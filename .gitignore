@@ -1,0 +1,6 @@
+overfit_100k/
+*.gff3
+gffcmp*
+gffcompare
+*.fa*
+subset*
