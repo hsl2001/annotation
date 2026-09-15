@@ -9,39 +9,6 @@
 
 const int wave_sizes[WAVE_COUNT] = {4, 5, 8};
 
-double otsu_threshold(const float *values, int count) {
-  double minimum = INFINITY, maximum = -INFINITY;
-  for (int index = 0; index < count; index++) {
-    if (!isfinite(values[index])) continue;
-    minimum = fmin(minimum, values[index]);
-    maximum = fmax(maximum, values[index]);
-  }
-  if (!(maximum > minimum)) return INFINITY;
-  double histogram[256] = {0}, total = 0, sum = 0;
-  double step = (maximum - minimum) / 256;
-  for (int index = 0; index < count; index++) {
-    if (!isfinite(values[index])) continue;
-    int bin = (int)((values[index] - minimum) / step);
-    if (bin > 255) bin = 255;
-    histogram[bin]++;
-    total++;
-    sum += bin;
-  }
-  double weight = 0, partial = 0, best = -1, threshold = INFINITY;
-  for (int bin = 0; bin < 255; bin++) {
-    weight += histogram[bin];
-    partial += bin * histogram[bin];
-    if (weight == 0 || weight == total) continue;
-    double difference = partial / weight - (sum - partial) / (total - weight);
-    double variance = weight * (total - weight) * difference * difference;
-    if (variance > best) {
-      best = variance;
-      threshold = minimum + (bin + 1) * step;
-    }
-  }
-  return threshold;
-}
-
 void anno_fail(const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);

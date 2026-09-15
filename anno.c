@@ -14,7 +14,9 @@
 
 KSEQ_INIT(gzFile, gzread)
 
-#define OTSU_WINDOW 10
+#define POWER_THRESHOLD 1.0
+#define EXON_WINDOW 200
+#define MIN_EXON_PEAKS 50
 
 static FILE *output_file(const char *directory, const char *name) {
   char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
@@ -42,51 +44,45 @@ static void write_matrix(FILE *stream, float *values, size_t count) {
   }
 }
 
-static void annotate(const char *name, const float *scores, int length, int strand, unsigned long *genes) {
+static void annotate(const char *name, const float *powers, int length, unsigned long *genes) {
+  float *scores = anno_alloc(length, sizeof(*scores));
+  for (int position = 0; position < length; position++) {
+    double score = 0.0;
+    for (int scale = 0; scale < WAVE_COUNT; scale++)
+      score += powers[(size_t)position * WAVE_COUNT + scale] / WAVE_COUNT;
+    scores[position] = (float)score;
+  }
   int *peaks = anno_alloc(length, sizeof(*peaks)), peak_count = 0;
   for (int position = 0; position < length; position++) {
-    int first = position - OTSU_WINDOW / 2;
-    if (first < 0) first = 0;
-    int count = position + OTSU_WINDOW - OTSU_WINDOW / 2;
-    if (count > length) count = length;
-    double threshold = otsu_threshold(scores + first, count - first);
     if (position < 1 || position + 1 >= length || !isfinite(scores[position]) ||
-      !(scores[position] >= threshold) || scores[position] < scores[position - 1] ||
+        scores[position] < POWER_THRESHOLD || scores[position] < scores[position - 1] ||
         scores[position] < scores[position + 1]) continue;
     if (scores[position] == scores[position - 1] && position > 1 && scores[position - 1] >= scores[position - 2]) continue;
     peaks[peak_count++] = position;
   }
-  fprintf(stderr, "Otsu sliding: %s (%c), window %d bp, %d peaks\n", name, strand ? '-' : '+', OTSU_WINDOW, peak_count);
-  int *starts = anno_alloc(length, sizeof(*starts));
-  int *ends = anno_alloc(length, sizeof(*ends));
-  int *best_peaks = anno_alloc(length, sizeof(*best_peaks));
-  int region_count = 0;
-  for (int peak_index = 0; peak_index < peak_count; peak_index++) {
-    int peak = peaks[peak_index], start = peak - OTSU_WINDOW / 2, end = peak + OTSU_WINDOW - OTSU_WINDOW / 2;
-    if (start < 0) start = 0;
-    if (end > length) end = length;
-    if (region_count && start <= ends[region_count - 1]) {
-      if (end > ends[region_count - 1]) ends[region_count - 1] = end;
-      if (scores[peak] > scores[best_peaks[region_count - 1]]) best_peaks[region_count - 1] = peak;
+  int exon_count = 0;
+  for (int peak_index = 0; peak_index < peak_count;) {
+    int cluster_start = peak_index;
+    int cluster_end = cluster_start + 1;
+    while (cluster_end < peak_count &&
+           peaks[cluster_end] - peaks[cluster_start] <= EXON_WINDOW)
+      cluster_end++;
+    if (cluster_end - cluster_start < MIN_EXON_PEAKS) {
+      peak_index++;
       continue;
     }
-    starts[region_count] = start;
-    ends[region_count] = end;
-    best_peaks[region_count++] = peak;
-  }
-  for (int region = 0; region < region_count; region++) {
-    int start = starts[region], end = ends[region], peak = best_peaks[region];
-    char direction = strand ? '-' : '+';
+    int start = peaks[cluster_start], end = peaks[cluster_end - 1];
     unsigned long gene = ++*genes;
-    int left = strand ? length - end : start;
-    int right = strand ? length - start : end;
-    int score = (int)lrint(fmin(1000.0, fmax(0.0, scores[peak] * 100.0)));
-    printf("%s\t%d\t%d\tpeak%lu\t%d\t%c\n", name, left, right, gene, score, direction);
+    double confidence = fmin(scores[start], scores[end]);
+    int score = (int)lrint(fmin(1000.0, fmax(0.0, confidence * 100.0)));
+    printf("%s\t%d\t%d\texon%lu\t%d\t.\n", name, start, end, gene, score);
+    exon_count++;
+    peak_index = cluster_end;
   }
-  free(starts);
-  free(ends);
-  free(best_peaks);
+    fprintf(stderr, "Fixed threshold: %s, threshold %.6g, %d peaks, %d exon clusters\n",
+      name, POWER_THRESHOLD, peak_count, exon_count);
   free(peaks);
+  free(scores);
 }
 
 int main(int argc, char **argv) {
@@ -129,8 +125,9 @@ int main(int argc, char **argv) {
     if (!names[records++]) anno_fail("Out of memory");
     if ((size_t)length > (SIZE_MAX / (WAVE_COUNT * 8) - rows) / 2) anno_fail("CWT matrix size overflow");
     if (export) fprintf(index, "%s\t%d\t%zu\t%zu\n", record->name.s, length, rows, rows + length);
-    float *scores = export ? NULL : anno_alloc(length, sizeof(float));
-    for (int strand = 0; strand < 2; strand++) {
+    float *powers = export ? NULL : anno_alloc((size_t)length * WAVE_COUNT, sizeof(float));
+    int strand_count = export ? 2 : 1;
+    for (int strand = 0; strand < strand_count; strand++) {
       char *reverse = strand ? reverse_complement(record->seq.s, length) : NULL;
       const char *bases = strand ? reverse : record->seq.s;
       double features[1024 * CWT_CHANNELS];
@@ -145,25 +142,26 @@ int main(int argc, char **argv) {
         } else {
           for (int offset = 0; offset < count; offset++) {
             int position = start + offset;
-            double power = 0;
-            for (int channel = 0; channel < CWT_CHANNELS; channel++) {
-              double value = features[offset * CWT_CHANNELS + channel];
-              power += value * value / WAVE_COUNT;
+            int known = position >= MAX_WAVE_SIZE / 2 &&
+                        position + (MAX_WAVE_SIZE - 1) / 2 < length;
+            if (known) for (int tap = -MAX_WAVE_SIZE / 2; tap <= (MAX_WAVE_SIZE - 1) / 2; tap++)
+              if (base_index(bases[position + tap]) < 0) known = 0;
+            for (int scale = 0; scale < WAVE_COUNT; scale++) {
+              double real = features[offset * CWT_CHANNELS + 2 * scale];
+              double imaginary = features[offset * CWT_CHANNELS + 2 * scale + 1];
+              powers[(size_t)position * WAVE_COUNT + scale] =
+                  known ? (float)(real * real + imaginary * imaginary) : NAN;
             }
-            if (position < MAX_WAVE_SIZE / 2 || position + (MAX_WAVE_SIZE - 1) / 2 >= length) power = NAN;
-            else for (int tap = -MAX_WAVE_SIZE / 2; tap <= (MAX_WAVE_SIZE - 1) / 2; tap++)
-              if (base_index(bases[position + tap]) < 0) power = NAN;
-            scores[position] = (float)power;
           }
         }
         start += count;
       }
-      if (!export) annotate(record->name.s, scores, length, strand, &genes);
+      if (!export) annotate(record->name.s, powers, length, &genes);
       rows += length;
       free(reverse);
     }
     fprintf(stderr, "%s: %s, %d bp\n", export ? "CWT" : "Annotated", record->name.s, length);
-    free(scores);
+    free(powers);
   }
   int error;
   gzerror(input, &error);
@@ -180,7 +178,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
   } else {
     if (fflush(stdout) || ferror(stdout)) anno_fail("Cannot write GFF output");
-    fprintf(stderr, "Predicted %lu unvalidated threshold regions\n", genes);
+    fprintf(stderr, "Predicted %lu exon candidates from threshold peak clusters\n", genes);
   }
   return 0;
 }

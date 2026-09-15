@@ -7,15 +7,6 @@
 #include <string.h>
 
 int main(void) {
-  float peaks[] = {0, 0, 0, 10, 10, 10, NAN};
-  assert(fabs(otsu_threshold(peaks, 7) - 10.0 / 256) < 1e-12);
-  float constant[] = {2, 2, NAN}, missing[] = {NAN, NAN};
-  assert(isinf(otsu_threshold(constant, 3)));
-  assert(isinf(otsu_threshold(missing, 2)));
-  assert(isinf(otsu_threshold(NULL, 0)));
-  float asymmetric[] = {0, 1, 2, 8, 9, 10};
-  double threshold = otsu_threshold(asymmetric, 6);
-  assert(threshold > 2 && threshold < 8);
   assert(base_signal('A') == 1.0 && base_signal('C') == I);
   assert(base_signal('G') == -I && base_signal('T') == -1.0);
   assert(base_signal('N') == 0.0 && base_signal('c') == I);

@@ -4,3 +4,8 @@ gffcmp*
 gffcompare
 *.fa*
 subset*
+Col-CC
+control
+exons
+*.bed
+__pycache__/

@@ -125,15 +125,6 @@ def report(reference, prediction) -> dict[str, Any]:
     result = metrics(reference, prediction)
     result["exon"] = scores(result)
     result["base"] = scores(result, "base_")
-    by_strand: dict[str, dict[str, Any]] = {}
-    for strand in ("+", "-"):
-        ref = {exon for exon in reference if exon[1] == strand}
-        pred = {exon for exon in prediction if exon[1] == strand}
-        strand_result = metrics(ref, pred)
-        strand_result["exon"] = scores(strand_result)
-        strand_result["base"] = scores(strand_result, "base_")
-        by_strand[strand] = strand_result
-    result["strand"] = by_strand
     return result
 
 
@@ -153,17 +144,12 @@ def main():
     parser.add_argument("prediction", help="prediction GFF3/GTF, optionally .gz")
     args = parser.parse_args()
     try:
-        reference, reference_duplicates = read_exons(args.reference)
-        prediction, prediction_duplicates = read_exons(args.prediction)
+        reference, _ = read_exons(args.reference)
+        prediction, _ = read_exons(args.prediction)
         result = report(reference, prediction)
-        result["reference_duplicates"] = reference_duplicates
-        result["prediction_duplicates"] = prediction_duplicates
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print_metric("overall", result)
-    for strand in ("+", "-"):
-        print_metric(f"strand {strand}", result["strand"][strand])
-    print(f"deduplicated: reference={reference_duplicates:,} prediction={prediction_duplicates:,}")
     return 0
 
 

@@ -26,7 +26,6 @@ int base_index(char base);
 anno_complex base_signal(char base);
 char *reverse_complement(const char *sequence, int length);
 void wavelets_init(Wavelets *wavelets);
-double otsu_threshold(const float *values, int count);
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
                  int start, int count, double *features);
 
