@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""End-to-end base-level (bp) exon annotation accuracy for anno.
-
-Runs the `anno` binary on the genome, then reports strand-agnostic base-level
-precision, recall and F1 against the reference GFF3 exon set. Base-level means
-every genomic position is scored as exonic or not, regardless of strand, which
-is the quantity the boundary-peak caller actually predicts.
-"""
-
 import argparse
 import gzip
 import subprocess

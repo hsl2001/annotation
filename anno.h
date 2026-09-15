@@ -11,9 +11,9 @@ typedef std::complex<double> anno_complex;
 typedef double complex anno_complex;
 #endif
 
-#define WAVE_COUNT 3
+#define WAVE_COUNT 4
 #define CWT_CHANNELS (2 * WAVE_COUNT)
-#define MAX_WAVE_SIZE 8
+#define MAX_WAVE_SIZE 9
 
 typedef struct {
   anno_complex kernel[WAVE_COUNT][MAX_WAVE_SIZE];
@@ -29,8 +29,8 @@ void wavelets_init(Wavelets *wavelets);
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
                  int start, int count, double *features);
 
-#define POWER_THRESHOLD 1.5
-#define EXON_WINDOW 200
+#define POWER_THRESHOLD 0.5
+#define EXON_WINDOW 400
 #define MIN_EXON_PEAKS 3
 
 typedef struct {

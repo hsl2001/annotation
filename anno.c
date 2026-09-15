@@ -11,7 +11,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-const int wave_sizes[WAVE_COUNT] = {4, 5, 8};
+const int wave_sizes[WAVE_COUNT] = {4, 5,8, 9};
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -255,7 +255,9 @@ int main(int argc, char **argv) {
     if (mkdir(argv[3], 0777)) anno_fail("Cannot create new directory %s: %s", argv[3], strerror(errno));
     matrix = output_file(argv[3], "matrix.bin");
     index = output_file(argv[3], "contigs.tsv");
-    fprintf(index, "# anno-cwt-v1\n# kernel_widths\t%d,%d,%d", wave_sizes[0], wave_sizes[1], wave_sizes[2]);
+    fputs("# anno-cwt-v1\n# kernel_widths\t", index);
+    for (int scale = 0; scale < WAVE_COUNT; scale++)
+      fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
     fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
   }
   Wavelets wavelets;
