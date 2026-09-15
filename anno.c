@@ -103,7 +103,8 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
   }
 }
 
-int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons) {
+int anno_call_exons_with_params(const float *powers, int length, int wave_count,
+                                const AnnoParameters *parameters, Exon *exons) {
   float *scores = anno_alloc(length, sizeof(*scores));
   for (int position = 0; position < length; position++) {
     double sum = 0.0;
@@ -117,7 +118,8 @@ int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons
       float value = powers[(size_t)position * wave_count + scale];
       float previous = powers[(size_t)(position - 1) * wave_count + scale];
       float next = powers[(size_t)(position + 1) * wave_count + scale];
-      if (!isfinite(value) || value < POWER_THRESHOLD || value < previous || value < next)
+        if (!isfinite(value) || value < parameters->power_threshold ||
+          value < previous || value < next)
         continue;
       if (value == previous && position > 1 &&
           previous >= powers[(size_t)(position - 2) * wave_count + scale])
@@ -133,9 +135,9 @@ int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons
     int cluster_start = peak_index;
     int cluster_end = cluster_start + 1;
     while (cluster_end < peak_count &&
-           peaks[cluster_end] - peaks[cluster_start] <= EXON_WINDOW)
+              peaks[cluster_end] - peaks[cluster_start] <= parameters->exon_window)
       cluster_end++;
-    if (cluster_end - cluster_start < MIN_EXON_PEAKS) {
+            if (cluster_end - cluster_start < parameters->min_exon_peaks) {
       peak_index++;
       continue;
     }
@@ -152,8 +154,15 @@ int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons
   return exon_count;
 }
 
+int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons) {
+  const AnnoParameters defaults = {
+      POWER_THRESHOLD, EXON_WINDOW, MIN_EXON_PEAKS};
+  return anno_call_exons_with_params(powers, length, wave_count, &defaults, exons);
+}
+
 #ifndef ANNO_NO_MAIN
 #include "kseq.h"
+#include "ketopt.h"
 #include <zlib.h>
 
 KSEQ_INIT(gzFile, gzread)
@@ -184,27 +193,61 @@ static void write_matrix(FILE *stream, float *values, size_t count) {
   }
 }
 
-static void annotate(const char *name, const float *powers, int length, unsigned long *genes) {
+static void annotate(const char *name, const float *powers, int length,
+                     const AnnoParameters *parameters, unsigned long *genes) {
   Exon *exons = anno_alloc(length, sizeof(*exons));
-  int exon_count = anno_call_exons(powers, length, WAVE_COUNT, exons);
+  int exon_count = anno_call_exons_with_params(powers, length, WAVE_COUNT, parameters, exons);
   for (int index = 0; index < exon_count; index++) {
     unsigned long gene = ++*genes;
     int score = (int)lrint(fmin(1000.0, fmax(0.0, exons[index].score * 100.0)));
     printf("%s\t%d\t%d\texon%lu\t%d\t.\n", name, exons[index].start, exons[index].end, gene, score);
   }
-  fprintf(stderr, "Boundary peaks: %s, %d exon clusters\n", name, exon_count);
+    fprintf(stderr, "Boundary peaks: %s, threshold %.6g, window %d, min peaks %d, %d exon clusters\n",
+      name, parameters->power_threshold, parameters->exon_window,
+      parameters->min_exon_peaks, exon_count);
   free(exons);
 }
 
+static int parse_int_option(const char *name, const char *text, int minimum) {
+  char *end = NULL;
+  long value = strtol(text, &end, 10);
+  if (*text == '\0' || *end != '\0' || value < minimum || value > INT_MAX)
+    anno_fail("Invalid %s: %s", name, text);
+  return (int)value;
+}
+
+static float parse_float_option(const char *name, const char *text, float minimum) {
+  char *end = NULL;
+  float value = strtof(text, &end);
+  if (*text == '\0' || *end != '\0' || !isfinite(value) || value < minimum)
+    anno_fail("Invalid %s: %s", name, text);
+  return value;
+}
+
 int main(int argc, char **argv) {
-  int help = argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"));
-  int export = argc == 4 && !strcmp(argv[1], "cwt");
-  if (help || (!export && argc != 2)) {
-    fprintf(stderr, "Usage: %s <genome.fasta[.gz]|-> > candidates.bed\n"
-                    "       %s cwt <genome.fasta[.gz]|-> <new_directory>\n", argv[0], argv[0]);
-    return help ? 0 : 1;
+  AnnoParameters parameters = {POWER_THRESHOLD, EXON_WINDOW, MIN_EXON_PEAKS};
+  ketopt_t options = KETOPT_INIT;
+  int option;
+  while ((option = ketopt(&options, argc, argv, 0, "t:w:m:h", NULL)) >= 0) {
+    if (option == 'h') {
+      fprintf(stderr, "Usage: %s [-t FLOAT] [-w INT] [-m INT] <genome.fasta[.gz]|->\n"
+                      "       %s cwt <genome.fasta[.gz]|-> <new_directory>\n", argv[0], argv[0]);
+      return 0;
+    }
+    if (option == '?') anno_fail("Unknown option");
+    if (option == ':') anno_fail("Missing option value");
+    if (option == 't') parameters.power_threshold = parse_float_option("-t", options.arg, 0.0f);
+    else if (option == 'w') parameters.exon_window = parse_int_option("-w", options.arg, 1);
+    else if (option == 'm') parameters.min_exon_peaks = parse_int_option("-m", options.arg, 1);
   }
-  const char *fasta = argv[export ? 2 : 1];
+  int argument = options.ind;
+  int export = argument < argc && !strcmp(argv[argument], "cwt");
+  if (argc - argument != (export ? 3 : 1)) {
+    fprintf(stderr, "Usage: %s [--threshold FLOAT] [--window INT] [--min-peaks INT] <genome.fasta[.gz]|->\n"
+                    "       %s cwt <genome.fasta[.gz]|-> <new_directory>\n", argv[0], argv[0]);
+    return 1;
+  }
+  const char *fasta = argv[argument + (export ? 1 : 0)];
   gzFile input = gzopen(!strcmp(fasta, "-") ? "/dev/stdin" : fasta, "rb");
   if (!input) anno_fail("Cannot open FASTA: %s", fasta);
   FILE *matrix = NULL, *index = NULL;
@@ -267,7 +310,7 @@ int main(int argc, char **argv) {
         }
         start += count;
       }
-      if (!export) annotate(record->name.s, powers, length, &genes);
+      if (!export) annotate(record->name.s, powers, length, &parameters, &genes);
       rows += length;
       free(reverse);
     }
