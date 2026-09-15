@@ -11,9 +11,9 @@ typedef std::complex<double> anno_complex;
 typedef double complex anno_complex;
 #endif
 
-#define WAVE_COUNT 4
+#define WAVE_COUNT 3
 #define CWT_CHANNELS (2 * WAVE_COUNT)
-#define MAX_WAVE_SIZE 4096
+#define MAX_WAVE_SIZE 8
 
 typedef struct {
   anno_complex kernel[WAVE_COUNT][MAX_WAVE_SIZE];
@@ -26,8 +26,8 @@ int base_index(char base);
 anno_complex base_signal(char base);
 char *reverse_complement(const char *sequence, int length);
 void wavelets_init(Wavelets *wavelets);
+double otsu_threshold(const float *values, int count);
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                 const unsigned char *masked, int start, int count,
-                 double *features);
+                 int start, int count, double *features);
 
 #endif

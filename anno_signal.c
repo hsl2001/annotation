@@ -7,7 +7,40 @@
 #include <stdlib.h>
 #include <string.h>
 
-const int wave_sizes[WAVE_COUNT] = {8, 64, 512, 4096};
+const int wave_sizes[WAVE_COUNT] = {4, 5, 8};
+
+double otsu_threshold(const float *values, int count) {
+  double minimum = INFINITY, maximum = -INFINITY;
+  for (int index = 0; index < count; index++) {
+    if (!isfinite(values[index])) continue;
+    minimum = fmin(minimum, values[index]);
+    maximum = fmax(maximum, values[index]);
+  }
+  if (!(maximum > minimum)) return INFINITY;
+  double histogram[256] = {0}, total = 0, sum = 0;
+  double step = (maximum - minimum) / 256;
+  for (int index = 0; index < count; index++) {
+    if (!isfinite(values[index])) continue;
+    int bin = (int)((values[index] - minimum) / step);
+    if (bin > 255) bin = 255;
+    histogram[bin]++;
+    total++;
+    sum += bin;
+  }
+  double weight = 0, partial = 0, best = -1, threshold = INFINITY;
+  for (int bin = 0; bin < 255; bin++) {
+    weight += histogram[bin];
+    partial += bin * histogram[bin];
+    if (weight == 0 || weight == total) continue;
+    double difference = partial / weight - (sum - partial) / (total - weight);
+    double variance = weight * (total - weight) * difference * difference;
+    if (variance > best) {
+      best = variance;
+      threshold = minimum + (bin + 1) * step;
+    }
+  }
+  return threshold;
+}
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -78,8 +111,7 @@ void wavelets_init(Wavelets *wavelets) {
 }
 
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                 const unsigned char *masked, int start, int count,
-                 double *features) {
+                 int start, int count, double *features) {
   memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
   for (int offset = 0; offset < count; offset++) {
     long position = (long)start + offset;
@@ -90,7 +122,7 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
       double complex coefficient = 0.0;
       for (int tap = 0; tap < width; tap++) {
         long context = position + tap - width / 2;
-        if (context >= 0 && context < length && (!masked || !masked[context]))
+        if (context >= 0 && context < length)
           coefficient += base_signal(sequence[context]) *
                          wavelets->kernel[scale][tap];
       }
