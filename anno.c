@@ -1,22 +1,162 @@
 #define _POSIX_C_SOURCE 200809L
-#include "anno_signal.h"
-#include "kseq.h"
+#include "anno.h"
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+
+const int wave_sizes[WAVE_COUNT] = {4, 5, 8};
+
+void anno_fail(const char *format, ...) {
+  va_list arguments;
+  va_start(arguments, format);
+  fputs("Error: ", stderr);
+  vfprintf(stderr, format, arguments);
+  fputc('\n', stderr);
+  va_end(arguments);
+  exit(EXIT_FAILURE);
+}
+
+void *anno_alloc(size_t count, size_t size) {
+  if (size && count > SIZE_MAX / size)
+    anno_fail("Allocation size overflow");
+  void *memory = calloc(count ? count : 1, size);
+  if (!memory)
+    anno_fail("Out of memory");
+  return memory;
+}
+
+int base_index(char base) {
+  switch (base) {
+  case 'A': case 'a': return 0;
+  case 'C': case 'c': return 1;
+  case 'G': case 'g': return 2;
+  case 'T': case 't': return 3;
+  default: return -1;
+  }
+}
+
+double complex base_signal(char base) {
+  const double complex mapping[4] = {1.0, I, -I, -1.0};
+  int index = base_index(base);
+  return index < 0 ? 0.0 : mapping[index];
+}
+
+char *reverse_complement(const char *sequence, int length) {
+  char *result = anno_alloc((size_t)length + 1, sizeof(char));
+  for (int position = 0; position < length; position++) {
+    int base = base_index(sequence[length - position - 1]);
+    result[position] = base < 0 ? 'N' : "TGCA"[base];
+  }
+  return result;
+}
+
+void wavelets_init(Wavelets *wavelets) {
+  memset(wavelets, 0, sizeof(*wavelets));
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    int width = wave_sizes[scale];
+    double complex mean = 0.0;
+    for (int tap = 0; tap < width; tap++) {
+      double coordinate = (tap - width / 2.0 + 0.5) / (width / 8.0);
+      double complex value = exp(-0.5 * coordinate * coordinate) *
+                             (cexp(I * 6.0 * coordinate) - exp(-18.0));
+      wavelets->kernel[scale][tap] = value;
+      mean += value / width;
+    }
+    double energy = 0.0;
+    for (int tap = 0; tap < width; tap++) {
+      wavelets->kernel[scale][tap] -= mean;
+      double magnitude = cabs(wavelets->kernel[scale][tap]);
+      energy += magnitude * magnitude;
+    }
+    for (int tap = 0; tap < width; tap++)
+      wavelets->kernel[scale][tap] =
+          conj(wavelets->kernel[scale][tap]) / sqrt(energy);
+  }
+}
+
+void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
+                 int start, int count, double *features) {
+  memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
+  for (int offset = 0; offset < count; offset++) {
+    long position = (long)start + offset;
+    if (position < 0 || position >= length)
+      continue;
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      int width = wave_sizes[scale];
+      double complex coefficient = 0.0;
+      for (int tap = 0; tap < width; tap++) {
+        long context = position + tap - width / 2;
+        if (context >= 0 && context < length)
+          coefficient += base_signal(sequence[context]) *
+                         wavelets->kernel[scale][tap];
+      }
+      features[(size_t)offset * CWT_CHANNELS + 2 * scale] = creal(coefficient);
+      features[(size_t)offset * CWT_CHANNELS + 2 * scale + 1] = cimag(coefficient);
+    }
+  }
+}
+
+int anno_call_exons(const float *powers, int length, int wave_count, Exon *exons) {
+  float *scores = anno_alloc(length, sizeof(*scores));
+  for (int position = 0; position < length; position++) {
+    double sum = 0.0;
+    for (int scale = 0; scale < wave_count; scale++)
+      sum += powers[(size_t)position * wave_count + scale];
+    scores[position] = (float)(sum / wave_count);
+  }
+  int *hits = anno_alloc(length, sizeof(*hits));
+  for (int scale = 0; scale < wave_count; scale++) {
+    for (int position = 1; position + 1 < length; position++) {
+      float value = powers[(size_t)position * wave_count + scale];
+      float previous = powers[(size_t)(position - 1) * wave_count + scale];
+      float next = powers[(size_t)(position + 1) * wave_count + scale];
+      if (!isfinite(value) || value < POWER_THRESHOLD || value < previous || value < next)
+        continue;
+      if (value == previous && position > 1 &&
+          previous >= powers[(size_t)(position - 2) * wave_count + scale])
+        continue;
+      hits[position]++;
+    }
+  }
+  int *peaks = anno_alloc(length, sizeof(*peaks)), peak_count = 0;
+  for (int position = 0; position < length; position++)
+    if (hits[position] == wave_count) peaks[peak_count++] = position;
+  int exon_count = 0;
+  for (int peak_index = 0; peak_index < peak_count;) {
+    int cluster_start = peak_index;
+    int cluster_end = cluster_start + 1;
+    while (cluster_end < peak_count &&
+           peaks[cluster_end] - peaks[cluster_start] <= EXON_WINDOW)
+      cluster_end++;
+    if (cluster_end - cluster_start < MIN_EXON_PEAKS) {
+      peak_index++;
+      continue;
+    }
+    int start = peaks[cluster_start], end = peaks[cluster_end - 1];
+    exons[exon_count].start = start;
+    exons[exon_count].end = end;
+    exons[exon_count].score = (float)fmin(scores[start], scores[end]);
+    exon_count++;
+    peak_index = cluster_end;
+  }
+  free(peaks);
+  free(hits);
+  free(scores);
+  return exon_count;
+}
+
+#ifndef ANNO_NO_MAIN
+#include "kseq.h"
 #include <zlib.h>
 
 KSEQ_INIT(gzFile, gzread)
-
-#define POWER_THRESHOLD 1.0
-#define EXON_WINDOW 200
-#define MIN_EXON_PEAKS 50
 
 static FILE *output_file(const char *directory, const char *name) {
   char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
@@ -45,44 +185,15 @@ static void write_matrix(FILE *stream, float *values, size_t count) {
 }
 
 static void annotate(const char *name, const float *powers, int length, unsigned long *genes) {
-  float *scores = anno_alloc(length, sizeof(*scores));
-  for (int position = 0; position < length; position++) {
-    double score = 0.0;
-    for (int scale = 0; scale < WAVE_COUNT; scale++)
-      score += powers[(size_t)position * WAVE_COUNT + scale] / WAVE_COUNT;
-    scores[position] = (float)score;
-  }
-  int *peaks = anno_alloc(length, sizeof(*peaks)), peak_count = 0;
-  for (int position = 0; position < length; position++) {
-    if (position < 1 || position + 1 >= length || !isfinite(scores[position]) ||
-        scores[position] < POWER_THRESHOLD || scores[position] < scores[position - 1] ||
-        scores[position] < scores[position + 1]) continue;
-    if (scores[position] == scores[position - 1] && position > 1 && scores[position - 1] >= scores[position - 2]) continue;
-    peaks[peak_count++] = position;
-  }
-  int exon_count = 0;
-  for (int peak_index = 0; peak_index < peak_count;) {
-    int cluster_start = peak_index;
-    int cluster_end = cluster_start + 1;
-    while (cluster_end < peak_count &&
-           peaks[cluster_end] - peaks[cluster_start] <= EXON_WINDOW)
-      cluster_end++;
-    if (cluster_end - cluster_start < MIN_EXON_PEAKS) {
-      peak_index++;
-      continue;
-    }
-    int start = peaks[cluster_start], end = peaks[cluster_end - 1];
+  Exon *exons = anno_alloc(length, sizeof(*exons));
+  int exon_count = anno_call_exons(powers, length, WAVE_COUNT, exons);
+  for (int index = 0; index < exon_count; index++) {
     unsigned long gene = ++*genes;
-    double confidence = fmin(scores[start], scores[end]);
-    int score = (int)lrint(fmin(1000.0, fmax(0.0, confidence * 100.0)));
-    printf("%s\t%d\t%d\texon%lu\t%d\t.\n", name, start, end, gene, score);
-    exon_count++;
-    peak_index = cluster_end;
+    int score = (int)lrint(fmin(1000.0, fmax(0.0, exons[index].score * 100.0)));
+    printf("%s\t%d\t%d\texon%lu\t%d\t.\n", name, exons[index].start, exons[index].end, gene, score);
   }
-    fprintf(stderr, "Fixed threshold: %s, threshold %.6g, %d peaks, %d exon clusters\n",
-      name, POWER_THRESHOLD, peak_count, exon_count);
-  free(peaks);
-  free(scores);
+  fprintf(stderr, "Boundary peaks: %s, %d exon clusters\n", name, exon_count);
+  free(exons);
 }
 
 int main(int argc, char **argv) {
@@ -182,3 +293,4 @@ int main(int argc, char **argv) {
   }
   return 0;
 }
+#endif

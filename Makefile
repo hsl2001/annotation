@@ -3,27 +3,21 @@ CFLAGS = -O3 -std=c11 -Wall -Wextra
 LIBS = -lz -lm
 
 TARGET = anno
-SRCS = anno.c anno_signal.c
-OBJS = $(SRCS:.c=.o)
-HEADERS = anno_signal.h kseq.h
+HEADERS = anno.h kseq.h
 TESTS = test_signal
 
 .PHONY: all clean test
 
 all: $(TARGET)
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
-	$(RM) $(OBJS)
+$(TARGET): anno.c $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ anno.c $(LIBS)
 
-%.o: %.c $(HEADERS)
-	$(CC) $(CFLAGS) -c $< -o $@
-
-test_signal: test_signal.c anno_signal.c anno_signal.h
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ test_signal.c anno_signal.c $(LIBS)
+test_signal: test_signal.c anno.c anno.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -DANNO_NO_MAIN -o $@ test_signal.c anno.c $(LIBS)
 
 test: $(TARGET) $(TESTS)
 	./test_signal
 
 clean:
-	rm -f $(OBJS) *.o $(TARGET) $(TESTS)
+	rm -f *.o $(TARGET) $(TESTS)

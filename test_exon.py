@@ -1,55 +1,46 @@
 #!/usr/bin/env python3
-"""Exact exon and covered-base accuracy without gffcompare."""
+"""End-to-end base-level (bp) exon annotation accuracy for anno.
+
+Runs the `anno` binary on the genome, then reports strand-agnostic base-level
+precision, recall and F1 against the reference GFF3 exon set. Base-level means
+every genomic position is scored as exonic or not, regardless of strand, which
+is the quantity the boundary-peak caller actually predicts.
+"""
 
 import argparse
-import csv
 import gzip
+import subprocess
 import sys
 from collections import defaultdict
-from typing import Any
+
+DEFAULT_GENOME = "data/Col-CC_v2_genome.fasta.gz"
+DEFAULT_GFF = "data/TAIR12_1Feb26_HEADERED.gff3"
 
 
 def open_text(path):
-    if path == "-":
-        return sys.stdin
-    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "r")
 
 
-def read_exons(path):
-    exons = set()
-    duplicates = 0
+def read_intervals(path, kind):
+    """Return {seqid: [(start, end), ...]} 1-based inclusive intervals."""
+    by_seq = defaultdict(list)
     with open_text(path) as stream:
         for line_number, line in enumerate(stream, 1):
             if not line.strip() or line.startswith("#"):
                 continue
             fields = line.rstrip("\r\n").split("\t")
-            if len(fields) in (3, 6):
-                seqid, start, end = fields[:3]
-                strand = fields[5] if len(fields) == 6 else "."
-                if strand == ".":
-                    strand = "+"
-                bed = True
-            elif len(fields) == 9:
-                if fields[2].lower() != "exon":
+            if kind == "gff":
+                if len(fields) != 9 or fields[2].lower() != "exon":
                     continue
-                seqid, start, end, strand = fields[0], fields[3], fields[4], fields[6]
-                bed = False
+                seqid, start, end = fields[0], int(fields[3]), int(fields[4])
             else:
-                raise ValueError(f"{path}:{line_number}: expected GFF3 or BED fields")
-            try:
-                start, end = int(start), int(end)
-            except ValueError as error:
-                raise ValueError(f"{path}:{line_number}: invalid exon coordinates") from error
-            if bed:
-                if start < 0 or end <= start:
-                    raise ValueError(f"{path}:{line_number}: invalid BED interval")
-                start += 1
-            if start < 1 or end < start or strand not in ("+", "-"):
-                raise ValueError(f"{path}:{line_number}: invalid exon interval or strand")
-            exon = (seqid, strand, start, end)
-            duplicates += exon in exons
-            exons.add(exon)
-    return exons, duplicates
+                if len(fields) < 3:
+                    raise ValueError(f"{path}:{line_number}: expected BED fields")
+                seqid, start, end = fields[0], int(fields[1]) + 1, int(fields[2])
+            if end < start:
+                raise ValueError(f"{path}:{line_number}: invalid interval")
+            by_seq[seqid].append((start, end))
+    return by_seq
 
 
 def merge(intervals):
@@ -62,14 +53,7 @@ def merge(intervals):
     return merged
 
 
-def union_by_group(exons):
-    groups = defaultdict(list)
-    for seqid, strand, start, end in exons:
-        groups[(seqid, strand)].append((start, end))
-    return {key: merge(intervals) for key, intervals in groups.items()}
-
-
-def interval_length(intervals):
+def total_length(intervals):
     return sum(end - start + 1 for start, end in intervals)
 
 
@@ -87,69 +71,42 @@ def overlap_length(left, right):
     return total
 
 
-def metrics(reference, prediction) -> dict[str, Any]:
-    true_positive = len(reference & prediction)
-    false_negative = len(reference - prediction)
-    false_positive = len(prediction - reference)
-    ref_union, pred_union = union_by_group(reference), union_by_group(prediction)
-    groups = set(ref_union) | set(pred_union)
-    ref_bases = sum(interval_length(ref_union.get(group, [])) for group in groups)
-    pred_bases = sum(interval_length(pred_union.get(group, [])) for group in groups)
-    base_true_positive = sum(overlap_length(ref_union.get(group, []), pred_union.get(group, [])) for group in groups)
-    return {
-        "reference_exons": len(reference),
-        "prediction_exons": len(prediction),
-        "true_positive": true_positive,
-        "false_positive": false_positive,
-        "false_negative": false_negative,
-        "reference_bases": ref_bases,
-        "prediction_bases": pred_bases,
-        "base_true_positive": base_true_positive,
-        "base_false_positive": pred_bases - base_true_positive,
-        "base_false_negative": ref_bases - base_true_positive,
-        "groups": len(groups),
-    }
-
-
-def scores(values: dict[str, Any], prefix="") -> dict[str, float]:
-    tp = values[prefix + "true_positive"]
-    fp = values[prefix + "false_positive"]
-    fn = values[prefix + "false_negative"]
-    precision = tp / (tp + fp) if tp + fp else 0.0
-    sensitivity = tp / (tp + fn) if tp + fn else 0.0
-    f1 = 2 * precision * sensitivity / (precision + sensitivity) if precision + sensitivity else 0.0
-    return {"precision": precision, "sensitivity": sensitivity, "f1": f1}
-
-
-def report(reference, prediction) -> dict[str, Any]:
-    result = metrics(reference, prediction)
-    result["exon"] = scores(result)
-    result["base"] = scores(result, "base_")
-    return result
-
-
-def print_metric(label, result):
-    exon, base = result["exon"], result["base"]
-    print(f"{label}: exon Sn={exon['sensitivity']:.4%} Pr={exon['precision']:.4%} F1={exon['f1']:.4%}; "
-          f"base Sn={base['sensitivity']:.4%} Pr={base['precision']:.4%} F1={base['f1']:.4%}")
-    print(f"  exons ref={result['reference_exons']:,} pred={result['prediction_exons']:,} "
-          f"TP={result['true_positive']:,} FP={result['false_positive']:,} FN={result['false_negative']:,}")
-    print(f"  bases ref={result['reference_bases']:,} pred={result['prediction_bases']:,} "
-          f"TP={result['base_true_positive']:,} FP={result['base_false_positive']:,} FN={result['base_false_negative']:,}")
+def base_scores(reference, prediction):
+    true_positive = false_positive = false_negative = 0
+    for seqid in set(reference) | set(prediction):
+        ref = merge(reference.get(seqid, []))
+        pred = merge(prediction.get(seqid, []))
+        shared = overlap_length(ref, pred)
+        true_positive += shared
+        false_positive += total_length(pred) - shared
+        false_negative += total_length(ref) - shared
+    precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
+    recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return precision, recall, f1, true_positive, false_positive, false_negative
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Exact exon and covered-base accuracy without gffcompare")
-    parser.add_argument("reference", help="reference GFF3/GTF, optionally .gz")
-    parser.add_argument("prediction", help="prediction GFF3/GTF, optionally .gz")
+    parser = argparse.ArgumentParser(description="End-to-end bp-level exon F1 for anno")
+    parser.add_argument("--genome", default=DEFAULT_GENOME, help="genome FASTA[.gz]")
+    parser.add_argument("--gff", default=DEFAULT_GFF, help="reference GFF3 exon annotation")
+    parser.add_argument("--bed", default="candidates.bed", help="prediction BED path")
+    parser.add_argument("--binary", default="./anno", help="anno executable")
+    parser.add_argument("--skip-run", action="store_true", help="reuse existing --bed")
     args = parser.parse_args()
+
+    if not args.skip_run:
+        with open(args.bed, "w") as bed:
+            subprocess.run([args.binary, args.genome], stdout=bed, check=True)
+
     try:
-        reference, _ = read_exons(args.reference)
-        prediction, _ = read_exons(args.prediction)
-        result = report(reference, prediction)
+        reference = read_intervals(args.gff, "gff")
+        prediction = read_intervals(args.bed, "bed")
     except (OSError, ValueError) as error:
         parser.error(str(error))
-    print_metric("overall", result)
+    precision, recall, f1, tp, fp, fn = base_scores(reference, prediction)
+    print(f"bp-level: F1={f1:.4%} precision={precision:.4%} recall={recall:.4%}")
+    print(f"  bases TP={tp:,} FP={fp:,} FN={fn:,}")
     return 0
 
 
