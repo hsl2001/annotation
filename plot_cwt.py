@@ -39,8 +39,17 @@ def load_matrix(directory):
 
 
 def oriented_bounds(contig, start, end, strand):
-    if strand not in ("+", "-") or not 1 <= start <= end <= contig["length"]:
+    if strand not in ("+", "-") or start < 1 or end < start:
         raise ValueError(f"Invalid interval: {start}-{end} ({strand})")
+    length = contig["length"]
+    span = end - start + 1
+    if end > length:
+        if span > length:
+            raise ValueError(f"Circular interval exceeds contig length: {start}-{end} ({strand})")
+        start = (start - 1) % length + 1
+        end = start + span - 1
+        if end > length:
+            raise ValueError(f"Circular interval crosses contig origin: {start}-{end} ({strand})")
     first = start - 1 if strand == "+" else contig["length"] - end
     return first, first + end - start + 1
 

@@ -1,11 +1,13 @@
 overfit_100k/
-*.gff3
+*.gff*
+*.model
 gffcmp*
 gffcompare
 *.fa*
 subset*
 Col-CC
-control
-exons
+control*
+exons*
 *.bed
 __pycache__/
+AGIS/
