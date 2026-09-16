@@ -165,10 +165,17 @@ static int is_stop(const char *seq, int length, int at, int reverse) {
   return code == 48 || code == 50 || code == 56; /* TAA TAG TGA */
 }
 
-/* In-frame stop codons may only terminate a CDS. */
+static int is_start(const char *seq, int length, int at, int reverse) {
+  return kmer(seq, length, at, 3, reverse) == 14; /* ATG */
+}
+
+/* Gene grammar: a CDS opens at ATG, closes at the first in-frame stop, and contains no other. */
 static int blocked(const char *seq, int length, int i, int a, int b) {
-  if (a == 3 && b) return is_stop(seq, length, i - 3, 0);
+  if (a == 0 && b == 1) return !is_start(seq, length, i, 0);
+  if (a == 3) return b ? is_stop(seq, length, i - 3, 0) : !is_stop(seq, length, i - 3, 0);
+  if (a == 0 && b == 9) return !is_stop(seq, length, i, 1);
   if ((a == 7 || a == 12) && b == 9) return is_stop(seq, length, i, 1);
+  if (a == 7 && b == 0) return !is_start(seq, length, i - 3, 1);
   return 0;
 }
 
@@ -393,6 +400,8 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
   for (int i = 0; i < windows; i++) order[i] = i;
   Work k = work_alloc();
   float *history = anno_alloc(WEIGHTS, sizeof(*history));
+  double *average = anno_alloc(WEIGHTS, sizeof(*average));
+  long averaged = 0;
   srand(1);
   for (int epoch = 1; epoch <= epochs; epoch++) {
     double likelihood = 0;
@@ -411,41 +420,59 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
       likelihood += value, positions += e - s;
       for (int f = 0; f < WEIGHTS; f++) {
         if (k.grad[f] == 0) continue;
-        float g = k.grad[f] / (e - s) - L2_PENALTY * w[f];
+        float g = k.grad[f] / (e - s);
         history[f] += g * g;
         w[f] += LEARNING_RATE * g / sqrtf(history[f] + 1e-8f);
         k.grad[f] = 0;
+      }
+      /* SGD end points oscillate between over- and under-calling; the final-epoch mean is stable. */
+      if (epoch == epochs) {
+        for (int f = 0; f < WEIGHTS; f++) average[f] += w[f];
+        averaged++;
       }
     }
     fprintf(stderr, "Epoch %d: %d windows trained, %d skipped, log-likelihood/bp %.4f\n",
             epoch, windows - skipped, skipped, positions ? likelihood / positions : 0.0);
   }
-  free(order), free(history), work_free(&k);
+  for (int f = 0; averaged && f < WEIGHTS; f++) w[f] = (float)(average[f] / averaged);
+  free(order), free(history), free(average), work_free(&k);
 }
 
-/* Viterbi with 2-bit back pointers per state (every state has at most three predecessors). */
+/* Streaming decode: Viterbi over transition + emission scores plus POSTERIOR_WEIGHT times the log
+   state posterior. The posterior term settles gene/no-gene calls from the full marginal mass while
+   the path scores keep boundaries sharp. Posteriors come from overlapping windows whose flanks are
+   dropped so every kept position sees full context. */
 void crf_decode(const float *w, const Contig *c, uint8_t *path) {
-  int n = c->length;
+  int n = c->length, margin = WINDOW / 4, step = WINDOW - 2 * margin;
   uint32_t *back = anno_alloc(n, sizeof(*back));
-  double prev[STATES], cur[STATES]; /* chromosome-scale sums exceed float resolution */
-  for (int i = 0; i < n; i++) {
-    Site site = site_at(c, i);
-    uint32_t bits = 0;
-    for (int b = 0; b < STATES; b++) {
-      double best = i ? -INFINITY : 0;
-      int arg = 0;
-      for (int j = 0; i && j < npreds[b]; j++) {
-        int a = preds[b][j];
-        if (blocked(c->seq, n, i, a, b)) continue;
-        double value = prev[a] + transition(w, &site, a, b);
-        if (value > best) best = value, arg = j;
+  double prev[STATES], cur[STATES];
+  Work k = work_alloc();
+  for (int start = 0; start < n; start += step) {
+    int s = start > margin ? start - margin : 0, e = s + WINDOW < n ? s + WINDOW : n;
+    window_posteriors(w, c, s, e, &k);
+    for (int i = s ? start : 0; i < (e < n ? start + step : n); i++) {
+      const Site *site = k.sites + (i - s);
+      const float *em = k.emis + (size_t)(i - s) * STATES;
+      const double *al = k.alpha + (size_t)(i - s) * STATES, *be = k.beta + (size_t)(i - s) * STATES;
+      uint32_t bits = 0;
+      for (int b = 0; b < STATES; b++) {
+        double best = i ? -INFINITY : 0, posterior = al[b] * be[b];
+        int arg = 0;
+        for (int j = 0; i && j < npreds[b]; j++) {
+          int a = preds[b][j];
+          if (blocked(c->seq, n, i, a, b)) continue;
+          double value = prev[a] + transition(w, site, a, b);
+          if (value > best) best = value, arg = j;
+        }
+        cur[b] = best + em[b] + POSTERIOR_WEIGHT * log(posterior > 1e-300 ? posterior : 1e-300);
+        bits |= (uint32_t)arg << 2 * b;
       }
-      cur[b] = best + emission(w, &site, b);
-      bits |= (uint32_t)arg << 2 * b;
+      back[i] = bits;
+      memcpy(prev, cur, sizeof(cur));
     }
-    back[i] = bits;
-    memcpy(prev, cur, sizeof(cur));
+    if (e == n) break;
   }
+  work_free(&k);
   int b = 0;
   for (int st = 1; st < STATES; st++) if (prev[st] > prev[b]) b = st;
   for (int i = n - 1; i >= 0; i--) path[i] = b, b = preds[b][back[i] >> 2 * b & 3];
@@ -559,7 +586,7 @@ static int usage(const char *program, int status) {
 
 int main(int argc, char **argv) {
   const char *model = "anno.model";
-  int epochs = 3, option;
+  int epochs = DEFAULT_EPOCHS, option;
   ketopt_t options = KETOPT_INIT;
   while ((option = ketopt(&options, argc, argv, 0, "m:e:h", NULL)) >= 0) {
     if (option == 'm') model = options.arg;

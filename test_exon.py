@@ -98,7 +98,7 @@ def main():
     parser.add_argument("--gff", default=DEFAULT_GFF)
     parser.add_argument("--holdout", default="Chr5", help="chromosome excluded from training")
     parser.add_argument("--binary", default="./anno")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--workdir", type=pathlib.Path, help="keep intermediate files here")
     args = parser.parse_args()
 

@@ -16,7 +16,8 @@
 #define WINDOW 65536
 #define MIN_CDS 90
 #define LEARNING_RATE 0.1f
-#define L2_PENALTY 1e-3f
+#define POSTERIOR_WEIGHT 0.01
+#define DEFAULT_EPOCHS 6
 
 typedef struct { double complex kernel[WAVE_COUNT][MAX_WAVE_SIZE]; } Wavelets;
 typedef struct { char *name, *seq; int length; uint16_t *cwt; uint8_t *label; } Contig;
