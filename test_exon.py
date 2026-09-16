@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
+"""Held-out accuracy for anno: train on every chromosome except one, predict the held-out one.
+
+Reports strand-aware CDS base-level precision/recall/F1 (the standard coding-base metric)
+and exact CDS-segment F1 against all reference isoforms.
+"""
+
 import argparse
 import gzip
+import pathlib
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 DEFAULT_GENOME = "data/Col-CC_v2_genome.fasta.gz"
@@ -13,26 +21,32 @@ def open_text(path):
     return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "r")
 
 
-def read_intervals(path, kind):
-    """Return {seqid: [(start, end), ...]} 1-based inclusive intervals."""
-    by_seq = defaultdict(list)
+def split_fasta(genome, holdout, train_path, test_path):
+    with open_text(genome) as source, open(train_path, "w") as train, open(test_path, "w") as test:
+        target = None
+        for line in source:
+            if line.startswith(">"):
+                target = test if line[1:].split()[0] == holdout else train
+            if target is None:
+                raise ValueError("FASTA does not start with a header")
+            target.write(line)
+
+
+def split_gff(gff, holdout, train_path):
+    with open_text(gff) as source, open(train_path, "w") as train:
+        for line in source:
+            if line.startswith("#") or line.split("\t", 1)[0] != holdout:
+                train.write(line)
+
+
+def read_cds(path, seqid):
+    intervals = defaultdict(list)
     with open_text(path) as stream:
-        for line_number, line in enumerate(stream, 1):
-            if not line.strip() or line.startswith("#"):
-                continue
+        for line in stream:
             fields = line.rstrip("\r\n").split("\t")
-            if kind == "gff":
-                if len(fields) != 9 or fields[2].lower() != "exon":
-                    continue
-                seqid, start, end = fields[0], int(fields[3]), int(fields[4])
-            else:
-                if len(fields) < 3:
-                    raise ValueError(f"{path}:{line_number}: expected BED fields")
-                seqid, start, end = fields[0], int(fields[1]) + 1, int(fields[2])
-            if end < start:
-                raise ValueError(f"{path}:{line_number}: invalid interval")
-            by_seq[seqid].append((start, end))
-    return by_seq
+            if len(fields) == 9 and fields[2] == "CDS" and fields[0] == seqid:
+                intervals[fields[6]].append((int(fields[3]), int(fields[4])))
+    return intervals
 
 
 def merge(intervals):
@@ -45,60 +59,66 @@ def merge(intervals):
     return merged
 
 
-def total_length(intervals):
-    return sum(end - start + 1 for start, end in intervals)
-
-
-def overlap_length(left, right):
-    total = left_index = right_index = 0
-    while left_index < len(left) and right_index < len(right):
-        start = max(left[left_index][0], right[right_index][0])
-        end = min(left[left_index][1], right[right_index][1])
-        if start <= end:
-            total += end - start + 1
-        if left[left_index][1] < right[right_index][1]:
-            left_index += 1
+def overlap(left, right):
+    total = i = j = 0
+    while i < len(left) and j < len(right):
+        start, end = max(left[i][0], right[j][0]), min(left[i][1], right[j][1])
+        total += max(0, end - start + 1)
+        if left[i][1] < right[j][1]:
+            i += 1
         else:
-            right_index += 1
+            j += 1
     return total
 
 
-def base_scores(reference, prediction):
-    true_positive = false_positive = false_negative = 0
-    for seqid in set(reference) | set(prediction):
-        ref = merge(reference.get(seqid, []))
-        pred = merge(prediction.get(seqid, []))
-        shared = overlap_length(ref, pred)
-        true_positive += shared
-        false_positive += total_length(pred) - shared
-        false_negative += total_length(ref) - shared
-    precision = true_positive / (true_positive + false_positive) if true_positive + false_positive else 0.0
-    recall = true_positive / (true_positive + false_negative) if true_positive + false_negative else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return precision, recall, f1, true_positive, false_positive, false_negative
+def f1(tp, fp, fn):
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0, precision, recall
+
+
+def evaluate(reference, prediction):
+    tp = fp = fn = 0
+    for strand in "+-":
+        ref, pred = merge(reference[strand]), merge(prediction[strand])
+        shared = overlap(ref, pred)
+        tp += shared
+        fp += sum(e - s + 1 for s, e in pred) - shared
+        fn += sum(e - s + 1 for s, e in ref) - shared
+    base = f1(tp, fp, fn)
+    ref_set = {(s, *i) for s in "+-" for i in reference[s]}
+    pred_set = {(s, *i) for s in "+-" for i in prediction[s]}
+    exact = f1(len(ref_set & pred_set), len(pred_set - ref_set), len(ref_set - pred_set))
+    return base, exact
 
 
 def main():
-    parser = argparse.ArgumentParser(description="End-to-end bp-level exon F1 for anno")
-    parser.add_argument("--genome", default=DEFAULT_GENOME, help="genome FASTA[.gz]")
-    parser.add_argument("--gff", default=DEFAULT_GFF, help="reference GFF3 exon annotation")
-    parser.add_argument("--bed", default="candidates.bed", help="prediction BED path")
-    parser.add_argument("--binary", default="./anno", help="anno executable")
-    parser.add_argument("--skip-run", action="store_true", help="reuse existing --bed")
+    parser = argparse.ArgumentParser(description="Held-out CDS accuracy for anno")
+    parser.add_argument("--genome", default=DEFAULT_GENOME)
+    parser.add_argument("--gff", default=DEFAULT_GFF)
+    parser.add_argument("--holdout", default="Chr5", help="chromosome excluded from training")
+    parser.add_argument("--binary", default="./anno")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--workdir", type=pathlib.Path, help="keep intermediate files here")
     args = parser.parse_args()
 
-    if not args.skip_run:
-        with open(args.bed, "w") as bed:
-            subprocess.run([args.binary, args.genome], stdout=bed, check=True)
-
+    workdir = args.workdir or pathlib.Path(tempfile.mkdtemp(prefix="anno-eval-"))
+    workdir.mkdir(parents=True, exist_ok=True)
+    train_fa, test_fa, train_gff = workdir / "train.fa", workdir / "test.fa", workdir / "train.gff3"
+    model, prediction = workdir / "anno.model", workdir / "prediction.gff3"
     try:
-        reference = read_intervals(args.gff, "gff")
-        prediction = read_intervals(args.bed, "bed")
-    except (OSError, ValueError) as error:
+        split_fasta(args.genome, args.holdout, train_fa, test_fa)
+        split_gff(args.gff, args.holdout, train_gff)
+        with open(prediction, "w") as out:
+            subprocess.run([args.binary, "-m", model, "-e", str(args.epochs), train_fa, train_gff],
+                           stdout=subprocess.DEVNULL, check=True)
+            subprocess.run([args.binary, "-m", model, test_fa], stdout=out, check=True)
+        base, exact = evaluate(read_cds(args.gff, args.holdout), read_cds(prediction, args.holdout))
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
-    precision, recall, f1, tp, fp, fn = base_scores(reference, prediction)
-    print(f"bp-level: F1={f1:.4%} precision={precision:.4%} recall={recall:.4%}")
-    print(f"  bases TP={tp:,} FP={fp:,} FN={fn:,}")
+    print(f"{args.holdout} CDS bp-level: F1={base[0]:.4%} precision={base[1]:.4%} recall={base[2]:.4%}")
+    print(f"{args.holdout} CDS exact-segment: F1={exact[0]:.4%} precision={exact[1]:.4%} recall={exact[2]:.4%}")
+    print(f"work directory: {workdir}")
     return 0
 
 
