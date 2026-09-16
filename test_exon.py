@@ -39,14 +39,48 @@ def split_gff(gff, holdout, train_path):
                 train.write(line)
 
 
+def attributes(text):
+    result = {}
+    for field in text.split(";"):
+        key, separator, value = field.partition("=")
+        if separator:
+            result[key] = value
+    return result
+
+
 def read_cds(path, seqid):
-    intervals = defaultdict(list)
+    transcripts = {}
+    cds = defaultdict(list)
     with open_text(path) as stream:
         for line in stream:
             fields = line.rstrip("\r\n").split("\t")
-            if len(fields) == 9 and fields[2] == "CDS" and fields[0] == seqid:
-                intervals[fields[6]].append((int(fields[3]), int(fields[4])))
-    return intervals
+            if len(fields) != 9 or fields[0] != seqid:
+                continue
+            info = attributes(fields[8])
+            if fields[2].lower() in ("gene", "mrna", "transcript"):
+                identifier = info.get("ID")
+                if identifier:
+                    parents = info.get("Parent", identifier).split(",")
+                    transcripts[identifier] = (parents[0], fields[6])
+            elif fields[2] == "CDS":
+                parent = info.get("Parent", "").split(",")[0]
+                if parent:
+                    cds[parent].append((int(fields[3]), int(fields[4])))
+
+    longest = {}
+    for transcript, intervals in cds.items():
+        if transcript in transcripts:
+            locus, strand = transcripts[transcript]
+        else:
+            locus, strand = transcript, "+"
+        length = sum(end - start + 1 for start, end in intervals)
+        previous = longest.get(locus)
+        if previous is None or length > previous[0]:
+            longest[locus] = (length, strand, intervals)
+    selected = defaultdict(list)
+    for _, strand, intervals in longest.values():
+        selected[strand].extend(intervals)
+    return selected
 
 
 def merge(intervals):
