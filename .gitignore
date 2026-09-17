@@ -11,3 +11,5 @@ exons*
 *.bed
 __pycache__/
 AGIS/
+regions*
+anno

@@ -288,14 +288,22 @@ def control_plot(args):
 
 def region_plot(args):
     matrix, contigs, widths = load_matrix(args.matrix)
-    if args.seqid not in contigs:
-        raise ValueError(f"Unknown contig: {args.seqid}")
-    contig = contigs[args.seqid]
-    first, last = oriented_bounds(contig, args.start, args.end, args.strand)
-    values = matrix[contig[args.strand] + first:contig[args.strand] + last]
+    render_region(matrix, contigs, widths, args.seqid, args.start, args.end, args.strand,
+                  args.flank, args.pixels, args.out)
+
+
+def render_region(matrix, contigs, widths, seqid, start, end, strand, flank, pixels, out):
+    if seqid not in contigs:
+        raise ValueError(f"Unknown contig: {seqid}")
+    contig = contigs[seqid]
+    first, last = oriented_bounds(contig, start, end, strand)
+    before, after = min(flank, first), min(flank, contig["length"] - last)
+    low, high = first - before, last + after
+    values = matrix[contig[strand] + low:contig[strand] + high]
     if len(values) > 100000:
         raise ValueError("Use a region of at most 100,000 bp for real/imaginary/phase detail")
-    bins = min(args.pixels, len(values))
+    bins = min(pixels, len(values))
+    body_end = before + (last - first)
     panels = ((resample_mean(np.real(values), bins).T, "Real (bin mean)", "RdBu_r"),
               (resample_mean(np.imag(values), bins).T, "Imaginary (bin mean)", "RdBu_r"),
               (np.log1p(resample_mean(power(values), bins)).T, "log(1 + mean power)", "viridis"))
@@ -305,15 +313,108 @@ def region_plot(args):
         image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
                             extent=(0, len(values), -0.5, len(widths) - 0.5), cmap=colors,
                             vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
+        if before:
+            axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
+        if after:
+            axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
         axis.set_yticks(range(len(widths)), widths)
         axis.set_ylabel("Kernel width (bp)")
         axis.set_title(title, loc="left", fontsize=11)
         figure.colorbar(image, ax=axis, pad=0.01)
-    axes[-1].set_xlabel("Offset from 5' end (bp); minus strand runs toward smaller genomic coordinates")
-    figure.suptitle(f"{args.seqid}:{args.start:,}-{args.end:,} ({args.strand}) | CWT")
-    figure.savefig(args.out, dpi=160)
+    axes[-1].set_xlabel(f"Offset from 5' end (bp); dashed lines bound the ROI, {flank} bp genomic flanks outside")
+    figure.suptitle(f"{seqid}:{start:,}-{end:,} ({strand}) | CWT | +/-{flank} bp flanks")
+    figure.savefig(out, dpi=160)
     plt.close(figure)
-    print(args.out)
+    print(out)
+
+
+def read_bed(path, contigs):
+    intervals = []
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as stream:
+        for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
+            if not row or row[0].startswith(("#", "track", "browser")):
+                continue
+            if len(row) < 3:
+                raise ValueError(f"Expected at least 3 BED columns at line {line_number}")
+            name, start, end = row[0], int(row[1]) + 1, int(row[2])
+            strand = row[5] if len(row) > 5 and row[5] in ("+", "-") else "+"
+            if name not in contigs:
+                raise ValueError(f"BED contig absent from CWT matrix: {name}")
+            oriented_bounds(contigs[name], start, end, strand)
+            intervals.append((name, start, end, strand))
+    if not intervals:
+        raise ValueError("No BED intervals found")
+    return intervals
+
+
+def regions_plot(args):
+    matrix, contigs, widths = load_matrix(args.matrix)
+    intervals = read_bed(args.bed, contigs)
+    args.out.mkdir(parents=True, exist_ok=False)
+    for name, start, end, strand in intervals:
+        tag = "plus" if strand == "+" else "minus"
+        render_region(matrix, contigs, widths, name, start, end, strand, args.flank, args.pixels,
+                      args.out / f"{name}_{start:06d}_{end:06d}_{tag}.png")
+    print(f"Rendered {len(intervals)} per-ROI region plots into {args.out}/")
+
+
+def regions_scaled_plot(args):
+    matrix, contigs, widths = load_matrix(args.matrix)
+    intervals = read_bed(args.bed, contigs)
+    args.out.mkdir(parents=True, exist_ok=False)
+    for name, start, end, strand in intervals:
+        tag = "plus" if strand == "+" else "minus"
+        render_region_scaled(matrix, contigs, widths, name, start, end, strand, args.bins, args.flank,
+                             args.out / f"{name}_{start:06d}_{end:06d}_{tag}.png")
+    print(f"Rendered {len(intervals)} scaled per-ROI region plots into {args.out}/")
+
+
+# Same real/imaginary/power detail as render_region, but the body is resampled to a fixed bin
+# count so every ROI's start and end line up; genomic flanks match exons/control exactly
+# (raw per-bp, NaN-padded past a contig edge).
+def render_region_scaled(matrix, contigs, widths, seqid, start, end, strand, bins, flank, out):
+    if seqid not in contigs:
+        raise ValueError(f"Unknown contig: {seqid}")
+    contig = contigs[seqid]
+    first, last = oriented_bounds(contig, start, end, strand)
+    before, after = min(flank, first), min(flank, contig["length"] - last)
+    offset, body_len, columns = contig[strand], last - first, bins + 2 * flank
+    span = matrix[offset + first - before:offset + last + after]
+
+    def scaled(component):
+        result = np.full((columns, component.shape[1]), np.nan, dtype=np.float64)
+        result[flank:flank + bins] = resample_mean(component[before:before + body_len], bins)
+        if before:
+            result[flank - before:flank] = component[:before]
+        if after:
+            result[flank + bins:flank + bins + after] = component[before + body_len:before + body_len + after]
+        return result.T
+
+    panels = ((scaled(np.real(span)), "Real (bin mean)", "RdBu_r"),
+              (scaled(np.imag(span)), "Imaginary (bin mean)", "RdBu_r"),
+              (np.log1p(scaled(power(span))), "log(1 + mean power)", "viridis"))
+    figure, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True, layout="constrained")
+    for axis, (image_values, title, colors) in zip(axes, panels):
+        maximum = max(float(np.nanmax(np.abs(image_values))), 1e-6)
+        image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
+                            extent=(0, columns, -0.5, len(widths) - 0.5), cmap=colors,
+                            vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
+        axis.axvline(flank, color="#bf5547", linestyle="--", linewidth=0.9)
+        axis.axvline(flank + bins, color="#bf5547", linestyle="--", linewidth=0.9)
+        axis.set_yticks(range(len(widths)), widths)
+        axis.set_ylabel("Kernel width (bp)")
+        axis.set_title(title, loc="left", fontsize=11)
+        figure.colorbar(image, ax=axis, pad=0.01)
+    ticks, labels = [flank, flank + bins / 2, flank + bins], ["0%", "50%", "100%"]
+    if flank:
+        ticks, labels = [0, *ticks, columns], [f"-{flank} bp", *labels, f"+{flank} bp"]
+    axes[-1].set_xticks(ticks, labels)
+    axes[-1].set_xlabel(f"5' to 3': body scaled to {bins} bins, {flank} bp genomic flanks")
+    figure.suptitle(f"{seqid}:{start:,}-{end:,} ({strand}) | CWT | body scaled to {bins} bins +/-{flank} bp")
+    figure.savefig(out, dpi=160)
+    plt.close(figure)
+    print(out)
 
 
 def positive(text):
@@ -339,9 +440,24 @@ def main():
     region.add_argument("--start", type=positive, required=True)
     region.add_argument("--end", type=positive, required=True)
     region.add_argument("--strand", choices=("+", "-"), default="+")
+    region.add_argument("--flank", type=nonnegative, default=10)
     region.add_argument("--pixels", type=positive, default=1600)
     region.add_argument("--out", type=pathlib.Path, required=True)
     region.set_defaults(handler=region_plot)
+    regions = commands.add_parser("regions")
+    regions.add_argument("matrix", type=pathlib.Path)
+    regions.add_argument("--bed", type=pathlib.Path, required=True)
+    regions.add_argument("--out", type=pathlib.Path, required=True)
+    regions.add_argument("--flank", type=nonnegative, default=10)
+    regions.add_argument("--pixels", type=positive, default=1600)
+    regions.set_defaults(handler=regions_plot)
+    regions_scaled = commands.add_parser("regions_scaled")
+    regions_scaled.add_argument("matrix", type=pathlib.Path)
+    regions_scaled.add_argument("--bed", type=pathlib.Path, required=True)
+    regions_scaled.add_argument("--out", type=pathlib.Path, required=True)
+    regions_scaled.add_argument("--bins", type=positive, default=200)
+    regions_scaled.add_argument("--flank", type=nonnegative, default=100)
+    regions_scaled.set_defaults(handler=regions_scaled_plot)
     exons = commands.add_parser("exons")
     exons.add_argument("matrix", type=pathlib.Path)
     exons.add_argument("--gff", type=pathlib.Path, required=True)

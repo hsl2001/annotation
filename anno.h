@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define WAVE_COUNT 4
+#define WAVE_COUNT 6
 #define MAX_WAVE_SIZE 9
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
@@ -20,7 +20,7 @@
 #define DEFAULT_EPOCHS 6
 
 typedef struct { double complex kernel[WAVE_COUNT][MAX_WAVE_SIZE]; } Wavelets;
-typedef struct { char *name, *seq; int length; uint16_t *cwt; uint8_t *label; } Contig;
+typedef struct { char *name, *seq; int length; uint32_t *cwt; uint8_t *label; } Contig;
 
 extern const int wave_sizes[WAVE_COUNT];
 void anno_fail(const char *format, ...);
@@ -29,7 +29,7 @@ int base_index(char base);
 void wavelets_init(Wavelets *wavelets);
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
                  int start, int count, double *features);
-uint16_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length);
+uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length);
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 size_t crf_weights(void);

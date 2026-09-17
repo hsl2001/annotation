@@ -15,16 +15,16 @@
 
 KSEQ_INIT(gzFile, gzread)
 
-const int wave_sizes[WAVE_COUNT] = {4, 5, 8, 9};
+const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9};
 static const float power_edges[7] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
 
 /* Weight layout: transition x boundary 4-mer, transition x (peaks at i-1, peaks at i),
    state x nucleotide, state x oriented hexamer, state x per-scale CWT code. */
-enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097, KCWT = 16 * WAVE_COUNT };
+enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097, KCWT = 32 * WAVE_COUNT };
 enum { OFF_T4 = 0, OFF_TPK = OFF_T4 + STATES * STATES * K4, OFF_NUC = OFF_TPK + STATES * STATES * KPK,
        OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX, WEIGHTS = OFF_CWT + STATES * KCWT };
 
-typedef struct { uint16_t k4, hexf, hexr, cwt; uint8_t nuc, pk; } Site;
+typedef struct { uint16_t k4, hexf, hexr; uint32_t cwt; uint8_t nuc, pk; } Site;
 
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans, preds[STATES][4], npreds[STATES];
 
@@ -99,16 +99,16 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int
   }
 }
 
-/* Per position and scale: bit 3 = local power maximum, bits 0-2 = power bin. */
-uint16_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length) {
-  uint16_t *codes = anno_alloc(length, sizeof(*codes));
+/* Per position and scale: bit 4 = local power minimum, bit 3 = local power maximum, bits 0-2 = power bin. */
+uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length) {
+  uint32_t *codes = anno_alloc(length, sizeof(*codes));
   double *features = anno_alloc((size_t)1026 * CWT_CHANNELS, sizeof(*features));
   for (int start = 0; start < length; start += 1024) {
     int count = length - start < 1024 ? length - start : 1024;
     cwt_extract(wavelets, sequence, length, start - 1, count + 2, features);
     for (int offset = 0; offset < count; offset++) {
       if (base_index(sequence[start + offset]) < 0) continue;
-      uint16_t code = 0;
+      uint32_t code = 0;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
         double power[3];
         for (int tap = 0; tap < 3; tap++) {
@@ -118,7 +118,8 @@ uint16_t *cwt_features(const Wavelets *wavelets, const char *sequence, int lengt
         int bin = 0;
         for (int edge = 0; edge < 7; edge++) bin += power[1] > power_edges[edge];
         int peak = power[1] > 0 && power[1] >= power[0] && power[1] >= power[2];
-        code |= (uint16_t)((peak << 3 | bin) << (4 * scale));
+        int valley = power[1] <= power[0] && power[1] <= power[2];
+        code |= (uint32_t)((valley << 4 | peak << 3 | bin) << (5 * scale));
       }
       codes[start + offset] = code;
     }
@@ -138,9 +139,9 @@ static int kmer(const char *seq, int length, int from, int k, int reverse) {
   return code;
 }
 
-static int peak_count(uint16_t code) {
+static int peak_count(uint32_t code) {
   int count = 0;
-  for (int scale = 0; scale < WAVE_COUNT; scale++) count += code >> (4 * scale + 3) & 1;
+  for (int scale = 0; scale < WAVE_COUNT; scale++) count += code >> (5 * scale + 3) & 1;
   return count;
 }
 
@@ -187,7 +188,7 @@ static void init_transitions(void) {
 
 static float emission(const float *w, const Site *s, int b) {
   float e = w[OFF_NUC + b * KNUC + s->nuc] + w[OFF_HEX + b * KHEX + (b >= 7 ? s->hexr : s->hexf)];
-  for (int k = 0; k < WAVE_COUNT; k++) e += w[OFF_CWT + b * KCWT + k * 16 + (s->cwt >> 4 * k & 15)];
+  for (int k = 0; k < WAVE_COUNT; k++) e += w[OFF_CWT + b * KCWT + k * 32 + (s->cwt >> 5 * k & 31)];
   return e;
 }
 
@@ -198,7 +199,7 @@ static float transition(const float *w, const Site *s, int a, int b) {
 static void add_emission(float *g, const Site *s, int b, float v) {
   g[OFF_NUC + b * KNUC + s->nuc] += v;
   g[OFF_HEX + b * KHEX + (b >= 7 ? s->hexr : s->hexf)] += v;
-  for (int k = 0; k < WAVE_COUNT; k++) g[OFF_CWT + b * KCWT + k * 16 + (s->cwt >> 4 * k & 15)] += v;
+  for (int k = 0; k < WAVE_COUNT; k++) g[OFF_CWT + b * KCWT + k * 32 + (s->cwt >> 5 * k & 31)] += v;
 }
 
 static void add_transition(float *g, const Site *s, int a, int b, float v) {
