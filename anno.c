@@ -232,7 +232,7 @@ Contig *read_fasta(const char *path, int *count) {
   return contigs;
 }
 
-typedef struct { int contig, start, end, phase; char strand, *parent; } Cds;
+typedef struct { int contig, start, end; char strand, *parent; } Cds;
 typedef struct { int first, count, total; } Group;
 
 static int by_parent(const void *x, const void *y) {
@@ -271,7 +271,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     cds = realloc(cds, (n + 1) * sizeof(*cds));
     if (!cds || !(cds[n].parent = strdup(parent))) anno_fail("Out of memory");
     cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
-    cds[n++].phase = field[7][0] >= '0' && field[7][0] <= '2' ? field[7][0] - '0' : 0;
+    n++;
   }
   free(line.s);
   ks_destroy(stream);
@@ -293,13 +293,21 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     for (int p = s->start - 1; ok && p < s[m - 1].end; p++) ok &= !c->label[p];
     if (!ok) continue;
     used++;
+    /* Reading frame is recomputed from CDS lengths in translation order; the GFF phase column is ignored. */
+    int *startpos = anno_alloc(m, sizeof(int));
+    for (int jj = 0, frame = 0; jj < m; jj++) {
+      int j = minus ? m - 1 - jj : jj;
+      startpos[j] = frame;
+      frame = (frame + s[j].end - s[j].start + 1) % 3;
+    }
     for (int j = 0; j < m; j++) {
-      int pos = (3 - s[j].phase) % 3, len = s[j].end - s[j].start + 1;
+      int pos = startpos[j], len = s[j].end - s[j].start + 1;
       for (int t = 0; t < len; t++, pos = (pos + 1) % 3)
         c->label[minus ? s[j].end - 1 - t : s[j].start - 1 + t] = (minus ? 7 : 1) + pos;
-      int q = minus ? (3 - s[j].phase + len - 1) % 3 : (3 - s[j].phase) % 3;
+      int q = minus ? (startpos[j] + len - 1) % 3 : startpos[j];
       for (int p = j ? s[j - 1].end : s[j].start; p < s[j].start - 1; p++) c->label[p] = (minus ? 10 : 4) + q;
     }
+    free(startpos);
   }
   for (int i = 0; i < n; i++) free(cds[i].parent);
   free(cds);

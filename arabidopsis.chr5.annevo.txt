@@ -1,0 +1,10 @@
+python3 test_accuracy.py -r truth.chr5.gff3 -g truth.chr5.fasta --gffcompare -q annevo/annevo.chr5.gff3 
+bp-level: F1=73.5937% precision=99.1338% recall=58.5177%
+  bases TP=7,061,076 FP=61,701 FN=5,005,494
+exon-level: F1=57.6450% precision=64.4399% recall=52.1464%
+  exons TP=19,399 FP=10,705 FN=17,802
+gene-level (protein): F1=91.2729% precision=96.2241% recall=86.8063%
+  genes TP=5,428 P(reference)=6,253 PP(predicted)=5,641
+gffcompare CDS exon-level: F1=90.5693% precision=94.8000% recall=86.7000%
+gffcompare CDS locus-level: F1=86.0625% precision=91.8000% recall=81.0000%
+  filtered transcripts: reference=5,165 query=3,425

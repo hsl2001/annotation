@@ -14,7 +14,7 @@
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 #define STATES 13
 #define WINDOW 65536
-#define MIN_CDS 90
+#define MIN_CDS 30
 #define LEARNING_RATE 0.1f
 #define POSTERIOR_WEIGHT 0.01
 #define DEFAULT_EPOCHS 6
