@@ -1,14 +1,33 @@
 #!/usr/bin/env python3
-"""Overall exon and covered-base accuracy for reference and query GFF3 files."""
+"""Accuracy metrics for reference and query GFF3 files.
+
+Always reports nucleotide (bp) and exon-level F1. When a genome FASTA is supplied
+(--genome), it additionally reports a protein-level gene F1 that mirrors the
+BUSCO protein-mode protocol used to compare annotation tools such as anno and
+AnnEvo: proteins are extracted with gffread, aligned with blastp, and a
+predicted gene counts as a true positive only when its best hit against the
+reference clears bit-score/e-value thresholds, sits in the same genomic region,
+and covers more than a set fraction of both proteins. Run inside the micromamba
+``anno`` environment so gffread/makeblastdb/blastp are on PATH:
+
+    micromamba run -n anno python3 test_accuracy.py \
+        -r reference.gff3 -q anno.gff3 -g genome.fasta.gz
+    micromamba run -n anno python3 test_accuracy.py \
+        -r reference.gff3 -q annevo.gff3 -g genome.fasta.gz
+"""
 
 import argparse
 import gzip
+import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 
 def open_text(path):
-    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r")
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "r")
 
 
 def attributes(text):
@@ -71,6 +90,50 @@ def read_exons(path):
     return set(selected)
 
 
+def read_genes(path):
+    """Map each coding gene to its longest-CDS transcript and CDS-spanning region.
+
+    Returns gene_id -> (seqid, start, end, strand, transcript_id).
+    """
+    transcripts = {}
+    cds = defaultdict(list)
+    cds_meta = {}
+    with open_text(path) as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) != 9:
+                raise ValueError(f"{path}:{line_number}: expected GFF3/GTF with 9 columns")
+            feature = fields[2].lower()
+            info = attributes(fields[8])
+            if feature in ("mrna", "transcript"):
+                identifier = info.get("ID") or info.get("transcript_id")
+                if identifier:
+                    parent = (info.get("Parent") or info.get("gene_id") or identifier).split(",")[0]
+                    transcripts[identifier] = (parent or identifier, fields[6], fields[0])
+            elif feature == "cds":
+                parent = (info.get("Parent") or info.get("transcript_id") or "").split(",")[0]
+                if not parent:
+                    continue
+                cds[parent].append((int(fields[3]), int(fields[4])))
+                cds_meta[parent] = (fields[0], fields[6])
+
+    genes = {}
+    for transcript, intervals in cds.items():
+        gene, strand, seqid = transcripts.get(transcript, (None, None, None))
+        if gene is None:
+            seqid, strand = cds_meta[transcript]
+            gene = transcript
+        length = sum(end - start + 1 for start, end in intervals)
+        start = min(start for start, _ in intervals)
+        end = max(end for _, end in intervals)
+        previous = genes.get(gene)
+        if previous is None or length > previous[0]:
+            genes[gene] = (length, seqid, start, end, strand, transcript)
+    return {gene: value[1:] for gene, value in genes.items()}
+
+
 def merge(intervals):
     merged = []
     for start, end in sorted(intervals):
@@ -124,11 +187,128 @@ def evaluate(reference, query):
     return scores(bp_tp, bp_fp, bp_fn), scores(exact_tp, exact_fp, exact_fn), (bp_tp, bp_fp, bp_fn), (exact_tp, exact_fp, exact_fn)
 
 
+def genome_fasta(genome, workdir):
+    """Return a plain, gffread-indexable FASTA path (decompressing .gz if needed)."""
+    if str(genome).endswith(".gz"):
+        plain = workdir / "genome.fa"
+        with gzip.open(genome, "rb") as source, open(plain, "wb") as target:
+            shutil.copyfileobj(source, target)
+        return plain
+    link = workdir / "genome.fa"
+    link.symlink_to(pathlib.Path(genome).resolve())
+    return link
+
+
+def read_fasta(path):
+    name, chunks = None, []
+    with open(path) as stream:
+        for line in stream:
+            if line.startswith(">"):
+                if name is not None:
+                    yield name, "".join(chunks)
+                name, chunks = line[1:].split()[0], []
+            else:
+                chunks.append(line.strip())
+    if name is not None:
+        yield name, "".join(chunks)
+
+
+def extract_proteins(gff, genome, genes, out_fasta, workdir, tag):
+    """Translate the longest-CDS transcript of each gene, header renamed to gene id."""
+    raw = workdir / f"{tag}.raw.faa"
+    subprocess.run(["gffread", str(gff), "-g", str(genome), "-y", str(raw)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wanted = {transcript: gene for gene, (_, _, _, _, transcript) in genes.items()}
+    written = 0
+    with open(out_fasta, "w") as target:
+        for name, sequence in read_fasta(raw):
+            gene = wanted.get(name)
+            if gene is None:
+                continue
+            sequence = sequence.replace(".", "").replace("*", "")
+            if not sequence:
+                continue
+            target.write(f">{gene}\n{sequence}\n")
+            written += 1
+    return written
+
+
+def blast_hits(query_fasta, ref_fasta, workdir, evalue, threads):
+    database = workdir / "refdb"
+    subprocess.run(["makeblastdb", "-in", str(ref_fasta), "-dbtype", "prot", "-out", str(database)],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    columns = "6 qseqid sseqid bitscore evalue qstart qend qlen sstart send slen"
+    result = subprocess.run(
+        ["blastp", "-query", str(query_fasta), "-db", str(database), "-evalue", str(evalue),
+         "-outfmt", columns, "-max_target_seqs", "5", "-num_threads", str(threads)],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    hits = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 10:
+            continue
+        query, subject = parts[0], parts[1]
+        hit_score, hit_evalue = float(parts[2]), float(parts[3])
+        qstart, qend, qlen = int(parts[4]), int(parts[5]), int(parts[6])
+        sstart, send, slen = int(parts[7]), int(parts[8]), int(parts[9])
+        qcov = (qend - qstart + 1) / qlen if qlen else 0.0
+        scov = (send - sstart + 1) / slen if slen else 0.0
+        hits.append((query, subject, hit_score, hit_evalue, qcov, scov))
+    return hits
+
+
+def region_overlap(a, b):
+    return a[0] == b[0] and a[1] <= b[2] and b[1] <= a[2]
+
+
+def gene_level(reference_gff, query_gff, genome, workdir, *, bitscore, evalue, coverage, threads):
+    ref_genes = read_genes(reference_gff)
+    query_genes = read_genes(query_gff)
+    indexed = genome_fasta(genome, workdir)
+    ref_fasta, query_fasta = workdir / "reference.faa", workdir / "query.faa"
+    positives = extract_proteins(reference_gff, indexed, ref_genes, ref_fasta, workdir, "reference")
+    predicted = extract_proteins(query_gff, indexed, query_genes, query_fasta, workdir, "query")
+    if positives == 0 or predicted == 0:
+        raise ValueError("no protein sequences extracted; check genome and GFF3 coordinates")
+
+    ref_region = {gene: (seqid, start, end) for gene, (seqid, start, end, *_) in ref_genes.items()}
+    query_region = {gene: (seqid, start, end) for gene, (seqid, start, end, *_) in query_genes.items()}
+
+    candidates = []
+    for query, subject, hit_score, hit_evalue, qcov, scov in blast_hits(query_fasta, ref_fasta, workdir, evalue, threads):
+        if hit_score < bitscore or hit_evalue > evalue:
+            continue
+        if qcov <= coverage or scov <= coverage:
+            continue
+        region_q, region_r = query_region.get(query), ref_region.get(subject)
+        if region_q is None or region_r is None or not region_overlap(region_q, region_r):
+            continue
+        candidates.append((hit_score, query, subject))
+
+    candidates.sort(reverse=True)
+    used_query, used_ref, tp = set(), set(), 0
+    for _, query, subject in candidates:
+        if query in used_query or subject in used_ref:
+            continue
+        used_query.add(query)
+        used_ref.add(subject)
+        tp += 1
+    return scores(tp, predicted - tp, positives - tp), (tp, positives, predicted)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Overall exon and bp-level accuracy")
+    parser = argparse.ArgumentParser(description="Overall exon, bp and protein-level gene accuracy")
     parser.add_argument("-r", "--reference", required=True, help="reference GFF3/GTF(.gz)")
     parser.add_argument("-q", "--query", required=True, help="query GFF3/GTF(.gz)")
+    parser.add_argument("-g", "--genome", help="genome FASTA(.gz); enables protein-level gene F1")
+    parser.add_argument("--bitscore", type=float, default=50.0, help="minimum blastp bit score")
+    parser.add_argument("--evalue", type=float, default=1e-5, help="maximum blastp e-value")
+    parser.add_argument("--coverage", type=float, default=0.70,
+                        help="minimum best-HSP coverage of both proteins (fraction)")
+    parser.add_argument("--threads", type=int, default=4, help="blastp threads")
+    parser.add_argument("--workdir", type=pathlib.Path, help="keep protein/blast intermediates here")
     args = parser.parse_args()
+
     try:
         reference = read_exons(args.reference)
         query = read_exons(args.query)
@@ -139,6 +319,28 @@ def main():
     print(f"  bases TP={bp_counts[0]:,} FP={bp_counts[1]:,} FN={bp_counts[2]:,}")
     print(f"exon-level: F1={exon[2]:.4%} precision={exon[0]:.4%} recall={exon[1]:.4%}")
     print(f"  exons TP={exon_counts[0]:,} FP={exon_counts[1]:,} FN={exon_counts[2]:,}")
+
+    if not args.genome:
+        return 0
+
+    keep = args.workdir is not None
+    if keep:
+        workdir = args.workdir
+    else:
+        base = "tmp" if pathlib.Path("tmp").is_dir() else "."
+        workdir = pathlib.Path(tempfile.mkdtemp(prefix="anno-gene-", dir=base))
+    workdir.mkdir(parents=True, exist_ok=True)
+    try:
+        gene, counts = gene_level(args.reference, args.query, args.genome, workdir,
+                                  bitscore=args.bitscore, evalue=args.evalue,
+                                  coverage=args.coverage, threads=args.threads)
+    except (OSError, ValueError, subprocess.CalledProcessError, FileNotFoundError) as error:
+        parser.error(str(error))
+    finally:
+        if not keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+    print(f"gene-level (protein): F1={gene[2]:.4%} precision={gene[0]:.4%} recall={gene[1]:.4%}")
+    print(f"  genes TP={counts[0]:,} P(reference)={counts[1]:,} PP(predicted)={counts[2]:,}")
     return 0
 
 

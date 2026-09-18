@@ -8,9 +8,9 @@ and exact CDS-segment F1 against all reference isoforms.
 import argparse
 import gzip
 import pathlib
+import shutil
 import subprocess
 import sys
-import tempfile
 from collections import defaultdict
 
 DEFAULT_GENOME = "data/Col-CC_v2_genome.fasta.gz"
@@ -136,7 +136,7 @@ def main():
     parser.add_argument("--workdir", type=pathlib.Path, help="keep intermediate files here")
     args = parser.parse_args()
 
-    workdir = args.workdir or pathlib.Path(tempfile.mkdtemp(prefix="anno-eval-"))
+    workdir = args.workdir or pathlib.Path("tmp")
     workdir.mkdir(parents=True, exist_ok=True)
     train_fa, test_fa, train_gff = workdir / "train.fa", workdir / "test.fa", workdir / "train.gff3"
     model, prediction = workdir / "anno.model", workdir / "prediction.gff3"
@@ -147,6 +147,7 @@ def main():
             subprocess.run([args.binary, "-m", model, "-e", str(args.epochs), train_fa, train_gff],
                            stdout=subprocess.DEVNULL, check=True)
             subprocess.run([args.binary, "-m", model, test_fa], stdout=out, check=True)
+        shutil.copyfile(prediction, pathlib.Path("prediction.gff3"))
         base, exact = evaluate(read_cds(args.gff, args.holdout), read_cds(prediction, args.holdout))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
