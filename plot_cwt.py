@@ -123,6 +123,9 @@ _KIND = {
               "Exon rank (short to long)"),
     "control": ("{n:,} length-matched random non-exon controls | {bins} body bins | {rows:,} display rows\n"
                 "Arbitrary genomic cut points; body avoids every annotated exon", "Control rank (short to long)"),
+    "control_aggt": ("{n:,} AG..GT-flanked non-exon controls | {bins} body bins | {rows:,} display rows\n"
+                     "Non-exon sites with AG upstream and GT downstream; length-matched to exons",
+                     "Control rank (short to long)"),
 }
 
 
@@ -251,6 +254,111 @@ def sample_controls(contigs, exons, seed, attempts=200):
     return controls, skipped
 
 
+def read_sequences(path, contigs):
+    wanted = set(contigs)
+    opener = gzip.open if str(path).endswith(".gz") else open
+    sequences = {}
+    name, keep, chunks = None, False, []
+    with opener(path, "rt") as stream:
+        for line in stream:
+            if line.startswith(">"):
+                if keep:
+                    sequences[name] = "".join(chunks).upper()
+                header = line[1:].split()
+                name = header[0] if header else ""
+                keep = name in wanted
+                chunks = []
+            elif keep:
+                chunks.append(line.strip())
+    if keep:
+        sequences[name] = "".join(chunks).upper()
+    missing = wanted - sequences.keys()
+    if missing:
+        raise ValueError(f"FASTA missing sequences for CWT contigs: {', '.join(sorted(missing))}")
+    for name, sequence in sequences.items():
+        if len(sequence) != contigs[name]["length"]:
+            raise ValueError(f"FASTA length for {name} ({len(sequence)}) differs from CWT matrix "
+                             f"({contigs[name]['length']})")
+    return sequences
+
+
+def aggt_candidates(sequences):
+    """Precompute, per strand, non-exon start positions carrying the transcript-oriented AG acceptor,
+    plus the donor dimer mask used to test the exon end. In transcript 5'->3' orientation an internal
+    exon reads ...AG | exon | GT... On the plus strand that is genomic AG before the body and GT after;
+    on the minus strand the reverse complement makes it genomic AC before and CT after the body."""
+    codes = {base: ord(base) for base in "ACGT"}
+    starts = {"+": [], "-": []}
+    names = {"+": [], "-": []}
+    end_masks = {"+": {}, "-": {}}
+    for name, sequence in sequences.items():
+        arr = np.frombuffer(sequence.encode("ascii"), dtype=np.uint8)
+        if len(arr) < 3:
+            continue
+        left, right = arr[:-1], arr[1:]
+        dimer = {pair: (left == codes[pair[0]]) & (right == codes[pair[1]]) for pair in ("AG", "GT", "AC", "CT")}
+        end_masks["+"][name] = dimer["GT"]
+        end_masks["-"][name] = dimer["CT"]
+        for strand, acceptor in (("+", "AG"), ("-", "AC")):
+            start = np.nonzero(dimer[acceptor])[0] + 3
+            start = start[start <= len(sequence)]
+            starts[strand].append(start.astype(np.int64))
+            names[strand].append(np.full(start.shape, name, dtype=object))
+    candidates = {}
+    for strand in ("+", "-"):
+        position = np.concatenate(starts[strand]) if starts[strand] else np.empty(0, dtype=np.int64)
+        contig = np.concatenate(names[strand]) if names[strand] else np.empty(0, dtype=object)
+        candidates[strand] = (position, contig)
+    return candidates, end_masks
+
+
+def sample_aggt_controls(contigs, exons, sequences, seed, attempts=200):
+    masks = build_exon_mask(contigs, exons)
+    candidates, end_masks = aggt_candidates(sequences)
+    if candidates["+"][0].size == 0 and candidates["-"][0].size == 0:
+        raise ValueError("No AG/GT-flanked non-exon sites available in the provided FASTA")
+    rng = np.random.default_rng(seed)
+    controls, skipped = [], 0
+    for _, start0, end0, _ in exons:
+        need = end0 - start0 + 1
+        for _ in range(attempts):
+            strand = "+" if rng.random() < 0.5 else "-"
+            position, contig = candidates[strand]
+            if position.size == 0:
+                continue
+            index = int(rng.integers(position.size))
+            name, start = str(contig[index]), int(position[index])
+            end = start + need - 1
+            if end > contigs[name]["length"] - 2:
+                continue
+            if not end_masks[strand][name][end]:
+                continue
+            if masks[name][start - 1:end].any():
+                continue
+            controls.append((name, start, end, strand))
+            break
+        else:
+            skipped += 1
+    if not controls:
+        raise ValueError("Could not place any AG/GT-flanked non-exon control at the requested lengths")
+    return controls, skipped
+
+
+def print_boundary_comparison(compare, mean, widths, flank, bins):
+    exon_mean = np.load(compare / "mean_power.npy")
+    if exon_mean.shape != mean.shape:
+        raise ValueError("Comparison mean_power.npy shape differs; rerun with matching bins/flank")
+    low5, high5 = max(0, flank - 5), flank + 6
+    low3, high3 = flank + bins - 6, min(mean.shape[1], flank + bins + 5)
+    print("\nLocal boundary peak power, exon vs non-exon control (window +/-5 bp):")
+    print(f"{'width':>6} {'boundary':>10} {'exon':>9} {'control':>9} {'exon/ctrl':>10}")
+    for scale, width in enumerate(widths):
+        for label, (low, high) in (("5'", (low5, high5)), ("3'", (low3, high3))):
+            e = float(np.nanmax(exon_mean[scale, low:high]))
+            c = float(np.nanmax(mean[scale, low:high]))
+            print(f"{width:>6} {label:>10} {e:>9.4f} {c:>9.4f} {e / c if c else float('nan'):>10.2f}")
+
+
 def control_plot(args):
     matrix, contigs, widths = load_matrix(args.matrix)
     exons, _ = read_exons(args.gff, contigs)
@@ -272,18 +380,34 @@ def control_plot(args):
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
     if args.compare:
-        exon_mean = np.load(args.compare / "mean_power.npy")
-        if exon_mean.shape != mean.shape:
-            raise ValueError("Comparison mean_power.npy shape differs; rerun with matching bins/flank")
-        low5, high5 = max(0, args.flank - 5), args.flank + 6
-        low3, high3 = args.flank + args.bins - 6, min(mean.shape[1], args.flank + args.bins + 5)
-        print("\nLocal boundary peak power, exon vs non-exon control (window +/-5 bp):")
-        print(f"{'width':>6} {'boundary':>10} {'exon':>9} {'control':>9} {'exon/ctrl':>10}")
-        for scale, width in enumerate(widths):
-            for label, (low, high) in (("5'", (low5, high5)), ("3'", (low3, high3))):
-                e = float(np.nanmax(exon_mean[scale, low:high]))
-                c = float(np.nanmax(mean[scale, low:high]))
-                print(f"{width:>6} {label:>10} {e:>9.4f} {c:>9.4f} {e / c if c else float('nan'):>10.2f}")
+        print_boundary_comparison(args.compare, mean, widths, args.flank, args.bins)
+
+
+def control_aggt_plot(args):
+    matrix, contigs, widths = load_matrix(args.matrix)
+    exons, _ = read_exons(args.gff, contigs)
+    sequences = read_sequences(args.fasta, contigs)
+    controls, skipped = sample_aggt_controls(contigs, exons, sequences, args.seed)
+    mean, meta = render_intervals(controls, matrix, contigs, widths, args.out,
+                                  args.bins, args.flank, args.rows, "control_aggt")
+    summary = {
+        "matrix": str(args.matrix.resolve()), "annotation": str(args.gff.resolve()),
+        "fasta": str(args.fasta.resolve()), "seed": args.seed,
+        "controls": meta["count"], "skipped_lengths": skipped,
+        "plus": meta["plus"], "minus": meta["minus"], "contigs": meta["contigs"], "kernel_widths": widths,
+        "bins": args.bins, "flank_bp": args.flank, "display_rows": meta["display_rows"],
+        "min_len": meta["min_len"], "max_len": meta["max_len"],
+        "mean_body_power_by_scale": meta["mean_body_power_by_scale"],
+        "sampling": "Length-matched to annotated exons; body fully non-exonic; AG immediately upstream and "
+                    "GT immediately downstream in transcript orientation; random contig, position and strand",
+        "orientation": "5-prime to 3-prime in the sampled strand; reverse-complement CWT for minus strand",
+        "normalization": "Area-weighted mean power per bin; identical to exon normalization",
+        "edge_policy": "Contig-external flanks are NaN and excluded from means",
+    }
+    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    if args.compare:
+        print_boundary_comparison(args.compare, mean, widths, args.flank, args.bins)
 
 
 def region_plot(args):
@@ -476,6 +600,17 @@ def main():
     control.add_argument("--seed", type=int, default=42)
     control.add_argument("--compare", type=pathlib.Path)
     control.set_defaults(handler=control_plot)
+    control_aggt = commands.add_parser("control-aggt")
+    control_aggt.add_argument("matrix", type=pathlib.Path)
+    control_aggt.add_argument("--gff", type=pathlib.Path, required=True)
+    control_aggt.add_argument("--fasta", type=pathlib.Path, required=True)
+    control_aggt.add_argument("--out", type=pathlib.Path, required=True)
+    control_aggt.add_argument("--bins", type=positive, default=200)
+    control_aggt.add_argument("--flank", type=nonnegative, default=100)
+    control_aggt.add_argument("--rows", type=positive, default=1500)
+    control_aggt.add_argument("--seed", type=int, default=42)
+    control_aggt.add_argument("--compare", type=pathlib.Path)
+    control_aggt.set_defaults(handler=control_aggt_plot)
     args = parser.parse_args()
     try:
         args.handler(args)
