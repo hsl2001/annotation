@@ -1,0 +1,44 @@
+{
+  "matrix": "/tmp/colcen/cwtdir",
+  "annotation": "/tmp/colcen/genes.gff3.gz",
+  "fasta": "/tmp/colcen/fasta.gz",
+  "seed": 42,
+  "controls": 192785,
+  "skipped_lengths": 1265,
+  "plus": 89514,
+  "minus": 103271,
+  "contigs": [
+    "Chr1",
+    "Chr2",
+    "Chr3",
+    "Chr4",
+    "Chr5",
+    "ChrC",
+    "ChrM"
+  ],
+  "kernel_widths": [
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+  ],
+  "bins": 200,
+  "flank_bp": 100,
+  "display_rows": 1500,
+  "min_len": 1,
+  "max_len": 7761,
+  "mean_body_power_by_scale": [
+    0.9294024809354474,
+    0.917333786520149,
+    0.9405444063915976,
+    0.9864380461588947,
+    1.015439340087013,
+    0.9938004096437504
+  ],
+  "sampling": "Length-matched to annotated exons; body fully non-exonic; AG immediately upstream and GT immediately downstream in transcript orientation; random contig, position and strand",
+  "orientation": "5-prime to 3-prime in the sampled strand; reverse-complement CWT for minus strand",
+  "normalization": "Area-weighted mean power per bin; identical to exon normalization",
+  "edge_policy": "Contig-external flanks are NaN and excluded from means"
+}
