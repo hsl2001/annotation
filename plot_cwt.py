@@ -10,6 +10,7 @@ from collections import defaultdict
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
 
@@ -315,11 +316,31 @@ def exons_mutated_plot(args):
                                  bins=args.bins, flank=args.flank, rows=args.rows))
 
 
+def plot_exon_length_distribution(exons, out):
+    lengths = np.array([end - start + 1 for _, start, end, _ in exons])
+    minimum, maximum = int(lengths.min()), int(lengths.max())
+    edges = np.array([minimum * 0.5, maximum * 1.5]) if minimum == maximum else np.geomspace(minimum, maximum, 46)
+    counts, edges = np.histogram(lengths, bins=edges)
+    figure, axis = plt.subplots(figsize=(9, 4.8), layout="constrained")
+    axis.stairs(counts, edges, fill=True, color="#287c8e", alpha=0.82, linewidth=1.0)
+    axis.set_xscale("log")
+    axis.set_xlim(minimum, maximum)
+    ticks = [tick for tick in (1, 3, 10, 30, 100, 300, 1000, 3000, 10000, 30000) if minimum <= tick <= maximum]
+    axis.set_xticks(ticks)
+    axis.xaxis.set_major_formatter(ScalarFormatter())
+    axis.set_xlabel("Exon length (bp)")
+    axis.set_ylabel("Unique exon count")
+    axis.grid(axis="y", color="#d8dedf", linewidth=0.7)
+    figure.savefig(out / "exon_length_distribution.png", dpi=180)
+    plt.close(figure)
+
+
 def exon_plot(args):
     matrix, contigs, widths = load_matrix(args.matrix)
     exons, raw_count = read_exons(args.gff, contigs)
     mean, meta = render_intervals(exons, matrix, contigs, widths, args.out,
                                   args.bins, args.flank, args.rows, "exons")
+    plot_exon_length_distribution(exons, args.out)
     summary = {
         "matrix": str(args.matrix.resolve()), "annotation": str(args.gff.resolve()),
         "raw_exon_rows": raw_count, "unique_exons": meta["count"],
