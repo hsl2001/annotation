@@ -182,8 +182,6 @@ def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows,
         profile.plot(np.arange(columns) + 0.5, mean[scale], color="#256c87", linewidth=1.3)
         profile.set_ylabel("Mean power" if scale == 0 else "")
         for panel in (axis, profile):
-            panel.axvline(flank, color="#bf5547", linestyle="--", linewidth=0.8)
-            panel.axvline(flank + bins, color="#bf5547", linestyle="--", linewidth=0.8)
             panel.set_xticks(ticks, labels, fontsize=8)
             panel.set_xlim(0, columns)
         profile.set_xlabel("5' to 3': normalized body + genomic flanks")
@@ -574,10 +572,11 @@ def render_region(matrix, contigs, widths, seqid, start, end, strand, flank, pix
         image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
                             extent=(0, len(values), -0.5, len(widths) - 0.5), cmap=colors,
                             vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
-        if before:
-            axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
-        if after:
-            axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
+        if title != "log(1 + mean power)":
+            if before:
+                axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
+            if after:
+                axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
         axis.set_yticks(range(len(widths)), widths)
         axis.set_ylabel("Kernel width (bp)")
         axis.set_title(title, loc="left", fontsize=11)
@@ -661,8 +660,9 @@ def render_region_scaled(matrix, contigs, widths, seqid, start, end, strand, bin
         image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
                             extent=(0, columns, -0.5, len(widths) - 0.5), cmap=colors,
                             vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
-        axis.axvline(flank, color="#bf5547", linestyle="--", linewidth=0.9)
-        axis.axvline(flank + bins, color="#bf5547", linestyle="--", linewidth=0.9)
+        if title != "log(1 + mean power)":
+            axis.axvline(flank, color="#bf5547", linestyle="--", linewidth=0.9)
+            axis.axvline(flank + bins, color="#bf5547", linestyle="--", linewidth=0.9)
         axis.set_yticks(range(len(widths)), widths)
         axis.set_ylabel("Kernel width (bp)")
         axis.set_title(title, loc="left", fontsize=11)
