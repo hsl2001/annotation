@@ -7,7 +7,7 @@ gffcompare
 subset*
 Col-CC
 control*
-exons*
+*exons*
 *.bed
 __pycache__/
 AGIS/

@@ -3,7 +3,9 @@ import csv
 import gzip
 import json
 import pathlib
+import subprocess
 import sys
+from collections import defaultdict
 
 import matplotlib
 matplotlib.use("Agg")
@@ -197,6 +199,120 @@ def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows,
         "mean_body_power_by_scale": finite_mean(mean[:, flank:flank + bins], axis=1).tolist(),
     }
     return mean, meta
+
+
+def read_genome(path):
+    """Load the assembly as ordered, mutable sequences keyed by contig name."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    order, sequences = [], {}
+    name, chunks = None, []
+    with opener(path, "rt") as stream:
+        for line in stream:
+            if line.startswith(">"):
+                if name is not None:
+                    sequences[name] = bytearray("".join(chunks), "ascii")
+                header = line[1:].split()
+                name = header[0] if header else ""
+                if name in sequences:
+                    raise ValueError(f"Duplicate FASTA contig: {name}")
+                order.append(name)
+                chunks = []
+            elif name is not None:
+                chunks.append(line.strip())
+    if name is not None:
+        sequences[name] = bytearray("".join(chunks), "ascii")
+    if not order:
+        raise ValueError("No sequences found in assembly FASTA")
+    return order, sequences
+
+
+def exon_parents(attributes_text):
+    for field in attributes_text.split(";"):
+        key, separator, value = field.partition("=")
+        if separator and key.strip() == "Parent":
+            return [parent for parent in value.split(",") if parent]
+    return []
+
+
+def splice_positions(path, contigs):
+    """Return intron-boundary and transcript-terminal exon positions for mutation."""
+    transcripts = defaultdict(list)
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as stream:
+        for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
+            if not row or row[0].startswith("#"):
+                if row and row[0] == "##FASTA":
+                    break
+                continue
+            if len(row) != 9:
+                raise ValueError(f"Expected 9 GFF/GTF columns at line {line_number}")
+            if row[2] != "exon":
+                continue
+            name, start, end = row[0], int(row[3]), int(row[4])
+            if name not in contigs:
+                raise ValueError(f"Exon contig absent from assembly FASTA: {name}")
+            for parent in exon_parents(row[8]):
+                transcripts[name, parent].append((start, end))
+    positions = defaultdict(set)
+    introns = 0
+    for (name, _), exons in transcripts.items():
+        exons.sort()
+        length = contigs[name]
+        for site in (exons[0][0], exons[0][0] + 1, exons[-1][1] - 1, exons[-1][1]):
+            if 1 <= site <= length:
+                positions[name].add(site - 1)
+        for (_, prev_end), (next_start, _) in zip(exons, exons[1:]):
+            low, high = prev_end + 1, next_start - 1
+            if high < low:
+                continue
+            introns += 1
+            for site in (low, low + 1, high - 1, high):
+                if low <= site <= high and 1 <= site <= length:
+                    positions[name].add(site - 1)
+    if not introns:
+        raise ValueError("No introns found; splice donors/acceptors require multi-exon transcripts")
+    return positions, introns
+
+
+def mutate_splice_sites(sequences, positions, seed):
+    rng = np.random.default_rng(seed)
+    alphabet = "ACGT"
+    mutated = 0
+    for name, sites in positions.items():
+        sequence = sequences[name]
+        for index in sorted(sites):
+            current = chr(sequence[index]).upper()
+            options = alphabet.replace(current, "") if current in alphabet else alphabet
+            sequence[index] = ord(options[int(rng.integers(len(options)))])
+            mutated += 1
+    return mutated
+
+
+def write_genome(path, order, sequences, width=60):
+    with open(path, "w") as stream:
+        for name in order:
+            stream.write(f">{name}\n")
+            sequence = sequences[name]
+            for offset in range(0, len(sequence), width):
+                stream.write(sequence[offset:offset + width].decode("ascii"))
+                stream.write("\n")
+
+
+def exons_mutated_plot(args):
+    order, sequences = read_genome(args.fasta)
+    contigs = {name: len(sequence) for name, sequence in sequences.items()}
+    positions, introns = splice_positions(args.gff, contigs)
+    args.work.mkdir(parents=True, exist_ok=False)
+    mutated = mutate_splice_sites(sequences, positions, args.seed)
+    fasta_path = args.work / "mutated.fasta"
+    write_genome(fasta_path, order, sequences)
+    matrix_dir = args.work / "cwt"
+    print(f"Mutated {mutated:,} intron-boundary and terminal-exon bases across {introns:,} introns",
+          file=sys.stderr, flush=True)
+    anno = str(args.anno.resolve()) if args.anno.exists() else str(args.anno)
+    subprocess.run([anno, "cwt", str(fasta_path), str(matrix_dir)], check=True)
+    exon_plot(argparse.Namespace(matrix=matrix_dir, gff=args.gff, out=args.out,
+                                 bins=args.bins, flank=args.flank, rows=args.rows))
 
 
 def exon_plot(args):
@@ -590,6 +706,17 @@ def main():
     exons.add_argument("--flank", type=nonnegative, default=100)
     exons.add_argument("--rows", type=positive, default=1500)
     exons.set_defaults(handler=exon_plot)
+    mutated = commands.add_parser("exons-mutated")
+    mutated.add_argument("fasta", type=pathlib.Path)
+    mutated.add_argument("--gff", type=pathlib.Path, required=True)
+    mutated.add_argument("--out", type=pathlib.Path, required=True)
+    mutated.add_argument("--work", type=pathlib.Path, required=True)
+    mutated.add_argument("--anno", type=pathlib.Path, default=pathlib.Path("./anno"))
+    mutated.add_argument("--bins", type=positive, default=200)
+    mutated.add_argument("--flank", type=nonnegative, default=100)
+    mutated.add_argument("--rows", type=positive, default=1500)
+    mutated.add_argument("--seed", type=int, default=42)
+    mutated.set_defaults(handler=exons_mutated_plot)
     control = commands.add_parser("control")
     control.add_argument("matrix", type=pathlib.Path)
     control.add_argument("--gff", type=pathlib.Path, required=True)
@@ -614,7 +741,7 @@ def main():
     args = parser.parse_args()
     try:
         args.handler(args)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
 
 
