@@ -6,12 +6,50 @@ import subprocess
 import sys
 import tempfile
 from collections import defaultdict
+from itertools import chain
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import numpy as np
+
+PLOT_NAMES = ("exons", "exons-mutated", "control", "control-aggt",
+              "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt")
+
+
+def open_text(path):
+    return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "rt")
+
+
+def fasta_records(path, wanted=None):
+    name, chunks = None, []
+    with open_text(path) as stream:
+        for line in stream:
+            if line.startswith(">"):
+                if name is not None and (wanted is None or name in wanted):
+                    yield name, "".join(chunks)
+                header = line[1:].split()
+                name = header[0] if header else ""
+                chunks = []
+            elif name is not None and (wanted is None or name in wanted):
+                chunks.append(line.strip())
+    if name is not None and (wanted is None or name in wanted):
+        yield name, "".join(chunks)
+
+
+def gff_exons(path):
+    with open_text(path) as stream:
+        for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
+            if not row or row[0].startswith("#"):
+                if row and row[0] == "##FASTA":
+                    break
+                continue
+            if len(row) != 9:
+                raise ValueError(f"Expected 9 GFF/GTF columns at line {line_number}")
+            if row[2] == "exon":
+                yield row
+
 
 def load_matrix(directory):
     with open(directory / "contigs.tsv") as stream:
@@ -99,41 +137,31 @@ def exon_power(matrix, contig, start, end, strand, bins, flank):
 
 def read_exons(path, contigs):
     intervals = set()
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as stream:
-        for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
-            if not row or row[0].startswith("#"):
-                if row and row[0] == "##FASTA":
-                    break
-                continue
-            if len(row) != 9:
-                raise ValueError(f"Expected 9 GFF/GTF columns at line {line_number}")
-            if row[2] != "exon":
-                continue
-            name, start, end, strand = row[0], int(row[3]), int(row[4]), row[6]
-            if name not in contigs:
-                raise ValueError(f"Exon contig absent from CWT matrix: {name}")
-            oriented_bounds(contigs[name], start, end, strand)
-            intervals.add((name, start, end, strand))
+    for row in gff_exons(path):
+        name, start, end, strand = row[0], int(row[3]), int(row[4]), row[6]
+        if name not in contigs:
+            raise ValueError(f"Exon contig absent from CWT matrix: {name}")
+        oriented_bounds(contigs[name], start, end, strand)
+        intervals.add((name, start, end, strand))
     if not intervals:
         raise ValueError("No exon features found; CDS is not silently substituted for exon")
     return sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
 
 
-def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows, stem):
+def aggregate_intervals(intervals, rows, sample_power, stem, action):
     intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
-    columns = bins + 2 * flank
     display_rows = min(rows, len(intervals))
     edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
-    display_total = np.zeros((display_rows, len(widths), columns), dtype=np.float64)
+    samples = (sample_power(interval) for interval in intervals)
+    first = next(samples)
+    display_total = np.zeros((display_rows, *first.shape), dtype=np.float64)
     display_counts = np.zeros_like(display_total, dtype=np.int64)
-    total = np.zeros((len(widths), columns), dtype=np.float64)
+    total = np.zeros(first.shape, dtype=np.float64)
     counts = np.zeros_like(total, dtype=np.int64)
     display_row = 0
-    for row, (name, start, end, strand) in enumerate(intervals):
+    for row, values in enumerate(chain((first,), samples)):
         while display_row + 1 < display_rows and row >= edges[display_row + 1]:
             display_row += 1
-        values = exon_power(matrix, contigs[name], start, end, strand, bins, flank)
         valid = np.isfinite(values)
         values = np.where(valid, values, 0.0)
         total += values
@@ -141,37 +169,60 @@ def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows,
         display_total[display_row] += values
         display_counts[display_row] += valid
         if (row + 1) % 10000 == 0:
-            print(f"Normalized {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
+            print(f"{action} {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
     display = np.divide(display_total, display_counts, out=np.full_like(display_total, np.nan),
                         where=display_counts > 0).astype(np.float32)
     mean = np.divide(total, counts, out=np.full_like(total, np.nan), where=counts > 0)
+    return display, mean
+
+
+def heatmap_limit(values):
+    return max(float(np.quantile(values[np.isfinite(values)], 0.995)), 1e-6)
+
+
+def render_power_panels(display, mean, contigs, widths, path, *, positions, extent, ticks,
+                        xlabel, height, maximum=None, color_label):
     image_values = np.log1p(display)
-    finite = image_values[np.isfinite(image_values)]
-    maximum = max(float(np.quantile(finite, 0.995)), 1e-6)
-    figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 9),
+    if maximum is None:
+        maximum = heatmap_limit(image_values)
+    parameter = next(iter(contigs.values())).get("parameter", "Kernel width")
+    figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), height),
                                 gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
-    ticks = [flank, flank + bins / 2, flank + bins]
-    labels = ["0%", "50%", "100%"]
-    if flank:
-        ticks = [0, *ticks, columns]
-        labels = [f"-{flank} bp", *labels, f"+{flank} bp"]
     for scale, width in enumerate(widths):
         axis, profile = axes[:, scale]
         image = axis.imshow(image_values[:, scale], aspect="auto", origin="lower", interpolation="nearest",
-                            extent=(0, columns, 0, len(intervals)), cmap="viridis", vmin=0, vmax=maximum)
-        axis.set_title(f"{next(iter(contigs.values())).get('parameter', 'Kernel width')} {width} bp")
+                            extent=extent, cmap="viridis", vmin=0, vmax=maximum)
+        axis.set_title(f"{parameter} {width} bp")
         axis.set_ylabel("Interval rank" if scale == 0 else "")
-        profile.plot(np.arange(columns) + 0.5, mean[scale], color="#256c87", linewidth=1.3)
+        profile.plot(positions, mean[scale], color="#256c87", linewidth=1.3)
         profile.set_ylabel("Mean power" if scale == 0 else "")
         profile.set_ylim(-0.1, 2.1)
         for panel in (axis, profile):
-            panel.set_xticks(ticks, labels, fontsize=8)
-            panel.set_xlim(0, columns)
-        profile.set_xlabel("5' to 3': normalized body + genomic flanks")
-    figure.colorbar(image, ax=list(axes[0]), label="log(1 + mean power), common scale; top 0.5% clipped",
-                    shrink=0.65, pad=0.01)
-    figure.savefig(out / f"{stem}.png", dpi=160)
+            panel.set_xticks(*ticks, fontsize=8)
+            panel.set_xlim(extent[:2])
+        profile.set_xlabel(xlabel)
+    figure.colorbar(image, ax=list(axes[0]), label=color_label, shrink=0.65, pad=0.01)
+    figure.savefig(path, dpi=160)
     plt.close(figure)
+
+
+def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows, stem):
+    display, mean = aggregate_intervals(
+        intervals, rows,
+        lambda interval: exon_power(matrix, contigs[interval[0]], interval[1], interval[2],
+                                    interval[3], bins, flank),
+        stem, "Normalized")
+    columns = bins + 2 * flank
+    ticks, labels = [flank, flank + bins / 2, flank + bins], ["0%", "50%", "100%"]
+    if flank:
+        ticks, labels = [0, *ticks, columns], [f"-{flank} bp", *labels, f"+{flank} bp"]
+    render_power_panels(
+        display, mean, contigs, widths, out / f"{stem}.png",
+        positions=np.arange(columns) + 0.5, extent=(0, columns, 0, len(intervals)),
+        ticks=(ticks, labels), xlabel="5' to 3': normalized body + genomic flanks", height=9,
+        color_label="log(1 + mean power), common scale; top 0.5% clipped")
+
+
 def boundary_power(matrix, contig, interval, boundary, radius=100):
     name, start, end, strand = interval
     first, last = oriented_bounds(contig, start, end, strand)
@@ -187,82 +238,29 @@ def boundary_power(matrix, contig, interval, boundary, radius=100):
 
 
 def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, stem):
-    intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
-    display_rows = min(rows, len(intervals))
-    edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
-    shape = (2, display_rows, 201, len(widths))
-    display_total = np.zeros(shape, dtype=np.float64)
-    display_counts = np.zeros(shape, dtype=np.int64)
-    profile_total = np.zeros((2, 201, len(widths)), dtype=np.float64)
-    profile_counts = np.zeros_like(profile_total, dtype=np.int64)
-    display_row = 0
-    for row, interval in enumerate(intervals):
-        while display_row + 1 < display_rows and row >= edges[display_row + 1]:
-            display_row += 1
-        for boundary_index, boundary in enumerate(("start", "end")):
-            values = boundary_power(matrix, contigs[interval[0]], interval, boundary)
-            valid = np.isfinite(values)
-            values = np.where(valid, values, 0.0)
-            display_total[boundary_index, display_row] += values
-            display_counts[boundary_index, display_row] += valid
-            profile_total[boundary_index] += values
-            profile_counts[boundary_index] += valid
-        if (row + 1) % 10000 == 0:
-            print(f"Aligned {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
-
-    display = np.divide(display_total, display_counts, out=np.full_like(display_total, np.nan),
-                        where=display_counts > 0).astype(np.float32)
-    profiles = np.divide(profile_total, profile_counts, out=np.full_like(profile_total, np.nan),
-                         where=profile_counts > 0)
-    image_values = np.log1p(display)
-    finite = image_values[np.isfinite(image_values)]
-    maximum = max(float(np.quantile(finite, 0.995)), 1e-6)
-    offsets = np.arange(-100, 101)
-
+    display, profiles = aggregate_intervals(
+        intervals, rows,
+        lambda interval: np.stack([boundary_power(matrix, contigs[interval[0]], interval, boundary).T
+                                   for boundary in ("start", "end")]),
+        stem, "Aligned")
+    maximum = heatmap_limit(np.log1p(display))
     for boundary_index, boundary in enumerate(("start", "end")):
-        figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6),
-                                    gridspec_kw={"height_ratios": [4, 1.3]},
-                                    layout="constrained", squeeze=False)
-        for scale, width in enumerate(widths):
-            axis, profile = axes[:, scale]
-            image = axis.imshow(image_values[boundary_index, :, :, scale], aspect="auto", origin="lower",
-                                interpolation="nearest", extent=(-100.5, 100.5, 0, len(intervals)),
-                                cmap="viridis", vmin=0, vmax=maximum)
-            axis.set_title(f"{next(iter(contigs.values())).get('parameter', 'Kernel width')} {width} bp")
-            axis.set_ylabel("Interval rank" if scale == 0 else "")
-            profile.plot(offsets, profiles[boundary_index, :, scale], color="#256c87", linewidth=1.3)
-            profile.set_ylabel("Mean power" if scale == 0 else "")
-            profile.set_ylim(-0.1, 2.1)
-            for panel in (axis, profile):
-                panel.set_xlim(-100.5, 100.5)
-                panel.set_xticks((-100, 0, 100), ("-100", "0", "+100"), fontsize=8)
-            profile.set_xlabel(f"Position from {boundary} boundary (bp)")
-        figure.colorbar(image, ax=list(axes[0]), label="log(1 + power), common scale; top 0.5% clipped",
-                        shrink=0.65, pad=0.01)
-        figure.savefig(out / f"{boundary}.png", dpi=160)
-        plt.close(figure)
+        render_power_panels(
+            display[:, boundary_index], profiles[boundary_index], contigs, widths, out / f"{boundary}.png",
+            positions=np.arange(-100, 101), extent=(-100.5, 100.5, 0, len(intervals)),
+            ticks=((-100, 0, 100), ("-100", "0", "+100")),
+            xlabel=f"Position from {boundary} boundary (bp)", height=6, maximum=maximum,
+            color_label="log(1 + power), common scale; top 0.5% clipped")
 
 
 def read_genome(path):
     """Load the assembly as ordered, mutable sequences keyed by contig name."""
-    opener = gzip.open if str(path).endswith(".gz") else open
     order, sequences = [], {}
-    name, chunks = None, []
-    with opener(path, "rt") as stream:
-        for line in stream:
-            if line.startswith(">"):
-                if name is not None:
-                    sequences[name] = bytearray("".join(chunks), "ascii")
-                header = line[1:].split()
-                name = header[0] if header else ""
-                if name in sequences:
-                    raise ValueError(f"Duplicate FASTA contig: {name}")
-                order.append(name)
-                chunks = []
-            elif name is not None:
-                chunks.append(line.strip())
-    if name is not None:
-        sequences[name] = bytearray("".join(chunks), "ascii")
+    for name, sequence in fasta_records(path):
+        if name in sequences:
+            raise ValueError(f"Duplicate FASTA contig: {name}")
+        order.append(name)
+        sequences[name] = bytearray(sequence, "ascii")
     if not order:
         raise ValueError("No sequences found in assembly FASTA")
     return order, sequences
@@ -279,22 +277,12 @@ def exon_parents(attributes_text):
 def splice_positions(path, contigs):
     """Return intron-boundary and transcript-terminal exon positions for mutation."""
     transcripts = defaultdict(list)
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as stream:
-        for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
-            if not row or row[0].startswith("#"):
-                if row and row[0] == "##FASTA":
-                    break
-                continue
-            if len(row) != 9:
-                raise ValueError(f"Expected 9 GFF/GTF columns at line {line_number}")
-            if row[2] != "exon":
-                continue
-            name, start, end = row[0], int(row[3]), int(row[4])
-            if name not in contigs:
-                raise ValueError(f"Exon contig absent from assembly FASTA: {name}")
-            for parent in exon_parents(row[8]):
-                transcripts[name, parent].append((start, end))
+    for row in gff_exons(path):
+        name, start, end = row[0], int(row[3]), int(row[4])
+        if name not in contigs:
+            raise ValueError(f"Exon contig absent from assembly FASTA: {name}")
+        for parent in exon_parents(row[8]):
+            transcripts[name, parent].append((start, end))
     positions = defaultdict(set)
     introns = 0
     for (name, _), exons in transcripts.items():
@@ -397,22 +385,7 @@ def sample_controls(contigs, exons, seed, attempts=200):
 
 def read_sequences(path, contigs):
     wanted = set(contigs)
-    opener = gzip.open if str(path).endswith(".gz") else open
-    sequences = {}
-    name, keep, chunks = None, False, []
-    with opener(path, "rt") as stream:
-        for line in stream:
-            if line.startswith(">"):
-                if keep:
-                    sequences[name] = "".join(chunks).upper()
-                header = line[1:].split()
-                name = header[0] if header else ""
-                keep = name in wanted
-                chunks = []
-            elif keep:
-                chunks.append(line.strip())
-    if keep:
-        sequences[name] = "".join(chunks).upper()
+    sequences = {name: sequence.upper() for name, sequence in fasta_records(path, wanted)}
     missing = wanted - sequences.keys()
     if missing:
         raise ValueError(f"FASTA missing sequences for CWT contigs: {', '.join(sorted(missing))}")
@@ -486,36 +459,28 @@ def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attem
 def render_group(names, matrix_dir, fasta, args, output_dirs):
     matrix, contigs, widths = load_matrix(matrix_dir)
     exons = read_exons(args.gff, contigs)
-    controls = sample_controls(contigs, exons, args.seed) if {"control", "abs-control"} & set(names) else None
-    aggt_controls = None
-    if {"control-aggt", "abs-control-aggt"} & set(names):
+    requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
+    intervals = {"exons": exons}
+    if "control" in requested:
+        intervals["control"] = sample_controls(contigs, exons, args.seed)
+    if "control-aggt" in requested:
         sequences = read_sequences(fasta, contigs)
-        aggt_controls = sample_aggt_controls(contigs, exons, sequences, args.seed, length_offset=1)
+        intervals["control-aggt"] = sample_aggt_controls(contigs, exons, sequences, args.seed, length_offset=1)
 
     for name in names:
         output = output_dirs[name]
-        if name in ("exons", "exons-mutated"):
-            render_intervals(exons, matrix, contigs, widths, output,
-                             args.bins, args.flank, args.rows, name)
-            plot_exon_length_distribution(exons, output)
-        elif name == "control":
-            render_intervals(controls, matrix, contigs, widths, output,
-                             args.bins, args.flank, args.rows, name)
-        elif name == "control-aggt":
-            render_intervals(aggt_controls, matrix, contigs, widths, output,
-                             args.bins, args.flank, args.rows, name)
-        elif name in ("abs-exons", "abs-exons-mutated"):
-            render_absolute_intervals(exons, matrix, contigs, widths, output, args.rows, name)
-        elif name == "abs-control":
-            render_absolute_intervals(controls, matrix, contigs, widths, output, args.rows, name)
+        group = name.removeprefix("abs-").removesuffix("-mutated")
+        if name.startswith("abs-"):
+            render_absolute_intervals(intervals[group], matrix, contigs, widths, output, args.rows, name)
         else:
-            render_absolute_intervals(aggt_controls, matrix, contigs, widths, output, args.rows, name)
+            render_intervals(intervals[group], matrix, contigs, widths, output,
+                             args.bins, args.flank, args.rows, name)
+            if group == "exons":
+                plot_exon_length_distribution(exons, output)
 
 
 def draw_plot(args):
-    names = ("exons", "exons-mutated", "control", "control-aggt",
-             "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt")
-    selected = [name for name in names if not getattr(args, f"no_{name.replace('-', '_')}")]
+    selected = [name for name in PLOT_NAMES if not getattr(args, f"no_{name.replace('-', '_')}")]
     if not selected:
         raise ValueError("At least one plot must be selected")
     args.out.mkdir(parents=True, exist_ok=False)
@@ -541,8 +506,7 @@ def draw_plot(args):
 
 def read_bed(path, contigs):
     intervals = []
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as stream:
+    with open_text(path) as stream:
         for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
             if not row or row[0].startswith(("#", "track", "browser")):
                 continue
@@ -635,25 +599,22 @@ def main():
     draw.add_argument("--flank", type=nonnegative, default=100)
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
-    for name in ("exons", "exons-mutated", "control", "control-aggt",
-                 "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt"):
+    for name in PLOT_NAMES:
         draw.add_argument(f"--no-{name}", action="store_true")
     draw.set_defaults(handler=draw_plot)
-    region = commands.add_parser("region")
-    add_pipeline_arguments(region, "region")
-    region.add_argument("--seqid", required=True)
-    region.add_argument("--start", type=positive, required=True)
-    region.add_argument("--end", type=positive, required=True)
-    region.add_argument("--strand", choices=("+", "-"), default="+")
-    region.add_argument("--flank", type=nonnegative, default=10)
-    region.add_argument("--pixels", type=positive, default=1600)
-    region.set_defaults(handler=region_plot)
-    regions = commands.add_parser("regions")
-    add_pipeline_arguments(regions, "regions")
-    regions.add_argument("--bed", type=pathlib.Path, required=True)
-    regions.add_argument("--flank", type=nonnegative, default=10)
-    regions.add_argument("--pixels", type=positive, default=1600)
-    regions.set_defaults(handler=regions_plot)
+    for name, handler in (("region", region_plot), ("regions", regions_plot)):
+        command = commands.add_parser(name)
+        add_pipeline_arguments(command, name)
+        if name == "region":
+            command.add_argument("--seqid", required=True)
+            command.add_argument("--start", type=positive, required=True)
+            command.add_argument("--end", type=positive, required=True)
+            command.add_argument("--strand", choices=("+", "-"), default="+")
+        else:
+            command.add_argument("--bed", type=pathlib.Path, required=True)
+        command.add_argument("--flank", type=nonnegative, default=10)
+        command.add_argument("--pixels", type=positive, default=1600)
+        command.set_defaults(handler=handler)
     args = parser.parse_args()
     try:
         if args.command == "draw":
