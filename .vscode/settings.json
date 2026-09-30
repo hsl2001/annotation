@@ -1,0 +1,7 @@
+{
+    "tinymist.formatterMode": "typstyle",
+    "tinymist.fontPaths": ["${workspaceFolder}/docs/fonts"],
+    "[typst]": {
+    "editor.formatOnSave": true
+  }
+}

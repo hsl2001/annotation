@@ -1,4 +1,4 @@
-#set text(lang: "kr", font: "Noto Sans CJK KR", size: 12pt)
+#set text(lang: "kr", font: "KoPubWorldDotum_Pro", size: 12pt)
 #set page(margin: 1.5cm, paper: "a4")
 #set page(numbering: "1")
 
