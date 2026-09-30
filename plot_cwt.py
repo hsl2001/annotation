@@ -1,10 +1,10 @@
 import argparse
 import csv
 import gzip
-import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 
 import matplotlib
@@ -13,14 +13,16 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
-
 def load_matrix(directory):
     with open(directory / "contigs.tsv") as stream:
-        if stream.readline().strip() != "# anno-cwt-v1":
+        version = stream.readline().strip()
+        if version not in ("# anno-cwt-v1", "# anno-cwt-v2"):
             raise ValueError("Unsupported CWT index version")
         fields = stream.readline().rstrip().split("\t")
-        if fields[0] != "# kernel_widths":
-            raise ValueError("Missing kernel widths")
+        parameter = "Scale" if version == "# anno-cwt-v2" else "Kernel width"
+        expected_field = "# scales" if version == "# anno-cwt-v2" else "# kernel_widths"
+        if fields[0] != expected_field:
+            raise ValueError("Missing CWT parameters")
         widths = [int(value) for value in ",".join(fields[1:]).split(",") if value]
         contigs = {}
         expected = 0
@@ -29,7 +31,7 @@ def load_matrix(directory):
             length, plus, minus = (int(row[key]) for key in ("length", "plus_offset", "minus_offset"))
             if name in contigs or length <= 0 or plus != expected or minus != plus + length:
                 raise ValueError(f"Invalid contig offsets: {name}")
-            contigs[name] = {"length": length, "+": plus, "-": minus}
+            contigs[name] = {"length": length, "+": plus, "-": minus, "parameter": parameter}
             expected += 2 * length
     if not widths or not contigs:
         raise ValueError("Missing CWT metadata")
@@ -39,6 +41,13 @@ def load_matrix(directory):
         raise ValueError("Expected a little-endian complex64 matrix matching contigs.tsv")
     matrix = np.memmap(path, dtype="<c8", mode="r", shape=(expected, len(widths)))
     return matrix, contigs, widths
+
+
+def run_anno_cwt(binary, fasta, output):
+    executable = str(binary.resolve()) if binary.exists() else str(binary)
+    matrix_dir = output / "cwt"
+    subprocess.run([executable, str(fasta), str(matrix_dir)], check=True)
+    return matrix_dir
 
 
 def oriented_bounds(contig, start, end, strand):
@@ -90,7 +99,6 @@ def exon_power(matrix, contig, start, end, strand, bins, flank):
 
 def read_exons(path, contigs):
     intervals = set()
-    raw_count = 0
     opener = gzip.open if str(path).endswith(".gz") else open
     with opener(path, "rt") as stream:
         for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
@@ -106,62 +114,37 @@ def read_exons(path, contigs):
             if name not in contigs:
                 raise ValueError(f"Exon contig absent from CWT matrix: {name}")
             oriented_bounds(contigs[name], start, end, strand)
-            raw_count += 1
             intervals.add((name, start, end, strand))
     if not intervals:
         raise ValueError("No exon features found; CDS is not silently substituted for exon")
-    return sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item)), raw_count
-
-
-def finite_mean(values, axis=0):
-    valid = np.isfinite(values)
-    count = valid.sum(axis=axis)
-    total = np.where(valid, values, 0.0).sum(axis=axis, dtype=np.float64)
-    return np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
-
-
-_KIND = {
-    "exons": ("All {n:,} unique annotated exons | {bins} body bins | {rows:,} display rows\n"
-              "Every exon included; display rows average adjacent length-sorted exons",
-              "Exon rank (short to long)"),
-    "control": ("{n:,} length-matched random non-exon controls | {bins} body bins | {rows:,} display rows\n"
-                "Arbitrary genomic cut points; body avoids every annotated exon", "Control rank (short to long)"),
-    "control_aggt": ("{n:,} AG..GT-flanked non-exon controls | {bins} body bins | {rows:,} display rows\n"
-                     "Non-exon sites with AG upstream and GT downstream; length-matched to exons",
-                     "Control rank (short to long)"),
-}
+    return sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
 
 
 def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows, stem):
     intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
-    out.mkdir(parents=True, exist_ok=False)
     columns = bins + 2 * flank
-    normalized = np.lib.format.open_memmap(out / f"{stem}.power.npy", mode="w+", dtype="float32",
-                                           shape=(len(intervals), len(widths), columns))
-    total = np.zeros((len(widths), columns), dtype=np.float64)
-    counts = np.zeros_like(total, dtype=np.int64)
-    with open(out / f"{stem}.tsv", "w") as stream:
-        writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
-        writer.writerow(("row", "seqid", "start", "end", "strand", "length"))
-        for row, (name, start, end, strand) in enumerate(intervals):
-            values = exon_power(matrix, contigs[name], start, end, strand, bins, flank)
-            normalized[row] = values
-            valid = np.isfinite(values)
-            total += np.where(valid, values, 0.0)
-            counts += valid
-            writer.writerow((row, name, start, end, strand, end - start + 1))
-            if (row + 1) % 10000 == 0:
-                print(f"Normalized {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
-    normalized.flush()
-    del normalized
-    normalized = np.load(out / f"{stem}.power.npy", mmap_mode="r", allow_pickle=False)
     display_rows = min(rows, len(intervals))
     edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
-    display = np.empty((display_rows, len(widths), columns), dtype=np.float32)
-    for row, (first, last) in enumerate(zip(edges[:-1], edges[1:])):
-        display[row] = finite_mean(normalized[first:last])
+    display_total = np.zeros((display_rows, len(widths), columns), dtype=np.float64)
+    display_counts = np.zeros_like(display_total, dtype=np.int64)
+    total = np.zeros((len(widths), columns), dtype=np.float64)
+    counts = np.zeros_like(total, dtype=np.int64)
+    display_row = 0
+    for row, (name, start, end, strand) in enumerate(intervals):
+        while display_row + 1 < display_rows and row >= edges[display_row + 1]:
+            display_row += 1
+        values = exon_power(matrix, contigs[name], start, end, strand, bins, flank)
+        valid = np.isfinite(values)
+        values = np.where(valid, values, 0.0)
+        total += values
+        counts += valid
+        display_total[display_row] += values
+        display_counts[display_row] += valid
+        if (row + 1) % 10000 == 0:
+            print(f"Normalized {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
+    display = np.divide(display_total, display_counts, out=np.full_like(display_total, np.nan),
+                        where=display_counts > 0).astype(np.float32)
     mean = np.divide(total, counts, out=np.full_like(total, np.nan), where=counts > 0)
-    np.save(out / "mean_power.npy", mean)
     image_values = np.log1p(display)
     finite = image_values[np.isfinite(image_values)]
     maximum = max(float(np.quantile(finite, 0.995)), 1e-6)
@@ -172,32 +155,92 @@ def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows,
     if flank:
         ticks = [0, *ticks, columns]
         labels = [f"-{flank} bp", *labels, f"+{flank} bp"]
-    title, rank_label = _KIND[stem]
     for scale, width in enumerate(widths):
         axis, profile = axes[:, scale]
         image = axis.imshow(image_values[:, scale], aspect="auto", origin="lower", interpolation="nearest",
                             extent=(0, columns, 0, len(intervals)), cmap="viridis", vmin=0, vmax=maximum)
-        axis.set_title(f"Kernel width {width} bp")
-        axis.set_ylabel(rank_label if scale == 0 else "")
+        axis.set_title(f"{next(iter(contigs.values())).get('parameter', 'Kernel width')} {width} bp")
+        axis.set_ylabel("Interval rank" if scale == 0 else "")
         profile.plot(np.arange(columns) + 0.5, mean[scale], color="#256c87", linewidth=1.3)
         profile.set_ylabel("Mean power" if scale == 0 else "")
+        profile.set_ylim(-0.1, 2.1)
         for panel in (axis, profile):
             panel.set_xticks(ticks, labels, fontsize=8)
             panel.set_xlim(0, columns)
         profile.set_xlabel("5' to 3': normalized body + genomic flanks")
     figure.colorbar(image, ax=list(axes[0]), label="log(1 + mean power), common scale; top 0.5% clipped",
                     shrink=0.65, pad=0.01)
-    figure.suptitle(title.format(n=len(intervals), bins=bins, rows=display_rows), fontsize=14)
     figure.savefig(out / f"{stem}.png", dpi=160)
     plt.close(figure)
-    meta = {
-        "count": len(intervals), "display_rows": display_rows,
-        "min_len": intervals[0][2] - intervals[0][1] + 1, "max_len": intervals[-1][2] - intervals[-1][1] + 1,
-        "plus": sum(item[3] == "+" for item in intervals), "minus": sum(item[3] == "-" for item in intervals),
-        "contigs": sorted({item[0] for item in intervals}),
-        "mean_body_power_by_scale": finite_mean(mean[:, flank:flank + bins], axis=1).tolist(),
-    }
-    return mean, meta
+def boundary_power(matrix, contig, interval, boundary, radius=100):
+    name, start, end, strand = interval
+    first, last = oriented_bounds(contig, start, end, strand)
+    center = first if boundary == "start" else last - 1
+    left, right = center - radius, center + radius + 1
+    window = np.full((2 * radius + 1, matrix.shape[1]), np.nan, dtype=np.float32)
+    clipped_left, clipped_right = max(0, left), min(contig["length"], right)
+    if clipped_left < clipped_right:
+        destination = clipped_left - left
+        window[destination:destination + clipped_right - clipped_left] = power(
+            matrix[contig[strand] + clipped_left:contig[strand] + clipped_right])
+    return window
+
+
+def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, stem):
+    intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
+    display_rows = min(rows, len(intervals))
+    edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
+    shape = (2, display_rows, 201, len(widths))
+    display_total = np.zeros(shape, dtype=np.float64)
+    display_counts = np.zeros(shape, dtype=np.int64)
+    profile_total = np.zeros((2, 201, len(widths)), dtype=np.float64)
+    profile_counts = np.zeros_like(profile_total, dtype=np.int64)
+    display_row = 0
+    for row, interval in enumerate(intervals):
+        while display_row + 1 < display_rows and row >= edges[display_row + 1]:
+            display_row += 1
+        for boundary_index, boundary in enumerate(("start", "end")):
+            values = boundary_power(matrix, contigs[interval[0]], interval, boundary)
+            valid = np.isfinite(values)
+            values = np.where(valid, values, 0.0)
+            display_total[boundary_index, display_row] += values
+            display_counts[boundary_index, display_row] += valid
+            profile_total[boundary_index] += values
+            profile_counts[boundary_index] += valid
+        if (row + 1) % 10000 == 0:
+            print(f"Aligned {row + 1:,}/{len(intervals):,} {stem}", file=sys.stderr, flush=True)
+
+    display = np.divide(display_total, display_counts, out=np.full_like(display_total, np.nan),
+                        where=display_counts > 0).astype(np.float32)
+    profiles = np.divide(profile_total, profile_counts, out=np.full_like(profile_total, np.nan),
+                         where=profile_counts > 0)
+    image_values = np.log1p(display)
+    finite = image_values[np.isfinite(image_values)]
+    maximum = max(float(np.quantile(finite, 0.995)), 1e-6)
+    offsets = np.arange(-100, 101)
+
+    for boundary_index, boundary in enumerate(("start", "end")):
+        figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6),
+                                    gridspec_kw={"height_ratios": [4, 1.3]},
+                                    layout="constrained", squeeze=False)
+        for scale, width in enumerate(widths):
+            axis, profile = axes[:, scale]
+            image = axis.imshow(image_values[boundary_index, :, :, scale], aspect="auto", origin="lower",
+                                interpolation="nearest", extent=(-100.5, 100.5, 0, len(intervals)),
+                                cmap="viridis", vmin=0, vmax=maximum)
+            axis.set_title(f"{next(iter(contigs.values())).get('parameter', 'Kernel width')} {width} bp")
+            axis.set_ylabel("Interval rank" if scale == 0 else "")
+            profile.plot(offsets, profiles[boundary_index, :, scale], color="#256c87", linewidth=1.3)
+            profile.set_ylabel("Mean power" if scale == 0 else "")
+            profile.set_ylim(-0.1, 2.1)
+            for panel in (axis, profile):
+                panel.set_xlim(-100.5, 100.5)
+                panel.set_xticks((-100, 0, 100), ("-100", "0", "+100"), fontsize=8)
+            profile.set_xlabel(f"Position from {boundary} boundary (bp)")
+        figure.colorbar(image, ax=list(axes[0]), label="log(1 + power), common scale; top 0.5% clipped",
+                        shrink=0.65, pad=0.01)
+        figure.savefig(out / f"{boundary}.png", dpi=160)
+        plt.close(figure)
 
 
 def read_genome(path):
@@ -270,21 +313,18 @@ def splice_positions(path, contigs):
                     positions[name].add(site - 1)
     if not introns:
         raise ValueError("No introns found; splice donors/acceptors require multi-exon transcripts")
-    return positions, introns
+    return positions
 
 
 def mutate_splice_sites(sequences, positions, seed):
     rng = np.random.default_rng(seed)
     alphabet = "ACGT"
-    mutated = 0
     for name, sites in positions.items():
         sequence = sequences[name]
         for index in sorted(sites):
             current = chr(sequence[index]).upper()
             options = alphabet.replace(current, "") if current in alphabet else alphabet
             sequence[index] = ord(options[int(rng.integers(len(options)))])
-            mutated += 1
-    return mutated
 
 
 def write_genome(path, order, sequences, width=60):
@@ -297,21 +337,13 @@ def write_genome(path, order, sequences, width=60):
                 stream.write("\n")
 
 
-def exons_mutated_plot(args):
-    order, sequences = read_genome(args.fasta)
+def make_mutated_fasta(fasta, gff, seed, output):
+    order, sequences = read_genome(fasta)
     contigs = {name: len(sequence) for name, sequence in sequences.items()}
-    positions, introns = splice_positions(args.gff, contigs)
-    args.work.mkdir(parents=True, exist_ok=False)
-    mutated = mutate_splice_sites(sequences, positions, args.seed)
-    fasta_path = args.work / "mutated.fasta"
-    write_genome(fasta_path, order, sequences)
-    matrix_dir = args.work / "cwt"
-    print(f"Mutated {mutated:,} intron-boundary and terminal-exon bases across {introns:,} introns",
-          file=sys.stderr, flush=True)
-    anno = str(args.anno.resolve()) if args.anno.exists() else str(args.anno)
-    subprocess.run([anno, "cwt", str(fasta_path), str(matrix_dir)], check=True)
-    exon_plot(argparse.Namespace(matrix=matrix_dir, gff=args.gff, out=args.out,
-                                 bins=args.bins, flank=args.flank, rows=args.rows))
+    positions = splice_positions(gff, contigs)
+    mutate_splice_sites(sequences, positions, seed)
+    write_genome(output, order, sequences)
+    return output
 
 
 def plot_exon_length_distribution(exons, out):
@@ -333,30 +365,6 @@ def plot_exon_length_distribution(exons, out):
     plt.close(figure)
 
 
-def exon_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    exons, raw_count = read_exons(args.gff, contigs)
-    mean, meta = render_intervals(exons, matrix, contigs, widths, args.out,
-                                  args.bins, args.flank, args.rows, "exons")
-    plot_exon_length_distribution(exons, args.out)
-    summary = {
-        "matrix": str(args.matrix.resolve()), "annotation": str(args.gff.resolve()),
-        "raw_exon_rows": raw_count, "unique_exons": meta["count"],
-        "duplicate_exon_rows": raw_count - meta["count"],
-        "plus_exons": meta["plus"], "minus_exons": meta["minus"],
-        "contigs": meta["contigs"], "kernel_widths": widths,
-        "bins": args.bins, "flank_bp": args.flank, "display_rows": meta["display_rows"],
-        "min_exon_bp": meta["min_len"], "max_exon_bp": meta["max_len"],
-        "mean_exon_power_by_scale": meta["mean_body_power_by_scale"],
-        "orientation": "Transcript 5-prime to 3-prime; reverse-complement CWT for minus strand",
-        "normalization": "Area-weighted mean power per bin; length only, no per-exon amplitude normalization",
-        "edge_policy": "Contig-external flanks are NaN and excluded from means",
-        "reference_policy": "Every exon feature, including UTR and noncoding exons; identical strand/coordinates deduplicated",
-    }
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps(summary, indent=2))
-
-
 def build_exon_mask(contigs, exons):
     masks = {name: np.zeros(info["length"], dtype=bool) for name, info in contigs.items()}
     for name, start, end, _ in exons:
@@ -369,7 +377,7 @@ def sample_controls(contigs, exons, seed, attempts=200):
     names = list(contigs)
     weights = np.cumsum([contigs[name]["length"] for name in names], dtype=np.float64)
     rng = np.random.default_rng(seed)
-    controls, skipped = [], 0
+    controls = []
     for _, start0, end0, _ in exons:
         need = end0 - start0 + 1
         for _ in range(attempts):
@@ -382,11 +390,9 @@ def sample_controls(contigs, exons, seed, attempts=200):
             if not masks[name][start - 1:start - 1 + need].any():
                 controls.append((name, start, start + need - 1, "+" if rng.random() < 0.5 else "-"))
                 break
-        else:
-            skipped += 1
     if not controls:
         raise ValueError("Could not place any non-exon control at the requested lengths")
-    return controls, skipped
+    return controls
 
 
 def read_sequences(path, contigs):
@@ -447,15 +453,15 @@ def aggt_candidates(sequences):
     return candidates, end_masks
 
 
-def sample_aggt_controls(contigs, exons, sequences, seed, attempts=200):
+def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attempts=200):
     masks = build_exon_mask(contigs, exons)
     candidates, end_masks = aggt_candidates(sequences)
     if candidates["+"][0].size == 0 and candidates["-"][0].size == 0:
         raise ValueError("No AG/GT-flanked non-exon sites available in the provided FASTA")
     rng = np.random.default_rng(seed)
-    controls, skipped = [], 0
+    controls = []
     for _, start0, end0, _ in exons:
-        need = end0 - start0 + 1
+        need = end0 - start0 + 1 + length_offset
         for _ in range(attempts):
             strand = "+" if rng.random() < 0.5 else "-"
             position, contig = candidates[strand]
@@ -472,120 +478,65 @@ def sample_aggt_controls(contigs, exons, sequences, seed, attempts=200):
                 continue
             controls.append((name, start, end, strand))
             break
-        else:
-            skipped += 1
     if not controls:
         raise ValueError("Could not place any AG/GT-flanked non-exon control at the requested lengths")
-    return controls, skipped
+    return controls
 
 
-def print_boundary_comparison(compare, mean, widths, flank, bins):
-    exon_mean = np.load(compare / "mean_power.npy")
-    if exon_mean.shape != mean.shape:
-        raise ValueError("Comparison mean_power.npy shape differs; rerun with matching bins/flank")
-    low5, high5 = max(0, flank - 5), flank + 6
-    low3, high3 = flank + bins - 6, min(mean.shape[1], flank + bins + 5)
-    print("\nLocal boundary peak power, exon vs non-exon control (window +/-5 bp):")
-    print(f"{'width':>6} {'boundary':>10} {'exon':>9} {'control':>9} {'exon/ctrl':>10}")
-    for scale, width in enumerate(widths):
-        for label, (low, high) in (("5'", (low5, high5)), ("3'", (low3, high3))):
-            e = float(np.nanmax(exon_mean[scale, low:high]))
-            c = float(np.nanmax(mean[scale, low:high]))
-            print(f"{width:>6} {label:>10} {e:>9.4f} {c:>9.4f} {e / c if c else float('nan'):>10.2f}")
+def render_group(names, matrix_dir, fasta, args, output_dirs):
+    matrix, contigs, widths = load_matrix(matrix_dir)
+    exons = read_exons(args.gff, contigs)
+    controls = sample_controls(contigs, exons, args.seed) if {"control", "abs-control"} & set(names) else None
+    aggt_controls = None
+    if {"control-aggt", "abs-control-aggt"} & set(names):
+        sequences = read_sequences(fasta, contigs)
+        aggt_controls = sample_aggt_controls(contigs, exons, sequences, args.seed, length_offset=1)
+
+    for name in names:
+        output = output_dirs[name]
+        if name in ("exons", "exons-mutated"):
+            render_intervals(exons, matrix, contigs, widths, output,
+                             args.bins, args.flank, args.rows, name)
+            plot_exon_length_distribution(exons, output)
+        elif name == "control":
+            render_intervals(controls, matrix, contigs, widths, output,
+                             args.bins, args.flank, args.rows, name)
+        elif name == "control-aggt":
+            render_intervals(aggt_controls, matrix, contigs, widths, output,
+                             args.bins, args.flank, args.rows, name)
+        elif name in ("abs-exons", "abs-exons-mutated"):
+            render_absolute_intervals(exons, matrix, contigs, widths, output, args.rows, name)
+        elif name == "abs-control":
+            render_absolute_intervals(controls, matrix, contigs, widths, output, args.rows, name)
+        else:
+            render_absolute_intervals(aggt_controls, matrix, contigs, widths, output, args.rows, name)
 
 
-def control_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    exons, _ = read_exons(args.gff, contigs)
-    controls, skipped = sample_controls(contigs, exons, args.seed)
-    mean, meta = render_intervals(controls, matrix, contigs, widths, args.out,
-                                  args.bins, args.flank, args.rows, "control")
-    summary = {
-        "matrix": str(args.matrix.resolve()), "annotation": str(args.gff.resolve()), "seed": args.seed,
-        "controls": meta["count"], "skipped_lengths": skipped,
-        "plus": meta["plus"], "minus": meta["minus"], "contigs": meta["contigs"], "kernel_widths": widths,
-        "bins": args.bins, "flank_bp": args.flank, "display_rows": meta["display_rows"],
-        "min_len": meta["min_len"], "max_len": meta["max_len"],
-        "mean_body_power_by_scale": meta["mean_body_power_by_scale"],
-        "sampling": "Length-matched to annotated exons; body fully non-exonic; random contig, position and strand",
-        "orientation": "5-prime to 3-prime in the sampled strand; reverse-complement CWT for minus strand",
-        "normalization": "Area-weighted mean power per bin; identical to exon normalization",
-        "edge_policy": "Contig-external flanks are NaN and excluded from means",
-    }
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps(summary, indent=2))
-    if args.compare:
-        print_boundary_comparison(args.compare, mean, widths, args.flank, args.bins)
+def draw_plot(args):
+    names = ("exons", "exons-mutated", "control", "control-aggt",
+             "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt")
+    selected = [name for name in names if not getattr(args, f"no_{name.replace('-', '_')}")]
+    if not selected:
+        raise ValueError("At least one plot must be selected")
+    args.out.mkdir(parents=True, exist_ok=False)
+    output_dirs = {name: args.out / name for name in selected}
+    for output in output_dirs.values():
+        output.mkdir()
 
-
-def control_aggt_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    exons, _ = read_exons(args.gff, contigs)
-    sequences = read_sequences(args.fasta, contigs)
-    controls, skipped = sample_aggt_controls(contigs, exons, sequences, args.seed)
-    mean, meta = render_intervals(controls, matrix, contigs, widths, args.out,
-                                  args.bins, args.flank, args.rows, "control_aggt")
-    summary = {
-        "matrix": str(args.matrix.resolve()), "annotation": str(args.gff.resolve()),
-        "fasta": str(args.fasta.resolve()), "seed": args.seed,
-        "controls": meta["count"], "skipped_lengths": skipped,
-        "plus": meta["plus"], "minus": meta["minus"], "contigs": meta["contigs"], "kernel_widths": widths,
-        "bins": args.bins, "flank_bp": args.flank, "display_rows": meta["display_rows"],
-        "min_len": meta["min_len"], "max_len": meta["max_len"],
-        "mean_body_power_by_scale": meta["mean_body_power_by_scale"],
-        "sampling": "Length-matched to annotated exons; body fully non-exonic; AG immediately upstream and "
-                    "GT immediately downstream in transcript orientation; random contig, position and strand",
-        "orientation": "5-prime to 3-prime in the sampled strand; reverse-complement CWT for minus strand",
-        "normalization": "Area-weighted mean power per bin; identical to exon normalization",
-        "edge_policy": "Contig-external flanks are NaN and excluded from means",
-    }
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps(summary, indent=2))
-    if args.compare:
-        print_boundary_comparison(args.compare, mean, widths, args.flank, args.bins)
-
-
-def region_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    render_region(matrix, contigs, widths, args.seqid, args.start, args.end, args.strand,
-                  args.flank, args.pixels, args.out)
-
-
-def render_region(matrix, contigs, widths, seqid, start, end, strand, flank, pixels, out):
-    if seqid not in contigs:
-        raise ValueError(f"Unknown contig: {seqid}")
-    contig = contigs[seqid]
-    first, last = oriented_bounds(contig, start, end, strand)
-    before, after = min(flank, first), min(flank, contig["length"] - last)
-    low, high = first - before, last + after
-    values = matrix[contig[strand] + low:contig[strand] + high]
-    if len(values) > 100000:
-        raise ValueError("Use a region of at most 100,000 bp for real/imaginary/phase detail")
-    bins = min(pixels, len(values))
-    body_end = before + (last - first)
-    panels = ((resample_mean(np.real(values), bins).T, "Real (bin mean)", "RdBu_r"),
-              (resample_mean(np.imag(values), bins).T, "Imaginary (bin mean)", "RdBu_r"),
-              (np.log1p(resample_mean(power(values), bins)).T, "log(1 + mean power)", "viridis"))
-    figure, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True, layout="constrained")
-    for axis, (image_values, title, colors) in zip(axes, panels):
-        maximum = max(float(np.abs(image_values).max()), 1e-6)
-        image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
-                            extent=(0, len(values), -0.5, len(widths) - 0.5), cmap=colors,
-                            vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
-        if title != "log(1 + mean power)":
-            if before:
-                axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
-            if after:
-                axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
-        axis.set_yticks(range(len(widths)), widths)
-        axis.set_ylabel("Kernel width (bp)")
-        axis.set_title(title, loc="left", fontsize=11)
-        figure.colorbar(image, ax=axis, pad=0.01)
-    axes[-1].set_xlabel(f"Offset from 5' end (bp); dashed lines bound the ROI, {flank} bp genomic flanks outside")
-    figure.suptitle(f"{seqid}:{start:,}-{end:,} ({strand}) | CWT | +/-{flank} bp flanks")
-    figure.savefig(out, dpi=160)
-    plt.close(figure)
-    print(out)
+    groups = (([name for name in selected if not name.endswith("-mutated")], args.fasta, "original"),
+              ([name for name in selected if name.endswith("-mutated")], None, "mutated"))
+    with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out) as temporary:
+        work = pathlib.Path(temporary)
+        for group_names, fasta, label in groups:
+            if not group_names:
+                continue
+            group_work = work / label
+            group_work.mkdir()
+            if fasta is None:
+                fasta = make_mutated_fasta(args.fasta, args.gff, args.seed, work / "mutated.fa")
+            matrix_dir = run_anno_cwt(args.anno_cwt, fasta, group_work)
+            print(f"Plotting {', '.join(group_names)}", file=sys.stderr, flush=True)
+            render_group(group_names, matrix_dir, fasta, args, output_dirs)
 
 
 def read_bed(path, contigs):
@@ -608,74 +559,50 @@ def read_bed(path, contigs):
     return intervals
 
 
+def draw_roi(intervals, matrix, contigs, widths, out, flank, pixels):
+    for name, start, end, strand in intervals:
+        contig = contigs[name]
+        first, last = oriented_bounds(contig, start, end, strand)
+        before, after = min(flank, first), min(flank, contig["length"] - last)
+        values = matrix[contig[strand] + first - before:contig[strand] + last + after]
+        if len(values) > 100000:
+            raise ValueError("Use a region of at most 100,000 bp for real/imaginary/phase detail")
+        bins = min(pixels, len(values))
+        body_end = before + last - first
+        panels = ((resample_mean(np.real(values), bins).T, "Real (bin mean)", "RdBu_r"),
+                  (resample_mean(np.imag(values), bins).T, "Imaginary (bin mean)", "RdBu_r"),
+                  (np.log1p(resample_mean(power(values), bins)).T, "log(1 + mean power)", "viridis"))
+        figure, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True, layout="constrained")
+        for axis, (panel, title, cmap) in zip(axes, panels):
+            maximum = max(float(np.nanmax(np.abs(panel))), 1e-6)
+            image = axis.imshow(panel, aspect="auto", origin="lower", interpolation="nearest",
+                                extent=(0, len(values), -0.5, len(widths) - 0.5), cmap=cmap,
+                                vmin=0 if cmap == "viridis" else -maximum, vmax=maximum)
+            axis.set_yticks(range(len(widths)), widths)
+            axis.set_ylabel(f"{contig.get('parameter', 'Kernel width')} (bp)")
+            axis.set_title(title, loc="left", fontsize=11)
+            figure.colorbar(image, ax=axis, pad=0.01)
+            if title != "log(1 + mean power)":
+                if before:
+                    axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
+                if after:
+                    axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
+        axes[-1].set_xlabel(f"5' to 3' offset; ROI with {flank} bp flanks")
+        figure.suptitle(f"{name}:{start:,}-{end:,} ({strand}) | CWT")
+        tag = "plus" if strand == "+" else "minus"
+        figure.savefig(out / f"{name}_{start:06d}_{end:06d}_{tag}.png", dpi=160)
+        plt.close(figure)
+
+
+def region_plot(args):
+    matrix, contigs, widths = load_matrix(args.matrix)
+    draw_roi([(args.seqid, args.start, args.end, args.strand)], matrix, contigs, widths,
+             args.out, args.flank, args.pixels)
+
+
 def regions_plot(args):
     matrix, contigs, widths = load_matrix(args.matrix)
-    intervals = read_bed(args.bed, contigs)
-    args.out.mkdir(parents=True, exist_ok=False)
-    for name, start, end, strand in intervals:
-        tag = "plus" if strand == "+" else "minus"
-        render_region(matrix, contigs, widths, name, start, end, strand, args.flank, args.pixels,
-                      args.out / f"{name}_{start:06d}_{end:06d}_{tag}.png")
-    print(f"Rendered {len(intervals)} per-ROI region plots into {args.out}/")
-
-
-def regions_scaled_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    intervals = read_bed(args.bed, contigs)
-    args.out.mkdir(parents=True, exist_ok=False)
-    for name, start, end, strand in intervals:
-        tag = "plus" if strand == "+" else "minus"
-        render_region_scaled(matrix, contigs, widths, name, start, end, strand, args.bins, args.flank,
-                             args.out / f"{name}_{start:06d}_{end:06d}_{tag}.png")
-    print(f"Rendered {len(intervals)} scaled per-ROI region plots into {args.out}/")
-
-
-# Same real/imaginary/power detail as render_region, but the body is resampled to a fixed bin
-# count so every ROI's start and end line up; genomic flanks match exons/control exactly
-# (raw per-bp, NaN-padded past a contig edge).
-def render_region_scaled(matrix, contigs, widths, seqid, start, end, strand, bins, flank, out):
-    if seqid not in contigs:
-        raise ValueError(f"Unknown contig: {seqid}")
-    contig = contigs[seqid]
-    first, last = oriented_bounds(contig, start, end, strand)
-    before, after = min(flank, first), min(flank, contig["length"] - last)
-    offset, body_len, columns = contig[strand], last - first, bins + 2 * flank
-    span = matrix[offset + first - before:offset + last + after]
-
-    def scaled(component):
-        result = np.full((columns, component.shape[1]), np.nan, dtype=np.float64)
-        result[flank:flank + bins] = resample_mean(component[before:before + body_len], bins)
-        if before:
-            result[flank - before:flank] = component[:before]
-        if after:
-            result[flank + bins:flank + bins + after] = component[before + body_len:before + body_len + after]
-        return result.T
-
-    panels = ((scaled(np.real(span)), "Real (bin mean)", "RdBu_r"),
-              (scaled(np.imag(span)), "Imaginary (bin mean)", "RdBu_r"),
-              (np.log1p(scaled(power(span))), "log(1 + mean power)", "viridis"))
-    figure, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True, layout="constrained")
-    for axis, (image_values, title, colors) in zip(axes, panels):
-        maximum = max(float(np.nanmax(np.abs(image_values))), 1e-6)
-        image = axis.imshow(image_values, aspect="auto", origin="lower", interpolation="nearest",
-                            extent=(0, columns, -0.5, len(widths) - 0.5), cmap=colors,
-                            vmin=0 if colors == "viridis" else -maximum, vmax=maximum)
-        if title != "log(1 + mean power)":
-            axis.axvline(flank, color="#bf5547", linestyle="--", linewidth=0.9)
-            axis.axvline(flank + bins, color="#bf5547", linestyle="--", linewidth=0.9)
-        axis.set_yticks(range(len(widths)), widths)
-        axis.set_ylabel("Kernel width (bp)")
-        axis.set_title(title, loc="left", fontsize=11)
-        figure.colorbar(image, ax=axis, pad=0.01)
-    ticks, labels = [flank, flank + bins / 2, flank + bins], ["0%", "50%", "100%"]
-    if flank:
-        ticks, labels = [0, *ticks, columns], [f"-{flank} bp", *labels, f"+{flank} bp"]
-    axes[-1].set_xticks(ticks, labels)
-    axes[-1].set_xlabel(f"5' to 3': body scaled to {bins} bins, {flank} bp genomic flanks")
-    figure.suptitle(f"{seqid}:{start:,}-{end:,} ({strand}) | CWT | body scaled to {bins} bins +/-{flank} bp")
-    figure.savefig(out, dpi=160)
-    plt.close(figure)
-    print(out)
+    draw_roi(read_bed(args.bed, contigs), matrix, contigs, widths, args.out, args.flank, args.pixels)
 
 
 def positive(text):
@@ -692,76 +619,50 @@ def nonnegative(text):
     return value
 
 
+def add_pipeline_arguments(command, output_name):
+    command.add_argument("fasta", type=pathlib.Path)
+    command.add_argument("--out", type=pathlib.Path, default=pathlib.Path(output_name))
+    command.add_argument("--anno-cwt", type=pathlib.Path, default=pathlib.Path("./anno_cwt"))
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Memory-mapped CWT visualization and all-exon length normalization")
+    parser = argparse.ArgumentParser(description="Generate CWT with anno_cwt, then plot and normalize genomic intervals")
     commands = parser.add_subparsers(dest="command", required=True)
+    draw = commands.add_parser("draw", help="run exon/control plots; --no-* skips a plot")
+    add_pipeline_arguments(draw, "plots-draw")
+    draw.add_argument("--gff", type=pathlib.Path, required=True)
+    draw.add_argument("--bins", type=positive, default=200)
+    draw.add_argument("--flank", type=nonnegative, default=100)
+    draw.add_argument("--rows", type=positive, default=1500)
+    draw.add_argument("--seed", type=int, default=42)
+    for name in ("exons", "exons-mutated", "control", "control-aggt",
+                 "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt"):
+        draw.add_argument(f"--no-{name}", action="store_true")
+    draw.set_defaults(handler=draw_plot)
     region = commands.add_parser("region")
-    region.add_argument("matrix", type=pathlib.Path)
+    add_pipeline_arguments(region, "region")
     region.add_argument("--seqid", required=True)
     region.add_argument("--start", type=positive, required=True)
     region.add_argument("--end", type=positive, required=True)
     region.add_argument("--strand", choices=("+", "-"), default="+")
     region.add_argument("--flank", type=nonnegative, default=10)
     region.add_argument("--pixels", type=positive, default=1600)
-    region.add_argument("--out", type=pathlib.Path, required=True)
     region.set_defaults(handler=region_plot)
     regions = commands.add_parser("regions")
-    regions.add_argument("matrix", type=pathlib.Path)
+    add_pipeline_arguments(regions, "regions")
     regions.add_argument("--bed", type=pathlib.Path, required=True)
-    regions.add_argument("--out", type=pathlib.Path, required=True)
     regions.add_argument("--flank", type=nonnegative, default=10)
     regions.add_argument("--pixels", type=positive, default=1600)
     regions.set_defaults(handler=regions_plot)
-    regions_scaled = commands.add_parser("regions_scaled")
-    regions_scaled.add_argument("matrix", type=pathlib.Path)
-    regions_scaled.add_argument("--bed", type=pathlib.Path, required=True)
-    regions_scaled.add_argument("--out", type=pathlib.Path, required=True)
-    regions_scaled.add_argument("--bins", type=positive, default=200)
-    regions_scaled.add_argument("--flank", type=nonnegative, default=100)
-    regions_scaled.set_defaults(handler=regions_scaled_plot)
-    exons = commands.add_parser("exons")
-    exons.add_argument("matrix", type=pathlib.Path)
-    exons.add_argument("--gff", type=pathlib.Path, required=True)
-    exons.add_argument("--out", type=pathlib.Path, required=True)
-    exons.add_argument("--bins", type=positive, default=200)
-    exons.add_argument("--flank", type=nonnegative, default=100)
-    exons.add_argument("--rows", type=positive, default=1500)
-    exons.set_defaults(handler=exon_plot)
-    mutated = commands.add_parser("exons-mutated")
-    mutated.add_argument("fasta", type=pathlib.Path)
-    mutated.add_argument("--gff", type=pathlib.Path, required=True)
-    mutated.add_argument("--out", type=pathlib.Path, required=True)
-    mutated.add_argument("--work", type=pathlib.Path, required=True)
-    mutated.add_argument("--anno", type=pathlib.Path, default=pathlib.Path("./anno"))
-    mutated.add_argument("--bins", type=positive, default=200)
-    mutated.add_argument("--flank", type=nonnegative, default=100)
-    mutated.add_argument("--rows", type=positive, default=1500)
-    mutated.add_argument("--seed", type=int, default=42)
-    mutated.set_defaults(handler=exons_mutated_plot)
-    control = commands.add_parser("control")
-    control.add_argument("matrix", type=pathlib.Path)
-    control.add_argument("--gff", type=pathlib.Path, required=True)
-    control.add_argument("--out", type=pathlib.Path, required=True)
-    control.add_argument("--bins", type=positive, default=200)
-    control.add_argument("--flank", type=nonnegative, default=100)
-    control.add_argument("--rows", type=positive, default=1500)
-    control.add_argument("--seed", type=int, default=42)
-    control.add_argument("--compare", type=pathlib.Path)
-    control.set_defaults(handler=control_plot)
-    control_aggt = commands.add_parser("control-aggt")
-    control_aggt.add_argument("matrix", type=pathlib.Path)
-    control_aggt.add_argument("--gff", type=pathlib.Path, required=True)
-    control_aggt.add_argument("--fasta", type=pathlib.Path, required=True)
-    control_aggt.add_argument("--out", type=pathlib.Path, required=True)
-    control_aggt.add_argument("--bins", type=positive, default=200)
-    control_aggt.add_argument("--flank", type=nonnegative, default=100)
-    control_aggt.add_argument("--rows", type=positive, default=1500)
-    control_aggt.add_argument("--seed", type=int, default=42)
-    control_aggt.add_argument("--compare", type=pathlib.Path)
-    control_aggt.set_defaults(handler=control_aggt_plot)
     args = parser.parse_args()
     try:
-        args.handler(args)
+        if args.command == "draw":
+            args.handler(args)
+        else:
+            args.out.mkdir(parents=True, exist_ok=False)
+            with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out) as temporary:
+                args.matrix = run_anno_cwt(args.anno_cwt, args.fasta, pathlib.Path(temporary))
+                args.handler(args)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
 
