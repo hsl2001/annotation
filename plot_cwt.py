@@ -14,8 +14,11 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
-PLOT_NAMES = ("exons", "exons-mutated", "control", "control-aggt",
-              "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt")
+PLOT_NAMES = ("exons", "exons-mutated", "control", "control-aggt", "control-aggt-p1",
+              "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt",
+              "abs-control-aggt-p1")
+AGGT_CONTROL_NAMES = frozenset(("control-aggt", "control-aggt-p1"))
+CONTROL_REPLICATES = 5
 
 
 def open_text(path):
@@ -196,7 +199,7 @@ def render_power_panels(display, mean, contigs, widths, path, *, positions, exte
         axis.set_ylabel("Interval rank" if scale == 0 else "")
         profile.plot(positions, mean[scale], color="#256c87", linewidth=1.3)
         profile.set_ylabel("Mean power" if scale == 0 else "")
-        profile.set_ylim(-0.1, 2.1)
+        profile.set_ylim(-0.1, 1.6)
         for panel in (axis, profile):
             panel.set_xticks(*ticks, fontsize=8)
             panel.set_xlim(extent[:2])
@@ -426,11 +429,16 @@ def aggt_candidates(sequences):
     return candidates, end_masks
 
 
-def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attempts=200):
+def prepare_aggt_controls(contigs, exons, sequences):
     masks = build_exon_mask(contigs, exons)
     candidates, end_masks = aggt_candidates(sequences)
     if candidates["+"][0].size == 0 and candidates["-"][0].size == 0:
         raise ValueError("No AG/GT-flanked non-exon sites available in the provided FASTA")
+    return masks, candidates, end_masks
+
+
+def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attempts=200, prepared=None):
+    masks, candidates, end_masks = prepared or prepare_aggt_controls(contigs, exons, sequences)
     rng = np.random.default_rng(seed)
     controls = []
     for _, start0, end0, _ in exons:
@@ -463,13 +471,33 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
     intervals = {"exons": exons}
     if "control" in requested:
         intervals["control"] = sample_controls(contigs, exons, args.seed)
-    if "control-aggt" in requested:
+    aggt_replicates = {}
+    if requested & AGGT_CONTROL_NAMES:
         sequences = read_sequences(fasta, contigs)
-        intervals["control-aggt"] = sample_aggt_controls(contigs, exons, sequences, args.seed, length_offset=1)
+        prepared = prepare_aggt_controls(contigs, exons, sequences)
+        for group in requested & AGGT_CONTROL_NAMES:
+            seed_offset = CONTROL_REPLICATES if group.endswith("-p1") else 0
+            aggt_replicates[group] = [
+                sample_aggt_controls(contigs, exons, sequences, args.seed + seed_offset + replicate,
+                                     length_offset=1 if group.endswith("-p1") else 0,
+                                     prepared=prepared)
+                for replicate in range(CONTROL_REPLICATES)
+            ]
 
     for name in names:
         output = output_dirs[name]
         group = name.removeprefix("abs-").removesuffix("-mutated")
+        if group in AGGT_CONTROL_NAMES:
+            for replicate, selected in enumerate(aggt_replicates[group], 1):
+                replicate_output = output / f"replicate-{replicate}"
+                replicate_output.mkdir()
+                if name.startswith("abs-"):
+                    render_absolute_intervals(selected, matrix, contigs, widths, replicate_output,
+                                              args.rows, name)
+                else:
+                    render_intervals(selected, matrix, contigs, widths, replicate_output,
+                                     args.bins, args.flank, args.rows, name)
+            continue
         if name.startswith("abs-"):
             render_absolute_intervals(intervals[group], matrix, contigs, widths, output, args.rows, name)
         else:
