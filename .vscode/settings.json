@@ -3,5 +3,6 @@
     "tinymist.fontPaths": ["${workspaceFolder}/docs/fonts"],
     "[typst]": {
     "editor.formatOnSave": true
-  }
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:system"
 }

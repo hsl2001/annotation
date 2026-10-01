@@ -546,12 +546,21 @@ def draw_roi(intervals, matrix, contigs, widths, out, flank, pixels):
             axis.set_ylabel(f"{contig.get('parameter', 'Kernel width')} (bp)")
             axis.set_title(title, loc="left", fontsize=11)
             figure.colorbar(image, ax=axis, pad=0.01)
-            if title != "log(1 + mean power)":
-                if before:
-                    axis.axvline(before, color="#bf5547", linestyle="--", linewidth=0.9)
-                if after:
-                    axis.axvline(body_end, color="#bf5547", linestyle="--", linewidth=0.9)
-        axes[-1].set_xlabel(f"5' to 3' offset; ROI with {flank} bp flanks")
+        left_boundary = ("start", start) if strand == "+" else ("end", end)
+        right_boundary = ("end", end) if strand == "+" else ("start", start)
+        ticks = []
+        if before:
+            ticks.append((0, f"5' flank\n{before} bp", "left"))
+        ticks.append((before, f"{left_boundary[0]}\n{left_boundary[1]:,}", "right"))
+        ticks.append((body_end, f"{right_boundary[0]}\n{right_boundary[1]:,}", "left"))
+        if after:
+            ticks.append((len(values), f"3' flank\n{after} bp", "right"))
+        axes[-1].set_xticks([position for position, _, _ in ticks],
+                            [label for _, label, _ in ticks])
+        for label, (_, _, alignment) in zip(axes[-1].get_xticklabels(), ticks):
+            label.set_horizontalalignment(alignment)
+        axes[-1].tick_params(axis="x", labelsize=8, pad=6)
+        axes[-1].set_xlabel("5' to 3' position; start/end mark genomic exon boundaries")
         figure.suptitle(f"{name}:{start:,}-{end:,} ({strand}) | CWT")
         tag = "plus" if strand == "+" else "minus"
         figure.savefig(out / f"{name}_{start:06d}_{end:06d}_{tag}.png", dpi=160)
