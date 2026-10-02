@@ -170,6 +170,39 @@ $J > 0$이므로 $J = sqrt(2 pi)$이다.
 $
   F \( s \) = integral_(bb(R)) e^(- u^2 \/ 2) e^(i s u) thin d u .
 $ <gauss-integral-2-proof-1>
-
-
-
+가우스 함수는 $\| u \|$를 곱해도 적분 가능할 정도로 빠르게 감소하는 것이 알려져 있다.
+따라서, $s$에 대한 미분을 적분 안으로 옮길 수 있다.
+$e^(i s u)$를 $s$로 미분하면 $i u e^(i s u)$이다.
+#cf[이러한 교환이 가능한 이유:\
+  #t[to be written...]
+]
+$
+  F' \( s \) = i integral_(bb(R)) u e^(- u^2 \/ 2) e^(i s u) thin d u .
+$ <gauss-integral-2-proof-2>
+이 때, $g \( u \) = e^(- u^2 \/ 2)$이면 $g' \( u \) = - u g \( u \)$이므로 부분적분을 적용하면
+$
+  F' \( s \) & = - i integral_(bb(R)) g' \( u \) e^(i s u) thin d u \
+             & = - i \[ g \( u \) e^(i s u) \]_(- oo)^oo + i integral_(bb(R)) g \( u \) \( i s \) e^(i s u) thin d u \
+             & = - s F \( s \) .
+$ <gauss-integral-2-proof-3>
+이다.
+경계항은 $\| e^(i s u) \| = 1$이고 $g \( u \) arrow.r 0$이므로 0이다.
+따라서 $F' \( s \) = - s F \( s \)$이다.
+곱의 미분법을 적용하면,
+$
+  frac(d, d s) \[ e^(s^2 \/ 2) F \( s \) \] = e^(s^2 \/ 2) \[ s F \( s \) + F' \( s \) \] = 0 .
+$ <gauss-integral-2-proof-4>
+따라서 $e^(s^2 \/ 2) F \( s \)$의 값은 상수이다.
+$F \( 0 \) = sqrt(2 pi)$를 대입하면,
+$
+  #box(stroke: black, inset: 3pt, [$ F \( s \) = sqrt(2 pi) e^(- s^2 \/ 2) $]) .
+$ <gauss-integral-2-proof-4>
+이다.
+실수부는 코사인 적분 항등식이고, 허수부의 사인 적분은 0이다.
+가우스 곡선은 우함수이고 사인함수는 기함수이므로 양쪽 기여가 상쇄된다.
+$v = sqrt(2) u$로 치환하면 아래 식도 얻을 수 있다.
+$
+  integral_(bb(R)) e^(- u^2) e^(i s u) thin d u = sqrt(pi) e^(- s^2 \/ 4)
+$ <gauss-integral-2-proof-5>
+이다.
+여기에 $s = 6$을 대입한 것이 $sqrt(pi) e^(- 9)$이다.

@@ -8,6 +8,7 @@
 
 import argparse
 import gzip
+import math
 import pathlib
 import re
 import shutil
@@ -38,47 +39,66 @@ def attributes(text):
     return result
 
 
-def read_exons(path):
-    transcripts = {}
-    exon_groups = defaultdict(list)
-    plain = defaultdict(list)
+def gff_records(path):
     with open_text(path) as stream:
         for line_number, line in enumerate(stream, 1):
+            if line.rstrip() == "##FASTA":
+                break
             if not line.strip() or line.startswith("#"):
                 continue
             fields = line.rstrip("\r\n").split("\t")
             if len(fields) != 9:
                 raise ValueError(f"{path}:{line_number}: expected GFF3/GTF with 9 columns")
-            feature = fields[2].lower()
-            info = attributes(fields[8])
-            identifier = info.get("ID") or info.get("transcript_id")
-            parents = (info.get("Parent") or info.get("gene_id") or "").split(",")
-            if feature in ("mrna", "transcript") and identifier:
-                transcripts[identifier] = (parents[0] or identifier, fields[6])
-            if feature != "exon":
-                continue
             try:
                 start, end = int(fields[3]), int(fields[4])
             except ValueError as error:
                 raise ValueError(f"{path}:{line_number}: invalid coordinates") from error
-            if start < 1 or end < start or fields[6] not in ("+", "-"):
-                raise ValueError(f"{path}:{line_number}: invalid exon interval or strand")
-            parent = parents[0]
-            interval = (fields[0], fields[6], start, end)
-            if parent:
-                exon_groups[parent].append(interval)
-            else:
-                plain[(fields[0], fields[6])].append(interval)
+            if start < 1 or end < start:
+                raise ValueError(f"{path}:{line_number}: invalid interval")
+            if fields[2].lower() in ("exon", "cds") and fields[6] not in ("+", "-"):
+                raise ValueError(f"{path}:{line_number}: invalid strand")
+            yield fields, attributes(fields[8]), start, end
 
-    selected = [interval for intervals in plain.values() for interval in intervals]
-    by_gene = defaultdict(list)
-    for transcript, intervals in exon_groups.items():
-        locus, strand = transcripts.get(transcript, (transcript, intervals[0][1]))
+
+def feature_parents(info):
+    return [parent for parent in (info.get("Parent") or info.get("transcript_id") or info.get("gene_id") or "").split(",")
+            if parent]
+
+
+def transcript_intervals(path, feature):
+    metadata, intervals, plain = {}, defaultdict(list), set()
+    for fields, info, start, end in gff_records(path):
+        identifier = info.get("ID") or info.get("transcript_id")
+        if fields[2].lower() in ("mrna", "transcript") and identifier:
+            gene = (info.get("Parent") or info.get("gene_id") or identifier).split(",")[0]
+            metadata[identifier] = (gene or identifier, fields[0], fields[6])
+        elif fields[2].lower() == feature:
+            interval = (fields[0], fields[6], start, end)
+            parents = feature_parents(info)
+            if not parents:
+                plain.add(interval)
+            for parent in parents:
+                intervals[parent].append(interval)
+                if info.get("gene_id"):
+                    metadata.setdefault(parent, (info["gene_id"], fields[0], fields[6]))
+    models = {}
+    for transcript, segments in intervals.items():
+        seqid, strand = segments[0][:2]
+        gene, seqid, strand = metadata.get(transcript, (transcript, seqid, strand))
+        if all(segment[:2] == (seqid, strand) for segment in segments):
+            models[transcript] = gene, seqid, strand, segments
+    return models, plain
+
+
+def read_exons(path):
+    transcripts, plain = transcript_intervals(path, "exon")
+    selected = {}
+    for gene, seqid, strand, intervals in transcripts.values():
         length = sum(end - start + 1 for _, _, start, end in intervals)
-        by_gene[(locus, strand)].append((length, intervals))
-    for candidates in by_gene.values():
-        selected.extend(max(candidates, key=lambda item: item[0])[1])
-    return set(selected)
+        key = seqid, strand, gene
+        if key not in selected or length > selected[key][0]:
+            selected[key] = length, intervals
+    return plain | {interval for _, intervals in selected.values() for interval in intervals}
 
 
 def read_genes(path):
@@ -86,39 +106,12 @@ def read_genes(path):
 
     Returns gene_id -> (seqid, start, end, strand, transcript_id).
     """
-    transcripts = {}
-    cds = defaultdict(list)
-    cds_meta = {}
-    with open_text(path) as stream:
-        for line_number, line in enumerate(stream, 1):
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip("\r\n").split("\t")
-            if len(fields) != 9:
-                raise ValueError(f"{path}:{line_number}: expected GFF3/GTF with 9 columns")
-            feature = fields[2].lower()
-            info = attributes(fields[8])
-            if feature in ("mrna", "transcript"):
-                identifier = info.get("ID") or info.get("transcript_id")
-                if identifier:
-                    parent = (info.get("Parent") or info.get("gene_id") or identifier).split(",")[0]
-                    transcripts[identifier] = (parent or identifier, fields[6], fields[0])
-            elif feature == "cds":
-                parent = (info.get("Parent") or info.get("transcript_id") or "").split(",")[0]
-                if not parent:
-                    continue
-                cds[parent].append((int(fields[3]), int(fields[4])))
-                cds_meta[parent] = (fields[0], fields[6])
-
+    transcripts, _ = transcript_intervals(path, "cds")
     genes = {}
-    for transcript, intervals in cds.items():
-        gene, strand, seqid = transcripts.get(transcript, (None, None, None))
-        if gene is None:
-            seqid, strand = cds_meta[transcript]
-            gene = transcript
-        length = sum(end - start + 1 for start, end in intervals)
-        start = min(start for start, _ in intervals)
-        end = max(end for _, end in intervals)
+    for transcript, (gene, seqid, strand, intervals) in transcripts.items():
+        length = sum(end - start + 1 for _, _, start, end in intervals)
+        start = min(interval[2] for interval in intervals)
+        end = max(interval[3] for interval in intervals)
         previous = genes.get(gene)
         if previous is None or length > previous[0]:
             genes[gene] = (length, seqid, start, end, strand, transcript)
@@ -126,19 +119,7 @@ def read_genes(path):
 
 
 def read_genome(path):
-    sequences = {}
-    name = None
-    chunks = []
-    with open_text(path) as stream:
-        for line in stream:
-            if line.startswith(">"):
-                if name is not None:
-                    sequences[name] = "".join(chunks).upper()
-                name, chunks = line[1:].split()[0], []
-            else:
-                chunks.append(line.strip())
-    if name is not None:
-        sequences[name] = "".join(chunks).upper()
+    sequences = {name: sequence.upper() for name, sequence in read_fasta(path)}
     if not sequences:
         raise ValueError(f"{path}: no FASTA sequences found")
     return sequences
@@ -150,52 +131,19 @@ def reverse_complement(sequence):
 
 def coding_transcripts(path, genome):
     """Read coding transcripts and apply the paper's invalid-model filters."""
-    transcripts = {}
-    cds = defaultdict(list)
-    with open_text(path) as stream:
-        for line_number, line in enumerate(stream, 1):
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip("\r\n").split("\t")
-            if len(fields) != 9:
-                raise ValueError(f"{path}:{line_number}: expected GFF3/GTF with 9 columns")
-            feature = fields[2].lower()
-            info = attributes(fields[8])
-            if feature in ("mrna", "transcript"):
-                identifier = info.get("ID") or info.get("transcript_id")
-                if identifier:
-                    gene = (info.get("Parent") or info.get("gene_id") or identifier).split(",")[0]
-                    transcripts[identifier] = (gene, fields[0], fields[6])
-            elif feature == "cds":
-                parent = (info.get("Parent") or info.get("transcript_id") or "").split(",")[0]
-                if not parent:
-                    continue
-                try:
-                    start, end = int(fields[3]), int(fields[4])
-                except ValueError as error:
-                    raise ValueError(f"{path}:{line_number}: invalid CDS coordinates") from error
-                if start < 1 or end < start or fields[6] not in ("+", "-"):
-                    raise ValueError(f"{path}:{line_number}: invalid CDS interval or strand")
-                cds[parent].append((fields[0], fields[6], start, end))
-
+    transcripts, _ = transcript_intervals(path, "cds")
     valid = {}
-    for transcript, intervals in cds.items():
-        if transcript in transcripts:
-            gene, seqid, strand = transcripts[transcript]
-        else:
-            seqid, strand = intervals[0][0], intervals[0][1]
-            gene = transcript
-        if any(seqid != item[0] or strand != item[1] for item in intervals):
-            continue
+    for transcript, (gene, seqid, strand, intervals) in transcripts.items():
         if seqid not in genome:
             raise ValueError(f"{path}: sequence {seqid} is missing from the genome FASTA")
         ordered = sorted(intervals, key=lambda item: item[2])
+        if any(end > len(genome[seqid]) for _, _, _, end in ordered):
+            raise ValueError(f"{path}: CDS extends beyond sequence {seqid}")
         if any(next_start - end - 1 <= 1
                for (_, _, _, end), (_, _, next_start, _) in zip(ordered, ordered[1:])):
             continue
         sequence = "".join(
-            genome[seqid][start - 1:end] for _, _, start, end in
-            (ordered if strand == "+" else reversed(ordered))
+            genome[seqid][start - 1:end] for _, _, start, end in ordered
         )
         if strand == "-":
             sequence = reverse_complement(sequence)
@@ -227,6 +175,13 @@ def filtered_gff(path, genome, output, longest_only=False):
         transcripts = {transcript: record for transcript, record in selected.values()}
 
     genes = {}
+    for record in transcripts.values():
+        key = record["seqid"], record["strand"], record["gene"]
+        start = min(interval[0] for interval in record["intervals"])
+        end = max(interval[1] for interval in record["intervals"])
+        previous = genes.get(key, (start, end))
+        genes[key] = min(start, previous[0]), max(end, previous[1])
+    written = set()
     with open(output, "w") as stream:
         stream.write("##gff-version 3\n")
         for transcript, record in sorted(transcripts.items()):
@@ -234,19 +189,20 @@ def filtered_gff(path, genome, output, longest_only=False):
             end = max(interval[1] for interval in record["intervals"])
             gene = record["gene"]
             gene_key = (record["seqid"], record["strand"], gene)
-            if gene_key not in genes:
-                genes[gene_key] = True
+            if gene_key not in written:
+                written.add(gene_key)
+                gene_start, gene_end = genes[gene_key]
                 stream.write(
-                    f"{record['seqid']}\ttest_accuracy\tgene\t{start}\t{end}\t.\t"
+                    f"{record['seqid']}\taccuracy\tgene\t{gene_start}\t{gene_end}\t.\t"
                     f"{record['strand']}\t.\tID={gene}\n"
                 )
             stream.write(
-                f"{record['seqid']}\ttest_accuracy\ttranscript\t{start}\t{end}\t.\t"
+                f"{record['seqid']}\taccuracy\ttranscript\t{start}\t{end}\t.\t"
                 f"{record['strand']}\t.\tID={transcript};Parent={gene}\n"
             )
             for number, (exon_start, exon_end) in enumerate(sorted(record["intervals"]), 1):
                 stream.write(
-                    f"{record['seqid']}\ttest_accuracy\texon\t{exon_start}\t{exon_end}\t.\t"
+                    f"{record['seqid']}\taccuracy\texon\t{exon_start}\t{exon_end}\t.\t"
                     f"{record['strand']}\t.\tID={transcript}.exon{number};Parent={transcript}\n"
                 )
     return len(transcripts)
@@ -345,49 +301,62 @@ def evaluate(reference, query):
 def genome_fasta(genome, workdir):
     """Return a plain, gffread-indexable FASTA path (decompressing .gz if needed)."""
     if str(genome).endswith(".gz"):
-        plain = workdir / "genome.fa"
-        with gzip.open(genome, "rb") as source, open(plain, "wb") as target:
+        with gzip.GzipFile(filename=genome, mode="rb") as source, \
+                tempfile.NamedTemporaryFile(mode="wb", prefix="genome-", suffix=".fa", dir=workdir, delete=False) as target:
             shutil.copyfileobj(source, target)
-        return plain
+            return pathlib.Path(target.name)
     link = workdir / "genome.fa"
-    link.symlink_to(pathlib.Path(genome).resolve())
+    source = pathlib.Path(genome).resolve()
+    if pathlib.Path(genome).absolute() == link.absolute():
+        return link
+    if link.is_symlink():
+        (workdir / "genome.fa.fai").unlink(missing_ok=True)
+    if link.resolve() == source:
+        return link
+    if link.is_symlink():
+        link.unlink()
+    if link.exists():
+        raise ValueError(f"Refusing to overwrite existing FASTA: {link}")
+    link.symlink_to(source)
     return link
 
 
 def write_protein_gff(path, genes, output):
     selected_genes = set(genes)
     selected_transcripts = {value[4] for value in genes.values()}
-    with open_text(path) as source, open(output, "w") as target:
+    with open(output, "w") as target:
         target.write("##gff-version 3\n")
-        for line_number, line in enumerate(source, 1):
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip("\r\n").split("\t")
-            if len(fields) != 9:
-                raise ValueError(f"{path}:{line_number}: expected GFF3/GTF with 9 columns")
+        for fields, info, start, end in gff_records(path):
             feature = fields[2].lower()
-            info = attributes(fields[8])
             identifier = info.get("ID") or info.get("transcript_id")
-            parent = (info.get("Parent") or info.get("transcript_id") or "").split(",")[0]
+            parents = [parent for parent in feature_parents(info) if parent in selected_transcripts]
             keep = ((feature == "gene" and identifier in selected_genes) or
                     (feature in ("mrna", "transcript") and identifier in selected_transcripts) or
-                    (feature == "cds" and parent in selected_transcripts))
+                    (feature == "cds" and bool(parents)))
             if not keep:
                 continue
             if fields[6] not in ("+", "-"):
-                raise ValueError(f"{path}:{line_number}: selected coding feature has invalid strand")
+                raise ValueError(f"{path}: selected coding feature has invalid strand")
+            if feature == "cds" and "Parent" in info:
+                info["Parent"] = ",".join(parents)
+                fields[8] = ";".join(f"{key}={value}" for key, value in info.items())
             target.write("\t".join(fields) + "\n")
 
 
 def read_fasta(path):
     name, chunks = None, []
-    with open(path) as stream:
-        for line in stream:
+    with open_text(path) as stream:
+        for line_number, line in enumerate(stream, 1):
             if line.startswith(">"):
                 if name is not None:
                     yield name, "".join(chunks)
-                name, chunks = line[1:].split()[0], []
-            else:
+                header = line[1:].split()
+                if not header:
+                    raise ValueError(f"{path}:{line_number}: empty FASTA header")
+                name, chunks = header[0], []
+            elif line.strip():
+                if name is None:
+                    raise ValueError(f"{path}:{line_number}: FASTA sequence before header")
                 chunks.append(line.strip())
     if name is not None:
         yield name, "".join(chunks)
@@ -395,6 +364,9 @@ def read_fasta(path):
 
 def extract_proteins(gff, genome, genes, out_fasta, workdir, tag):
     """Translate the longest-CDS transcript of each gene, header renamed to gene id."""
+    if not genes:
+        out_fasta.write_text("")
+        return 0
     raw = workdir / f"{tag}.raw.faa"
     coding_gff = workdir / f"{tag}.coding.gff3"
     write_protein_gff(gff, genes, coding_gff)
@@ -455,7 +427,7 @@ def gene_level(reference_gff, query_gff, genome, workdir, *, bitscore, evalue, c
     positives = extract_proteins(reference_gff, indexed, ref_genes, ref_fasta, workdir, "reference")
     predicted = extract_proteins(query_gff, indexed, query_genes, query_fasta, workdir, "query")
     if positives == 0 or predicted == 0:
-        raise ValueError("no protein sequences extracted; check genome and GFF3 coordinates")
+        return scores(0, predicted, positives), (0, positives, predicted)
 
     ref_region = {gene: (seqid, start, end) for gene, (seqid, start, end, *_) in ref_genes.items()}
     query_region = {gene: (seqid, start, end) for gene, (seqid, start, end, *_) in query_genes.items()}
@@ -467,7 +439,8 @@ def gene_level(reference_gff, query_gff, genome, workdir, *, bitscore, evalue, c
         if qcov <= coverage or scov <= coverage:
             continue
         region_q, region_r = query_region.get(query), ref_region.get(subject)
-        if region_q is None or region_r is None or not region_overlap(region_q, region_r):
+        if (region_q is None or region_r is None or not region_overlap(region_q, region_r)
+            or query_genes[query][3] != ref_genes[subject][3]):
             continue
         candidates.append((hit_score, query, subject))
 
@@ -496,6 +469,16 @@ def main():
     parser.add_argument("--gffcompare", action="store_true",
                         help="run CDS-only gffcompare exon/locus evaluation")
     args = parser.parse_args()
+    if args.gffcompare and not args.genome:
+        parser.error("--gffcompare requires --genome")
+    if args.threads < 1:
+        parser.error("--threads must be positive")
+    if not math.isfinite(args.bitscore) or args.bitscore < 0:
+        parser.error("--bitscore must be finite and nonnegative")
+    if not math.isfinite(args.evalue) or args.evalue <= 0:
+        parser.error("--evalue must be finite and positive")
+    if not 0 <= args.coverage < 1:
+        parser.error("--coverage must be in [0, 1)")
 
     try:
         reference = read_exons(args.reference)
@@ -508,8 +491,6 @@ def main():
     print(f"exon-level: F1={exon[2]:.4%} precision={exon[0]:.4%} recall={exon[1]:.4%}")
     print(f"  exons TP={exon_counts[0]:,} FP={exon_counts[1]:,} FN={exon_counts[2]:,}")
 
-    if args.gffcompare and not args.genome:
-        parser.error("--gffcompare requires --genome")
     if not args.genome:
         return 0
 
@@ -532,11 +513,11 @@ def main():
             reference_count = filtered_gff(args.reference, genome, reference_all)
             filtered_gff(args.reference, genome, reference_longest, longest_only=True)
             query_count = filtered_gff(args.query, genome, query_cds)
-            if not reference_count or not query_count:
-                raise ValueError("gffcompare filtering removed all coding transcripts")
-            exon_metrics = run_gffcompare(reference_longest, query_cds, workdir, "gffcompare_exon")
-            locus_metrics = run_gffcompare(reference_all, query_cds, workdir, "gffcompare_locus")
-    except (OSError, ValueError, subprocess.CalledProcessError, FileNotFoundError) as error:
+            exon_gff = locus_gff = scores(0, query_count, reference_count)
+            if reference_count and query_count:
+                exon_gff = run_gffcompare(reference_longest, query_cds, workdir, "gffcompare_exon")["exon"]
+                locus_gff = run_gffcompare(reference_all, query_cds, workdir, "gffcompare_locus")["locus"]
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     finally:
         if not keep:
@@ -544,8 +525,6 @@ def main():
     print(f"gene-level (protein): F1={gene[2]:.4%} precision={gene[0]:.4%} recall={gene[1]:.4%}")
     print(f"  genes TP={counts[0]:,} P(reference)={counts[1]:,} PP(predicted)={counts[2]:,}")
     if args.gffcompare:
-        exon_gff = exon_metrics["exon"]
-        locus_gff = locus_metrics["locus"]
         print(f"gffcompare CDS exon-level: F1={exon_gff[2]:.4%} precision={exon_gff[0]:.4%} recall={exon_gff[1]:.4%}")
         print(f"gffcompare CDS locus-level: F1={locus_gff[2]:.4%} precision={locus_gff[0]:.4%} recall={locus_gff[1]:.4%}")
         print(f"  filtered transcripts: reference={reference_count:,} query={query_count:,}")
