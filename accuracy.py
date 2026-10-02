@@ -2,8 +2,6 @@
 """Accuracy metrics for reference and query GFF3 files.
     micromamba run -n anno python3 accuracy.py \
         -r reference.gff3 -q anno.gff3 -g genome.fasta.gz
-    micromamba run -n anno python3 accuracy.py \
-        -r reference.gff3 -q annevo.gff3 -g genome.fasta.gz
 """
 
 import argparse

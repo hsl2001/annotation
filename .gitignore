@@ -17,3 +17,4 @@ anno_cwt
 annevo/
 tmp*
 *plots-draw*
+!truth*
