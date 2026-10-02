@@ -195,7 +195,7 @@ $ <gauss-integral-2-proof-4>
 따라서 $e^(s^2 \/ 2) F \( s \)$의 값은 상수이다.
 $F \( 0 \) = sqrt(2 pi)$를 대입하면,
 $
-  #box(stroke: black, inset: 3pt, [$ F \( s \) = sqrt(2 pi) e^(- s^2 \/ 2) $]) .
+  F \( s \) = sqrt(2 pi) e^(- s^2 \/ 2) .
 $ <gauss-integral-2-proof-4>
 이다.
 실수부는 코사인 적분 항등식이고, 허수부의 사인 적분은 0이다.

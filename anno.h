@@ -23,7 +23,7 @@
 #define DEFAULT_EPOCHS 72
 
 typedef struct {
-   double complex *kernel[WAVE_COUNT];
+   double _Complex *kernel[WAVE_COUNT];
    int widths[WAVE_COUNT], max_width;
 } Wavelets;
 typedef struct { char *name, *seq; int length; uint32_t *cwt; uint8_t *label; } Contig;
