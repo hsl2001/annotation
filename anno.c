@@ -794,10 +794,6 @@ int main(int argc, char **argv) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    if (!initial_model && epochs > INITIAL_EPOCHS) {
-      crf_train(contigs, count, weights, INITIAL_EPOCHS);
-      epochs -= INITIAL_EPOCHS;
-    }
     crf_train(contigs, count, weights, epochs);
     save_model(model, weights);
   }

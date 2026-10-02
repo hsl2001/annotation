@@ -20,7 +20,6 @@
 #define LEARNING_RATE 0.1f
 #define POSTERIOR_WEIGHT 0.01
 #define SPLICE_PENALTY 8.0
-#define INITIAL_EPOCHS 24
 #define DEFAULT_EPOCHS 72
 
 typedef struct {
