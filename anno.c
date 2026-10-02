@@ -13,18 +13,26 @@
 #include <sys/stat.h>
 #include <zlib.h>
 
+#define RFFT_IMPLEMENTATION
+#include "rfft.h"
+
 KSEQ_INIT(gzFile, gzread)
 
 const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9};
 static const float power_edges[7] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
 
-/* Weight layout: transition x boundary 4-mer, transition x (peaks at i-1, peaks at i),
-   state x nucleotide, state x oriented hexamer, state x per-scale CWT code. */
 enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097, KCWT = 32 * WAVE_COUNT };
 enum { OFF_T4 = 0, OFF_TPK = OFF_T4 + STATES * STATES * K4, OFF_NUC = OFF_TPK + STATES * STATES * KPK,
-       OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX, WEIGHTS = OFF_CWT + STATES * KCWT };
+       OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX, BASE_WEIGHTS = OFF_CWT + STATES * KCWT,
+       FLANKS = 27, OFF_SPLICE = BASE_WEIGHTS, RESERVED_WEIGHTS = STATES * 64,
+       OFF_BIAS = OFF_SPLICE + 4 * FLANKS * 17 + RESERVED_WEIGHTS, WEIGHTS = OFF_BIAS + STATES + STATES * STATES,
+       EMISSION_FEATURES = WAVE_COUNT + 3, TRANSITION_FEATURES = FLANKS + 3, MODEL_FEATURES = 191 };
 
-typedef struct { uint16_t k4, hexf, hexr; uint32_t cwt; uint8_t nuc, pk; } Site;
+typedef struct {
+  uint16_t k4, hexf, hexr;
+  uint32_t cwt;
+  uint8_t nuc, pk, flank[2][FLANKS];
+} Site;
 
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans, preds[STATES][4], npreds[STATES];
 
@@ -61,42 +69,114 @@ static double complex base_signal(char base) {
   return index < 0 ? 0.0 : mapping[index];
 }
 
+static double complex morlet_integral(double lower, double upper) {
+  static const double nodes[8] = {
+    0.09501250983763744, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438,
+    0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499
+  };
+  static const double weights[8] = {
+    0.1894506104550685, 0.1826034150449236, 0.1691565193950025, 0.1495959888165767,
+    0.1246289712555339, 0.0951585116824928, 0.0622535239386479, 0.0271524594117541
+  };
+  lower = fmax(lower, -8.0);
+  upper = fmin(upper, 8.0);
+  if (lower >= upper) return 0.0;
+  double normalization = 1.0 / sqrt(sqrt(acos(-1.0)) *
+                                   (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
+  int segments = (int)ceil((upper - lower) * 2.0);
+  double step = (upper - lower) / segments;
+  double complex integral = 0.0;
+  for (int segment = 0; segment < segments; segment++) {
+    double middle = lower + (segment + 0.5) * step;
+    for (int node = 0; node < 8; node++) {
+      double left = middle - nodes[node] * step / 2.0;
+      double right = middle + nodes[node] * step / 2.0;
+      integral += weights[node] * step / 2.0 * (
+        exp(-0.5 * left * left) * (cexp(-I * 6.0 * left) - exp(-18.0)) +
+        exp(-0.5 * right * right) * (cexp(-I * 6.0 * right) - exp(-18.0)));
+    }
+  }
+  return normalization * integral;
+}
+
 void wavelets_init(Wavelets *wavelets) {
   memset(wavelets, 0, sizeof(*wavelets));
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    int width = wave_sizes[scale];
-    double complex mean = 0.0;
+    double dilation = wave_sizes[scale];
+    if (!isfinite(dilation) || dilation <= 0.0 || dilation != floor(dilation))
+      anno_fail("CWT scales must be positive natural numbers");
+    double radius_value = ceil(8.0 * dilation + 0.5);
+    if (radius_value > (INT_MAX - 1) / 2) anno_fail("CWT scale exceeds supported kernel size");
+    int radius = (int)radius_value;
+    int width = 2 * radius + 1;
+    size_t capacity = MAX_WAVE_SIZE > 0 ? (size_t)MAX_WAVE_SIZE : 1;
+    if (capacity > (size_t)width) capacity = (size_t)width;
+    while (capacity < (size_t)width) capacity *= 2;
+    wavelets->kernel[scale] = anno_alloc(capacity, sizeof(double complex));
+    wavelets->widths[scale] = width;
+    if (width > wavelets->max_width) wavelets->max_width = width;
     for (int tap = 0; tap < width; tap++) {
-      double coordinate = (tap - width / 2.0 + 0.5) / (width / 8.0);
-      double complex value = exp(-0.5 * coordinate * coordinate) * (cexp(I * 6.0 * coordinate) - exp(-18.0));
-      wavelets->kernel[scale][tap] = value;
-      mean += value / width;
+      double displacement = tap - radius;
+      wavelets->kernel[scale][tap] = sqrt(dilation) * morlet_integral(
+        (displacement - 0.5) / dilation, (displacement + 0.5) / dilation);
     }
-    double energy = 0.0;
-    for (int tap = 0; tap < width; tap++) {
-      wavelets->kernel[scale][tap] -= mean;
-      energy += cabs(wavelets->kernel[scale][tap]) * cabs(wavelets->kernel[scale][tap]);
-    }
-    for (int tap = 0; tap < width; tap++) wavelets->kernel[scale][tap] = conj(wavelets->kernel[scale][tap]) / sqrt(energy);
   }
 }
 
+static void wavelets_free(Wavelets *wavelets) {
+  for (int scale = 0; scale < WAVE_COUNT; scale++) free(wavelets->kernel[scale]);
+}
+
+static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
+  if (signal_length > SIZE_MAX - (kernel_length - 1)) anno_fail("CWT FFT size overflow");
+  size_t required = signal_length + kernel_length - 1;
+  size_t size = 1;
+  while (size < required) {
+    if (size > SIZE_MAX / 2) anno_fail("CWT FFT size overflow");
+    size <<= 1;
+  }
+  return size;
+}
+
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int start, int count, double *features) {
+  if (count <= 0) return;
   memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
-  for (int offset = 0; offset < count; offset++) {
-    long position = (long)start + offset;
-    if (position < 0 || position >= length) continue;
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      int width = wave_sizes[scale];
-      double complex coefficient = 0.0;
-      for (int tap = 0; tap < width; tap++) {
-        long context = position + tap - width / 2;
-        if (context >= 0 && context < length) coefficient += base_signal(sequence[context]) * wavelets->kernel[scale][tap];
-      }
+  if (start >= length || (long)start + count <= 0) return;
+
+  long context_start = (long)start - wavelets->max_width / 2;
+  long context_end = (long)start + count + wavelets->max_width / 2;
+  if (context_start < 0) context_start = 0;
+  if (context_end > length) context_end = length;
+  size_t signal_length = (size_t)(context_end - context_start);
+  size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
+  double complex *signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
+  double complex *kernel_fft = anno_alloc(fft_size, sizeof(*kernel_fft));
+
+  for (size_t index = 0; index < signal_length; index++)
+    signal_fft[index] = base_signal(sequence[context_start + (long)index]);
+  fft_transform(signal_fft, fft_size, false);
+
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    int width = wavelets->widths[scale];
+    memset(kernel_fft, 0, fft_size * sizeof(*kernel_fft));
+    for (int tap = 0; tap < width; tap++)
+      kernel_fft[width - 1 - tap] = wavelets->kernel[scale][tap];
+    fft_transform(kernel_fft, fft_size, false);
+    for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
+    fft_transform(kernel_fft, fft_size, true);
+
+    for (int offset = 0; offset < count; offset++) {
+      long position = (long)start + offset;
+      if (position < 0 || position >= length) continue;
+      size_t convolution_index = (size_t)(position - context_start) + width - 1 - width / 2;
+      double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
       features[(size_t)offset * CWT_CHANNELS + 2 * scale] = creal(coefficient);
       features[(size_t)offset * CWT_CHANNELS + 2 * scale + 1] = cimag(coefficient);
     }
   }
+
+  free(signal_fft);
+  free(kernel_fft);
 }
 
 /* Per position and scale: bit 4 = local power minimum, bit 3 = local power maximum, bits 0-2 = power bin. */
@@ -147,10 +227,36 @@ static int peak_count(uint32_t code) {
 
 static Site site_at(const Contig *c, int i) {
   int base = base_index(c->seq[i]);
-  Site s = {kmer(c->seq, c->length, i - 2, 4, 0), kmer(c->seq, c->length, i - 5, 6, 0),
-            kmer(c->seq, c->length, i, 6, 1), c->cwt[i], base < 0 ? 4 : base,
-            (i ? peak_count(c->cwt[i - 1]) : 0) * (WAVE_COUNT + 1) + peak_count(c->cwt[i])};
+  Site s = {.k4 = kmer(c->seq, c->length, i - 2, 4, 0), .hexf = kmer(c->seq, c->length, i - 5, 6, 0),
+            .hexr = kmer(c->seq, c->length, i, 6, 1), .cwt = c->cwt[i], .nuc = base < 0 ? 4 : base,
+            .pk = (i ? peak_count(c->cwt[i - 1]) : 0) * (WAVE_COUNT + 1) + peak_count(c->cwt[i])};
+  for (int offset = 0; offset < FLANKS; offset++) {
+    int displacement = -40 + 2 * offset;
+    s.flank[0][offset] = kmer(c->seq, c->length, i + displacement, 2, 0);
+    s.flank[1][offset] = kmer(c->seq, c->length, i - displacement - 2, 2, 1);
+  }
   return s;
+}
+
+static int boundary_kind(int a, int b) {
+  if ((a >= 1 && a <= 3 && b >= 4 && b <= 6) || (a >= 10 && b >= 7 && b <= 9)) return 0;
+  if ((a >= 4 && a <= 6 && b >= 1 && b <= 3) || (a >= 7 && a <= 9 && b >= 10)) return 1;
+  if ((a == 0 && b == 1) || (a == 7 && b == 0)) return 2;
+  if ((a == 3 && b == 0) || (a == 0 && b == 9)) return 3;
+  return -1;
+}
+
+static double splice_adjustment(const Site *site, int a, int b) {
+  int kind = boundary_kind(a, b), reverse = a >= 7 || b >= 7;
+  if (kind == 0) {
+    int code = site->flank[reverse][20];
+    return code == 11 || code == 9 || code == 3 ? 0 : -SPLICE_PENALTY;
+  }
+  if (kind == 1) {
+    int code = site->flank[reverse][19];
+    return code == 2 || code == 1 ? 0 : -SPLICE_PENALTY;
+  }
+  return 0;
 }
 
 static int allowed(int a, int b) {
@@ -186,25 +292,57 @@ static void init_transitions(void) {
       if (allowed(a, b)) trans_a[ntrans] = a, trans_b[ntrans++] = b, preds[b][npreds[b]++] = a;
 }
 
-static float emission(const float *w, const Site *s, int b) {
-  float e = w[OFF_NUC + b * KNUC + s->nuc] + w[OFF_HEX + b * KHEX + (b >= 7 ? s->hexr : s->hexf)];
-  for (int k = 0; k < WAVE_COUNT; k++) e += w[OFF_CWT + b * KCWT + k * 32 + (s->cwt >> 5 * k & 31)];
-  return e;
+static void emission_indices(const Site *site, int state, int *indices) {
+  indices[0] = OFF_NUC + state * KNUC + site->nuc;
+  indices[1] = OFF_HEX + state * KHEX + (state >= 7 ? site->hexr : site->hexf);
+  for (int scale = 0; scale < WAVE_COUNT; scale++)
+    indices[scale + 2] = OFF_CWT + state * KCWT + scale * 32 + (site->cwt >> (5 * scale) & 31);
+  indices[EMISSION_FEATURES - 1] = OFF_BIAS + state;
 }
 
-static float transition(const float *w, const Site *s, int a, int b) {
-  return w[OFF_T4 + (a * STATES + b) * K4 + s->k4] + w[OFF_TPK + (a * STATES + b) * KPK + s->pk];
+static int transition_indices(const Site *site, int previous, int current, int *indices) {
+  int pair = previous * STATES + current, kind = boundary_kind(previous, current), count = 2;
+  indices[0] = OFF_T4 + pair * K4 + site->k4;
+  indices[1] = OFF_TPK + pair * KPK + site->pk;
+  if (kind >= 0)
+    for (int offset = 0; offset < FLANKS; offset++)
+      indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * 17 + site->flank[previous >= 7 || current >= 7][offset];
+  indices[count++] = OFF_BIAS + STATES + pair;
+  return count;
 }
 
-static void add_emission(float *g, const Site *s, int b, float v) {
-  g[OFF_NUC + b * KNUC + s->nuc] += v;
-  g[OFF_HEX + b * KHEX + (b >= 7 ? s->hexr : s->hexf)] += v;
-  for (int k = 0; k < WAVE_COUNT; k++) g[OFF_CWT + b * KCWT + k * 32 + (s->cwt >> 5 * k & 31)] += v;
+static float feature_score(const float *weights, const int *indices, int count) {
+  float score = 0;
+  for (int index = 0; index < count; index++) score += weights[indices[index]];
+  return score;
 }
 
-static void add_transition(float *g, const Site *s, int a, int b, float v) {
-  g[OFF_T4 + (a * STATES + b) * K4 + s->k4] += v;
-  g[OFF_TPK + (a * STATES + b) * KPK + s->pk] += v;
+static void add_features(float *gradient, const int *indices, int count, float value) {
+  for (int index = 0; index < count; index++) gradient[indices[index]] += value;
+}
+
+static float emission(const float *weights, const Site *site, int state) {
+  int indices[EMISSION_FEATURES];
+  emission_indices(site, state, indices);
+  return feature_score(weights, indices, EMISSION_FEATURES);
+}
+
+static float transition(const float *weights, const Site *site, int previous, int current) {
+  int indices[TRANSITION_FEATURES];
+  int count = transition_indices(site, previous, current, indices);
+  return feature_score(weights, indices, count);
+}
+
+static void add_emission(float *gradient, const Site *site, int state, float value) {
+  int indices[EMISSION_FEATURES];
+  emission_indices(site, state, indices);
+  add_features(gradient, indices, EMISSION_FEATURES, value);
+}
+
+static void add_transition(float *gradient, const Site *site, int previous, int current, float value) {
+  int indices[TRANSITION_FEATURES];
+  int count = transition_indices(site, previous, current, indices);
+  add_features(gradient, indices, count, value);
 }
 
 size_t crf_weights(void) { return WEIGHTS; }
@@ -217,7 +355,7 @@ Contig *read_fasta(const char *path, int *count) {
   *count = 0;
   while (kseq_read(record) >= 0) {
     if (!record->seq.l) continue;
-    if (record->seq.l > INT_MAX - MAX_WAVE_SIZE) anno_fail("Contig too long: %s", record->name.s);
+    if (record->seq.l > INT_MAX - 1024) anno_fail("Contig too long: %s", record->name.s);
     contigs = realloc(contigs, (*count + 1) * sizeof(*contigs));
     if (!contigs) anno_fail("Out of memory");
     Contig *c = contigs + (*count)++;
@@ -230,6 +368,16 @@ Contig *read_fasta(const char *path, int *count) {
   kseq_destroy(record);
   if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
   return contigs;
+}
+
+static void free_contigs(Contig *contigs, int count) {
+  for (int contig = 0; contig < count; contig++) {
+    free(contigs[contig].name);
+    free(contigs[contig].seq);
+    free(contigs[contig].cwt);
+    free(contigs[contig].label);
+  }
+  free(contigs);
 }
 
 typedef struct { int contig, start, end; char strand, *parent; } Cds;
@@ -428,11 +576,11 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
       if (isnan(value)) { skipped++; continue; }
       likelihood += value, positions += e - s;
       for (int f = 0; f < WEIGHTS; f++) {
-        if (k.grad[f] == 0) continue;
         float g = k.grad[f] / (e - s);
+        k.grad[f] = 0;
+        if (g == 0) continue;
         history[f] += g * g;
         w[f] += LEARNING_RATE * g / sqrtf(history[f] + 1e-8f);
-        k.grad[f] = 0;
       }
       /* SGD end points oscillate between over- and under-calling; the final-epoch mean is stable. */
       if (epoch == epochs) {
@@ -466,14 +614,15 @@ void crf_decode(const float *w, const Contig *c, uint8_t *path) {
       uint32_t bits = 0;
       for (int b = 0; b < STATES; b++) {
         double best = i ? -INFINITY : 0, posterior = al[b] * be[b];
+        double observation = em[b] + POSTERIOR_WEIGHT * log(posterior > 1e-300 ? posterior : 1e-300);
         int arg = 0;
         for (int j = 0; i && j < npreds[b]; j++) {
           int a = preds[b][j];
           if (blocked(c->seq, n, i, a, b)) continue;
-          double value = prev[a] + transition(w, site, a, b);
+          double value = prev[a] + transition(w, site, a, b) + splice_adjustment(site, a, b);
           if (value > best) best = value, arg = j;
         }
-        cur[b] = best + em[b] + POSTERIOR_WEIGHT * log(posterior > 1e-300 ? posterior : 1e-300);
+        cur[b] = best + observation;
         bits |= (uint32_t)arg << 2 * b;
       }
       back[i] = bits;
@@ -514,15 +663,26 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRF1", 1, 8, file) != 8 || fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
+  uint32_t features = MODEL_FEATURES;
+  if (!file || fwrite("ANNOCRF4", 1, 8, file) != 8 || fwrite(&features, sizeof(features), 1, file) != 1 ||
+      fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
 
 static void load_model(const char *path, float *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
-  if (!file || fread(magic, 1, 8, file) != 8 || memcmp(magic, "ANNOCRF1", 8) ||
-      fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
+  if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
+  if (!memcmp(magic, "ANNOCRF1", 8))
+    anno_fail("Model %s uses the previous CWT implementation; retrain it with this executable", path);
+  size_t count = BASE_WEIGHTS;
+  if (!memcmp(magic, "ANNOCRF4", 8)) {
+    uint32_t features;
+    if (fread(&features, sizeof(features), 1, file) != 1 || features != MODEL_FEATURES)
+      anno_fail("Model uses experimental features; retrain with this executable: %s", path);
+    count = WEIGHTS;
+  } else if (memcmp(magic, "ANNOCRF2", 8)) anno_fail("Cannot read model: %s", path);
+  if (fread(w, sizeof(*w), count, file) != count || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
 }
@@ -557,7 +717,7 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   Contig *contigs = read_fasta(fasta, &count);
   if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
   FILE *matrix = create_in(directory, "matrix.bin"), *index = create_in(directory, "contigs.tsv");
-  fputs("# anno-cwt-v1\n# kernel_widths\t", index);
+  fputs("# anno-cwt-v2\n# scales\t", index);
   for (int scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
   double *features = anno_alloc(1024 * CWT_CHANNELS, sizeof(*features));
@@ -584,21 +744,26 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     rows += 2 * (size_t)g->length;
   }
   if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
+  free_contigs(contigs, count);
+  free(features);
+  free(values);
   fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
 }
 
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
                   "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
 
 int main(int argc, char **argv) {
   const char *model = "anno.model";
+  const char *initial_model = NULL;
   int epochs = DEFAULT_EPOCHS, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:e:h", NULL)) >= 0) {
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:h", NULL)) >= 0) {
     if (option == 'm') model = options.arg;
+    else if (option == 'i') initial_model = options.arg;
     else if (option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
     else return usage(argv[0], option != 'h');
   }
@@ -606,25 +771,35 @@ int main(int argc, char **argv) {
   char **args = argv + options.ind;
   int export = rest == 3 && !strcmp(args[0], "cwt");
   if (!export && (rest < 1 || rest > 2)) return usage(argv[0], 1);
+  if (initial_model && (rest != 2 || export)) anno_fail("Initial model is only supported for training");
   init_transitions();
   Wavelets wavelets;
   wavelets_init(&wavelets);
   if (export) {
     export_cwt(&wavelets, args[1], args[2]);
+    wavelets_free(&wavelets);
     return 0;
+  }
+  float *weights = anno_alloc(WEIGHTS, sizeof(*weights));
+  if (rest == 1) load_model(model, weights);
+  if (initial_model) {
+    load_model(initial_model, weights);
+    fprintf(stderr, "Warm start from %s; optimizer accumulators are reset\n", initial_model);
   }
   int count;
   Contig *contigs = read_fasta(args[0], &count);
-  for (int c = 0; c < count; c++) contigs[c].cwt = cwt_features(&wavelets, contigs[c].seq, contigs[c].length);
-  float *weights = anno_alloc(WEIGHTS, sizeof(*weights));
+  for (int c = 0; c < count; c++)
+    contigs[c].cwt = cwt_features(&wavelets, contigs[c].seq, contigs[c].length);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
+    if (!initial_model && epochs > INITIAL_EPOCHS) {
+      crf_train(contigs, count, weights, INITIAL_EPOCHS);
+      epochs -= INITIAL_EPOCHS;
+    }
     crf_train(contigs, count, weights, epochs);
     save_model(model, weights);
-  } else {
-    load_model(model, weights);
   }
   puts("##gff-version 3");
   unsigned long genes = 0;
@@ -637,5 +812,8 @@ int main(int argc, char **argv) {
   }
   if (fflush(stdout) || ferror(stdout)) anno_fail("Cannot write GFF");
   fprintf(stderr, "Predicted %lu genes\n", genes);
+  wavelets_free(&wavelets);
+  free_contigs(contigs, count);
+  free(weights);
   return 0;
 }

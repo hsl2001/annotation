@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
 """Accuracy metrics for reference and query GFF3 files.
-
-Always reports nucleotide (bp) and exon-level F1. When a genome FASTA is supplied
-(--genome), it additionally reports a protein-level gene F1 that mirrors the
-BUSCO protein-mode protocol used to compare annotation tools such as anno and
-AnnEvo: proteins are extracted with gffread, aligned with blastp, and a
-predicted gene counts as a true positive only when its best hit against the
-reference clears bit-score/e-value thresholds, sits in the same genomic region,
-and covers more than a set fraction of both proteins. Run inside the micromamba
-``anno`` environment so gffread/makeblastdb/blastp are on PATH:
-
-    micromamba run -n anno python3 test_accuracy.py \
+    micromamba run -n anno python3 accuracy.py \
         -r reference.gff3 -q anno.gff3 -g genome.fasta.gz
-    micromamba run -n anno python3 test_accuracy.py \
+    micromamba run -n anno python3 accuracy.py \
         -r reference.gff3 -q annevo.gff3 -g genome.fasta.gz
-
-With ``--gffcompare``, the script removes non-coding/UTR features, rejects
-incomplete CDS models and transcripts containing introns of length 1 or less,
-then runs ``gffcompare --no-exon-merge --strict-match``. Its exon metric uses
-the longest valid reference transcript per gene; its locus metric allows a
-strictly matching predicted transcript to match any valid reference isoform.
-Training-set species provenance for ANNEVO, Tiberius, and Helixer is not
-inferable from GFF3 files and must be reported separately.
 """
 
 import argparse

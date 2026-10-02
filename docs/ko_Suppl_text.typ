@@ -1,7 +1,7 @@
 #set text(lang: "kr", font: "KoPubWorldDotum_Pro", weight: "medium", size: 10pt)
 #set page(margin: 2.0cm, paper: "a4")
 #set page(numbering: "1")
-#set math.equation(numbering: "(1)")
+#set math.equation(numbering: "(Eq. 1)", supplement: [Eq.])
 
 #show heading.where(level: 2): it => {
   pagebreak(weak: true)
@@ -94,11 +94,82 @@ $ <dna-signal-def>
 예를 들어,
 $
   x \( t \) = cases(delim: "{", 1 \, & - 1 / 2 lt.eq t < 1 / 2 \,, i \, & 1 / 2 lt.eq t < 3 / 2 \,, 0 \, & upright("other positions").)
-$
+$ <example-dna-signal>
 이다.
 이 때, 서열 밖은 0으로 정의된다.
 이 방식을 통하여 계산할 신호를 정확히 정의할 수 있다.
 
 == 3. DNA 신호를 분석하기 위한 Wavelet
 === 3.1. 위치별 서열 신호 패턴의 분석
-푸리에 분석:
+푸리에 분석은 신호 전체에 $e^(i omega t)$가 얼마나 포함되어 있는지를 정량할 수 있다.
+그러나, 어느 위치에서 해당 패턴이 나타났는지는 전체 비교로는 알기 어렵다.
+Wavelet은 일정한 주기의 진동에 짧은 창 함수(window function)을 씌워 특정 위치의 패턴을 비교한다.
+선택된 Morlet wavelet은 중심값이 크고 양쪽에서 빠르게 작아지는 가우스 함수를 채택한다.
+$
+  g \( u \) = e^(- u^2 \/ 2)
+$ <gauss-window>
+이 때 상수로서 진동 $e^(6 i u)$을 곱하면
+$
+  g \( u \) e^(6 i u) = e^(- u^2 \/ 2) \( cos 6 u + i sin 6 u \)
+$ <gauss-window-omega-6>
+형태가 된다.
+이 wavelet은 실수부는 중심값이 큰 코사인 진동, 허수부는 중심값이 큰 사인 진동이다.
+임의로 정한 Mother wavelet의 중심 각속도 $omega_0 &= 6$는 반드시 6일 필요는 없다.
+같은 스케일에서 $omega_0$만 바꾸면 가우스 창의 폭은 그대로이고 그 촘촘함이 변한다.
+#cf[$omega_0$가 크면 Morlet wavelet 코일이 더 촘촘해진다고 보면 된다.]
+많은 신호분석 문헌에서 6이 경험적으로 좋은 시간-주파수 해상도를 보이는 것이 알려져 있다.
+#cf[시간-주파수 해상도와 하이젠버그의 불확정성 원리: \
+  #t[to be written...]
+]
+여기서 Mother wavelet이란, wavelet을 sliding하고 scaling하는 기준이 되는, 스케일 1·위치 0의 wavelet이다.
+=== 3.2. 웨이블릿의 조건 1 - 영평균 조건
+신호가 모든 위치에서  $x \( t \) = c$인 상수라고 하면 직관적으로 상수 패턴에는 진동이 없으므로 wavelet과 비교한 결과도 0이 되는 것이 적절하다.
+그러나, 비교 패턴 자체의 적분이 0이 아니면 상수 신호에도 비교한 결과가 0이 나오지 않는다.
+따라서 Mother wavelet(과 그 daugther wavelet들까지도) $psi \( u \)$는 다음 조건을 만족해야 한다.
+$
+  integral_(- oo)^oo psi \( u \) thin d u = 0 .
+$ <zero-mean-condition>
+Mother wavelet이 전체 구간에서의 정적분이 0이라는 것은 곧 평균값이 0이라는 뜻이다.
+이를 #text(weight: "bold")[영평균 조건] 이라고 한다.
+
+#cf[이외에도 유한 에너지 조건(finite energy condition)과 적합성 조건(admissibility condition)이 있다. 많은 Mother wavelet(충분히 매끄럽고 빠르게 감소하는 함수)이 적합성 조건을 만족하면 자동으로 영평균 조건을 만족한다.]
+
+== 4. 영평균 조건을 만족하는 유전체 분석용 Morlet wavelet의 유도
+=== 4.1. 가우스 적분
+가우스 적분은 초월함수 적분법의 일종으로, 가우스 곡선의 $-oo$부터 $oo$까지의 정적분이다.
+#cf[정규분포가 가우스 곡선의 일종이다.]
+여기에서 사용할 두 적분은 다음과 같다.
+$
+  integral_(bb(R)) e^(- u^2 \/ 2) thin d u = sqrt(2 pi)
+$ <gauss-integral-1>
+$
+  integral_(bb(R)) e^(- u^2 \/ 2) e^(i s u) thin d u = sqrt(2 pi) e^(- s^2 \/ 2) .
+$ <gauss-integral-2>
+여기서 $bb(R)$은 실수 전체를 뜻한다. 즉, 적분 구간은 $- oo$부터 $oo$까지이다.
+첫 번째 식은 가우스 곡선 아래의 전체 면적을 의미한다.
+두 번째 식은 가우스 함수에 각속도 $s$인 복소 진동을 곱한 적분이다.
+이 때, $s = 0$이면 첫 번째 식과 같아지고, $s$가 커질수록 진동의 양과 음이 더 많이 상쇄되어 적분값이 작아진다.
+=== 4.2. 가우스 적분의 유도 - 1
+@gauss-integral-1 을 증명하기 위해, $J = integral_(bb(R)) e^(- u^2 \/ 2) thin d u$라고 놓을 수 있다.
+같은 적분을 두 번 곱하며 두 적분의 변수를 $x$와 $y$로 구분하면,
+$
+  J^2 = integral_(bb(R)) integral_(bb(R)) e^(- \( x^2 + y^2 \) \/ 2) thin d x thin d y .
+$ <gauss-integral-1-proof-1>
+이는 평면 전체에서 높이 $e^(- \( x^2 + y^2 \) \/ 2)$를 면적에 곱해 더한 값이다.
+높이가 원점으로부터의 거리에만 의존하므로 극좌표로 바꾸어 계산하면,
+$x = r cos theta$, $y = r sin theta$로 놓으면 $x^2 + y^2 = r^2$이다.
+이 때, $r$은 원점으로부터의 거리, $theta$는 각도이다.
+반지름 폭 $d r$, 각도 폭 $d theta$인 작은 부채꼴의 면적은 호 길이 $r thin d theta$와 폭 $d r$의 곱인 $r thin d r thin d theta$이므로,
+$
+  J^2 = integral_0^(2 pi) integral_0^oo e^(- r^2 \/ 2) r thin d r thin d theta = 2 pi \[ - e^(- r^2 \/ 2) \]_0^oo = 2 pi .
+$ <gauss-integral-1-proof-2>
+$J > 0$이므로 $J = sqrt(2 pi)$이다.
+#cf[이 적분은 수렴하고 적분항이 음수가 아님을 증명할 수 있으므로, 두 적분을 이중적분으로 묶을 수 있다.]
+=== 4.3. 가우스 적분의 유도 - 2
+이번에는 @gauss-integral-2 를 증명하기 위해,  각주파수 $s$에 따른 적분값을 $F \( s \)$라고 놓아보자.
+$
+  F \( s \) = integral_(bb(R)) e^(- u^2 \/ 2) e^(i s u) thin d u .
+$ <gauss-integral-2-proof-1>
+
+
+

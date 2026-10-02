@@ -6,7 +6,9 @@
 #include <stdint.h>
 
 #define WAVE_COUNT 6
+#ifndef MAX_WAVE_SIZE
 #define MAX_WAVE_SIZE 9
+#endif
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
 /* Linear-chain CRF decoded jointly for both strands.
@@ -17,9 +19,14 @@
 #define MIN_CDS 30
 #define LEARNING_RATE 0.1f
 #define POSTERIOR_WEIGHT 0.01
-#define DEFAULT_EPOCHS 6
+#define SPLICE_PENALTY 8.0
+#define INITIAL_EPOCHS 24
+#define DEFAULT_EPOCHS 72
 
-typedef struct { double complex kernel[WAVE_COUNT][MAX_WAVE_SIZE]; } Wavelets;
+typedef struct {
+   double complex *kernel[WAVE_COUNT];
+   int widths[WAVE_COUNT], max_width;
+} Wavelets;
 typedef struct { char *name, *seq; int length; uint32_t *cwt; uint8_t *label; } Contig;
 
 extern const int wave_sizes[WAVE_COUNT];
