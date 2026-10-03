@@ -20,7 +20,7 @@
 #define LEARNING_RATE 0.1f
 #define POSTERIOR_WEIGHT 0.01
 #define SPLICE_PENALTY 8.0
-#define DEFAULT_EPOCHS 72
+#define DEFAULT_EPOCHS 24
 
 typedef struct {
    double _Complex *kernel[WAVE_COUNT];
