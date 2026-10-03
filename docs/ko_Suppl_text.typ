@@ -206,3 +206,14 @@ $
 $ <gauss-integral-2-proof-5>
 이다.
 여기에 $s = 6$을 대입한 것이 $sqrt(pi) e^(- 9)$이다.
+=== 4.4. 영평균 조건을 만족하는 보정항 계산
+위의 wavelet, 즉 window function $times e^(i s u)$를 통해 다음 식을 계산할 수 있다.
+$
+  integral_(bb(R)) e^(- u^2 \/ 2) e^(i s u) thin d u = sqrt(2 pi) e^(- s^2 \/ 2)
+$ <zero-mean-proof-1>
+이 때, @zero-mean-proof-1 의 적분값은 0이 아니다.
+따라서 $c$를 곱한 항을 빼서 $c e^(i s u)$ 적분값을 0으로 만들기 위해 시도해 볼 수 있다.
+위의 각속도 $s = 6$을 대입하면,
+$
+  psi_0 \( u \) = e^(- u^2 \/ 2) \( e^(6 i u) - c \) .
+$ <zero-mean-proof-2>
