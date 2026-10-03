@@ -1454,3 +1454,159 @@ int main(int argc, char **argv) {
 c.f.) 11.2절부터 11.10절까지의 C 코드 블록은 #text(weight: "bold")[위에서 아래로 연결하면 원래 소스 순서]임.\
 외부 헤더 `kseq.h`, `rfft.h`와 zlib은 별도로 필요함.
 
+== 12. anno의 CWT 보존형 특성 공학
+
+이 절은 위의 연속 CWT를 바꾸는 것이 아니라, 그 결과와 서열 문맥을 `anno`의
+13상태 선형-chain CRF에 전달하는 방법을 설명함. 기존 스케일 `4,5,6,7,8,9`의
+power 구간·극대·극소 특성은 모든 실험에서 유지됨.
+
+새 학습의 기본 설정은 `periodic`, 24 epoch, 학습률 `0.1`임.
+실측한 후보 중 구조가 더 단순하고 gene/CDS exon 두 F1의 균형이 가장
+좋았던 설정을 선택한 것이며, annevo의 두 목표를 초과했다는 뜻은 아님.
+따라서 `-f`와 `-e`를 생략한 새 학습은 `-f periodic -e 24`와 같음.
+`transfer`와 `adaptive`는 명시적으로 선택할 때만 사용함.
+추론과 `-i` 이어 학습은 저장 모델의 특성 구성을 유지하며, 새 기본값으로
+기존 모델의 의미를 바꾸지 않음. 학습 원본은 Nip 그대로 사용하고 증강하지 않음.
+
+=== 12.1 추가 특성군
+
+- `baseline`: 기존 염기·hexamer·전이 4-mer·CWT·경계 dinucleotide 특성만 사용함.
+- `cwt`: 실제 양쪽 가닥의 복소 계수에서 8구간 위상, 3bp 간격의 4구간
+  위상 변화, 이웃 스케일 간 power 비율을 추가함. 거의 0인 계수와 N은
+  별도 코드로 처리함. 역상보 서열을 직접 변환하므로 켤레만으로 대체하지 않음.
+- `sequence`: 31bp/127bp 국소 GC, 31bp 최빈 염기 비율에 따른 복잡도,
+  코돈 위치별 codon, 같은 reading frame의 다음 stop까지 거리 구간,
+  donor/acceptor/start/stop 경계의 위치별 단일 염기 문맥을 추가함.
+- `combined`: `cwt`와 `sequence`를 함께 사용함.
+- `periodic`: 두 특성군에 스케일 3의 power·위상 특성을 추가함. 기존 여섯
+  스케일은 삭제하거나 대체하지 않음. 스케일 3의 중심 주기는 정확히 3bp가 아님.
+- `transfer`: 모든 `periodic` CWT 특성을 유지하면서, GC는 1023bp 배경 대비
+  31bp/127bp 차이로 표현함. Codon은 아미노산과 배경 GC 계층의 결합으로
+  표현하고 계층 공통 아미노산 특성도 함께 사용하여 동의 codon의 종별
+  사용 빈도 차이를 줄임. 기존 nucleotide/4-mer/hexamer 가중치는 GC 개수
+  그룹 안에서 중심화하여 종별 절대 GC 선호만으로 판정하지 않게 함.
+  이는 선택적인 transfer 학습의 제약이며 CWT 가중치는 중심화하지 않음.
+  이 계층과 구간은
+  고정 정의이며 Col 정답을 이용해 학습한 통계가 아님.
+  추가 스케일 3의 원래 power·위상도 보존하고, 31bp 평균 power의 기존
+  여섯 스케일 대비 비율과 3bp 간격 위상 변화 특성을 별도로 더하여
+  절대 크기·위상의 종별 변화에 덜 의존하게 함.
+  원래 여섯 스케일의 power·위상·위상 변화 특성도 그대로 유지함.
+- `adaptive`: `transfer`에 Nip 정답으로 추정한 GC 계층별 5차 Markov 모델을
+  결합함. 세 CDS phase·intron·intergenic의 염기 조건부 확률과 경계 PWM을
+  Dirichlet backoff로 추정하고 모델에 저장함. 추론 서열의 1023bp 국소 GC를
+  이용해 coding/intron 및 배경 확률을 같은 방식으로 기울인 뒤 likelihood
+  ratio를 계산함. 경계 PWM도 국소 배경 대비 enrichment로 표현함.
+  여섯 결합 계수는 Nip에서 CRF와 함께 학습하고 생성형 확률은 고정함.
+  이 선택에서는 기존 경계 dinucleotide와 단일 염기 가중치에도 GC 중심화
+  제약을 적용하되 row 전체의 평균 상수는 보존함. 경계 빈도 prior까지
+  제거하는 것과 GC 선호 제거를 구분하기 위함임.
+  모든 원래·확장 CWT 특성과 가중치는 그대로 유지함.
+  생성형 통계는 fitting에서만 계산함. Col 추론에서는 저장한 확률만 사용하며,
+  Col 정답·추가 학습 데이터·사전학습 모델을 사용하지 않음.
+  Coding likelihood의 캐시는 고정 범위 ±16, 1/1024 간격이며 원시 CWT와 무관함.
+
+구간 경계와 특성 배치는 고정된 모델 스키마에 속함. 새로운 정답 통계는
+Col에서 계산하지 않으며, CRF 가중치는 Nip의 정답으로만 학습함.
+원시 복소 계수를 염색체 전체에 상주시켜 저장하지 않고, 청크 계산 결과를
+가닥별 64비트 CWT 코드와 32비트 서열 문맥 코드로 압축함.
+압축은 모델 입력 특성의 표현이며, 위에서 유도한 CWT 계산의 축소가 아님.
+
+=== 12.2 모델과 출력
+
+`ANNOCRF6` 모델에는 특성 스키마, 특성군 bit mask, 가중치 차원과 선택적인
+생성형 확률이 기록됨. 저장 확률은 양수·유한값·합 1인지 검증함.
+추론은 저장된 특성군을 사용하며, 잘못된 스키마·차원·잘린 파일은 오류임.
+기존 `ANNOCRF2`, 호환되는 `ANNOCRF4`, 앞선 실험의 `ANNOCRF5` 모델도
+해당 특성 경로로 읽음.
+Warm start는 같은 특성군 또는 기존 인덱스를 보존하는 추가 특성만 허용함.
+기존 sequence 모델의 codon/GC 인코딩을 transfer 인코딩으로 바꾸거나
+이미 학습한 특성을 제거하는 것은 허용하지 않음.
+
+`anno cwt`와 `anno_cwt`의 기본 원시 export는 기존 여섯 스케일과
+`anno-cwt-v2` 형식을 그대로 유지함. 추가 스케일 3은 CRF의 선택적 파생
+특성군이며, 기본 export의 채널 수나 순서를 변경하지 않음.
+
+=== 12.3 환경과 재현
+
+`environment.yml`의 micromamba 환경 이름은 `anno`임.
+환경 생성 후 모든 빌드·테스트·학습·평가는 이 환경에서 실행함.
+
+```sh
+micromamba create -n anno -f environment.yml --channel-priority strict -y
+micromamba run -n anno make test
+micromamba run -n anno python3 benchmark_nip_col.py \
+  --features periodic --epochs 24 \
+  --output experiments/nip-col-chr5/periodic-e24 --measure-only
+```
+
+실험 스크립트는 실행 파일과 평가기를 보존하고 입력·소스·모델·예측의 해시,
+환경 패키지·도구 버전, epoch·seed·특성 설정, 로그와 평가 결과를 기록함.
+이미 존재하는 출력 폴더는 덮어쓰지 않음.
+`accuracy.py --json-output`은 기존 텍스트 결과와 함께 수치 결과를 저장함.
+`--learning-rate`는 학습 명령의 `-r`에 연결됨. `--initial-model`을 사용할 때는
+모델 해시와 Nip 학습 입력·명령이 기록된 provenance를 확인하여 Col에서
+학습한 모델이나 입력이 다른 모델을 초기값으로 혼용하지 않음.
+
+후속 생성형 결합 실험도 같은 도구와 Nip-only 입력을 사용함.
+아래 명령은 앞선 실패 실험의 모델을 초기값으로 사용하는 측정 실험이며,
+목표 달성을 보장하는 설정이 아님.
+
+```sh
+micromamba run -n anno python3 benchmark_nip_col.py \
+  --features adaptive --epochs 8 --learning-rate 0.02 \
+  --initial-model experiments/nip-col-chr5/transfer-e24-r002/model.bin \
+  --output experiments/nip-col-chr5/adaptive-gauge-e8-r002 --measure-only
+```
+
+같은 모델의 protein gene F1이 `91.2729%`보다 크고 gffcompare CDS exon F1이
+`90.5693%`보다 커야 두 목표를 통과함. 반올림 표시만으로 같아 보이는 개선은
+통과로 처리하지 않음. `--measure-only`가 없는 실험은 목표 미달 시 종료 코드 2임.
+이 수치는 제공된 annevo 보고서의 고정 목표이며, 현재 데이터에서 annevo를
+재실행한 직접 비교가 아님. Col을 반복 평가하여 특성을 선택하므로,
+Col 결과를 독립적인 미사용 테스트 결과라고 해석하면 안 됨.
+
+=== 12.4 전체 염색체 실험 기록
+
+현재 `anno` 환경에서 실제 Nip chr5 전체 학습과 Col chr5 전체 평가를 수행한
+결과는 다음과 같음. 지표 계산과 필터는 변경하지 않음.
+
+- 기존 특성, 72 epoch: Col protein gene F1 `46.6912%`,
+  gffcompare CDS exon F1 `51.0577%`.
+- `periodic`, 24 epoch, 학습률 `0.1`: Col protein gene F1 `58.8425%`,
+  gffcompare CDS exon F1 `58.2614%`.
+- `transfer`, Nip-only 기준선에서 24 epoch 추가, 학습률 `0.02`:
+  Col protein gene F1 `53.0543%`, gffcompare CDS exon F1 `58.7318%`.
+- 경계 row의 평균 상수 보존 수정 전 `adaptive`, `transfer`에서 4 epoch 추가:
+  Col protein gene F1 `39.4853%`, gffcompare CDS exon F1 `8.8158%`.
+  Nip 자기평가도 `49.9892%`/`11.3123%`로 낮아 이 후보를 채택하지 않음.
+- 경계 row의 평균 상수를 보존한 `adaptive`, `transfer`에서 8 epoch 추가,
+  학습률 `0.02`: Col protein gene F1 `55.0215%`,
+  gffcompare CDS exon F1 `60.6640%`. Nip 자기평가는
+  `87.9552%`/`83.4313%`였음.
+
+다섯 실험 모두 목표 미달임. 서로 다른 epoch와 초기값의 결과이므로 특성 하나만의
+통제된 인과 비교로 해석하지 않음.
+기준선의 Nip 자기평가는 gene F1 `96.9445%`, CDS exon F1 `91.6380%`였으나
+Col에서 크게 낮아졌음. 따라서 학습기를 단순히 더 오래 학습시키는 것과
+종간 조성 이전을 구분해야 함.
+`periodic`의 Nip 자기평가 gene F1도 `67.6183%`로 낮았으므로,
+이 후보에는 큰 특성 벡터의 최적화 문제도 존재함.
+Nip-only 기준선에서 시작한 `transfer`의 Nip 자기평가는 gene F1 `97.2878%`,
+CDS exon F1 `92.8454%`였음. 최적화가 충분해도 Col의 두 목표에는 미달하여,
+이 특성 조합으로 종간 이전 문제가 해결되었다고 주장하지 않음.
+
+`periodic` 저장 모델을 현재 실행 파일에서 다시 읽어 Col chr5 전체를
+예측했으며, 원래 평가에 사용한 GFF3와 바이트 단위로 일치했음.
+따라서 모델 복원이나 출력 재현 문제가 이 결과를 설명하지 않음.
+전체 일곱 스케일의 CWT 직접합·FFT 일치, 기존 여섯 스케일의 원시 export
+동일성, 신규 emission/transition gradient와 모델 호환성 테스트도 통과했음.
+생성형 content/PWM의 배경 정규화, 양쪽 가닥의 비단순 스플라이싱과 결합
+계수 gradient, 알 수 없는 염기, 이전 모델과 새 확률 모델의 복원도 검사함.
+`anno` 환경에서 원래 여섯 스케일을 사용하는 양쪽 가닥 plotting CLI도
+유효한 PNG를 생성했음.
+
+참조 경계에서 특성군별 점수를 비교한 진단에서는 Col의 start 경계 점수가
+Nip보다 더 낮고, 참조 intron의 평균 지속 점수도 intergenic 대비 음수로
+이동했음. 이는 후속 특성 실험을 위한 진단이며, 원인이 확정되었거나
+경계 정규화만으로 두 F1 목표에 도달한다고 해석하면 안 됨.
