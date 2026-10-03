@@ -192,6 +192,8 @@ $ integral_(bb(R)) e^(- u^2) e^(i s u) thin d u = sqrt(pi) e^(- s^2 \/ 4) $
 위에서 제안한 각속도 $s = 6$을 대입하면
 $ psi_0 \( u \) = e^(- u^2 \/ 2) \( e^(6 i u) - c \) . $
 여기서 $psi_0$는 에너지 정규화 전의 wavelet임. 평균 0 조건에 대입하면
+
+
 $ 0 = integral_(bb(R)) psi_0 \( u \) thin d u = sqrt(2 pi) e^(- 6^2 \/ 2) - c sqrt(2 pi) . $
 양변을 $sqrt(2 pi)$로 나누면
 $ c = e^(- 18) $
