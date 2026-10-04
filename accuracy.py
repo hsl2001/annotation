@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Accuracy metrics for reference and query GFF3 files.
+"""Protein gene-level and gffcompare CDS exon-level accuracy.
     micromamba run -n anno python3 accuracy.py \
         -r reference.gff3 -q anno.gff3 -g genome.fasta.gz
 """
@@ -86,17 +86,6 @@ def transcript_intervals(path, feature):
         if all(segment[:2] == (seqid, strand) for segment in segments):
             models[transcript] = gene, seqid, strand, segments
     return models, plain
-
-
-def read_exons(path):
-    transcripts, plain = transcript_intervals(path, "exon")
-    selected = {}
-    for gene, seqid, strand, intervals in transcripts.values():
-        length = sum(end - start + 1 for _, _, start, end in intervals)
-        key = seqid, strand, gene
-        if key not in selected or length > selected[key][0]:
-            selected[key] = length, intervals
-    return plain | {interval for _, intervals in selected.values() for interval in intervals}
 
 
 def read_genes(path):
@@ -207,9 +196,8 @@ def filtered_gff(path, genome, output, longest_only=False):
 
 
 def parse_gffcompare_stats(path):
-    metrics = {}
     pattern = re.compile(
-        r"^\s*(Base|Exon|Intron|Intron chain|Transcript|Locus) level:\s*"
+        r"^\s*Exon level:\s*"
         r"([0-9.]+)\s*\|\s*([0-9.]+)"
     )
     with open(path) as stream:
@@ -217,17 +205,14 @@ def parse_gffcompare_stats(path):
             match = pattern.match(line)
             if not match:
                 continue
-            name = match.group(1).lower().replace(" ", "_")
-            recall, precision = float(match.group(2)) / 100, float(match.group(3)) / 100
+            recall, precision = float(match.group(1)) / 100, float(match.group(2)) / 100
             tp = precision * recall
-            metrics[name] = scores(
+            return {"exon": scores(
                 tp,
                 recall - tp,
                 precision - tp,
-            )
-    if not metrics:
-        raise ValueError(f"could not parse gffcompare statistics: {path}")
-    return metrics
+            )}
+    raise ValueError(f"could not parse gffcompare exon statistics: {path}")
 
 
 def run_gffcompare(reference, query, workdir, label):
@@ -243,57 +228,11 @@ def run_gffcompare(reference, query, workdir, label):
     return parse_gffcompare_stats(stats_path)
 
 
-def merge(intervals):
-    merged = []
-    for start, end in sorted(intervals):
-        if merged and start <= merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def overlap(left, right):
-    total = i = j = 0
-    while i < len(left) and j < len(right):
-        start = max(left[i][0], right[j][0])
-        end = min(left[i][1], right[j][1])
-        total += max(0, end - start + 1)
-        if left[i][1] < right[j][1]:
-            i += 1
-        else:
-            j += 1
-    return total
-
-
 def scores(tp, fp, fn):
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return precision, recall, f1
-
-
-def evaluate(reference, query):
-    exact_tp = len(reference & query)
-    exact_fp = len(query - reference)
-    exact_fn = len(reference - query)
-    ref_groups = defaultdict(list)
-    query_groups = defaultdict(list)
-    for seqid, strand, start, end in reference:
-        ref_groups[(seqid, strand)].append((start, end))
-    for seqid, strand, start, end in query:
-        query_groups[(seqid, strand)].append((start, end))
-    bp_tp = bp_fp = bp_fn = 0
-    for group in set(ref_groups) | set(query_groups):
-        ref = merge(ref_groups[group])
-        pred = merge(query_groups[group])
-        shared = overlap(ref, pred)
-        ref_bp = sum(end - start + 1 for start, end in ref)
-        query_bp = sum(end - start + 1 for start, end in pred)
-        bp_tp += shared
-        bp_fp += query_bp - shared
-        bp_fn += ref_bp - shared
-    return scores(bp_tp, bp_fp, bp_fn), scores(exact_tp, exact_fp, exact_fn), (bp_tp, bp_fp, bp_fn), (exact_tp, exact_fp, exact_fn)
 
 
 def genome_fasta(genome, workdir):
@@ -454,21 +393,18 @@ def gene_level(reference_gff, query_gff, genome, workdir, *, bitscore, evalue, c
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Overall exon, bp and protein-level gene accuracy")
+    parser = argparse.ArgumentParser(description="Protein gene-level and gffcompare CDS exon-level accuracy")
     parser.add_argument("-r", "--reference", required=True, help="reference GFF3/GTF(.gz)")
     parser.add_argument("-q", "--query", required=True, help="query GFF3/GTF(.gz)")
-    parser.add_argument("-g", "--genome", help="genome FASTA(.gz); enables protein-level gene F1")
+    parser.add_argument("-g", "--genome", required=True, help="genome FASTA(.gz)")
     parser.add_argument("--bitscore", type=float, default=50.0, help="minimum blastp bit score")
     parser.add_argument("--evalue", type=float, default=1e-5, help="maximum blastp e-value")
     parser.add_argument("--coverage", type=float, default=0.70,
                         help="minimum best-HSP coverage of both proteins (fraction)")
     parser.add_argument("--threads", type=int, default=4, help="blastp threads")
     parser.add_argument("--workdir", type=pathlib.Path, help="keep protein/blast intermediates here")
-    parser.add_argument("--gffcompare", action="store_true",
-                        help="run CDS-only gffcompare exon/locus evaluation")
+    parser.add_argument("--gffcompare", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.gffcompare and not args.genome:
-        parser.error("--gffcompare requires --genome")
     if args.threads < 1:
         parser.error("--threads must be positive")
     if not math.isfinite(args.bitscore) or args.bitscore < 0:
@@ -477,20 +413,6 @@ def main():
         parser.error("--evalue must be finite and positive")
     if not 0 <= args.coverage < 1:
         parser.error("--coverage must be in [0, 1)")
-
-    try:
-        reference = read_exons(args.reference)
-        query = read_exons(args.query)
-        bp, exon, bp_counts, exon_counts = evaluate(reference, query)
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
-    print(f"bp-level: F1={bp[2]:.4%} precision={bp[0]:.4%} recall={bp[1]:.4%}")
-    print(f"  bases TP={bp_counts[0]:,} FP={bp_counts[1]:,} FN={bp_counts[2]:,}")
-    print(f"exon-level: F1={exon[2]:.4%} precision={exon[0]:.4%} recall={exon[1]:.4%}")
-    print(f"  exons TP={exon_counts[0]:,} FP={exon_counts[1]:,} FN={exon_counts[2]:,}")
-
-    if not args.genome:
-        return 0
 
     keep = args.workdir is not None
     if keep:
@@ -503,18 +425,14 @@ def main():
         gene, counts = gene_level(args.reference, args.query, args.genome, workdir,
                                   bitscore=args.bitscore, evalue=args.evalue,
                                   coverage=args.coverage, threads=args.threads)
-        if args.gffcompare:
-            genome = read_genome(args.genome)
-            reference_all = workdir / "reference.cds.gff3"
-            reference_longest = workdir / "reference.longest.cds.gff3"
-            query_cds = workdir / "query.cds.gff3"
-            reference_count = filtered_gff(args.reference, genome, reference_all)
-            filtered_gff(args.reference, genome, reference_longest, longest_only=True)
-            query_count = filtered_gff(args.query, genome, query_cds)
-            exon_gff = locus_gff = scores(0, query_count, reference_count)
-            if reference_count and query_count:
-                exon_gff = run_gffcompare(reference_longest, query_cds, workdir, "gffcompare_exon")["exon"]
-                locus_gff = run_gffcompare(reference_all, query_cds, workdir, "gffcompare_locus")["locus"]
+        genome = read_genome(args.genome)
+        reference_longest = workdir / "reference.longest.cds.gff3"
+        query_cds = workdir / "query.cds.gff3"
+        reference_count = filtered_gff(args.reference, genome, reference_longest, longest_only=True)
+        query_count = filtered_gff(args.query, genome, query_cds)
+        exon_gff = scores(0, query_count, reference_count)
+        if reference_count and query_count:
+            exon_gff = run_gffcompare(reference_longest, query_cds, workdir, "gffcompare_exon")["exon"]
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     finally:
@@ -522,10 +440,8 @@ def main():
             shutil.rmtree(workdir, ignore_errors=True)
     print(f"gene-level (protein): F1={gene[2]:.4%} precision={gene[0]:.4%} recall={gene[1]:.4%}")
     print(f"  genes TP={counts[0]:,} P(reference)={counts[1]:,} PP(predicted)={counts[2]:,}")
-    if args.gffcompare:
-        print(f"gffcompare CDS exon-level: F1={exon_gff[2]:.4%} precision={exon_gff[0]:.4%} recall={exon_gff[1]:.4%}")
-        print(f"gffcompare CDS locus-level: F1={locus_gff[2]:.4%} precision={locus_gff[0]:.4%} recall={locus_gff[1]:.4%}")
-        print(f"  filtered transcripts: reference={reference_count:,} query={query_count:,}")
+    print(f"gffcompare CDS exon-level: F1={exon_gff[2]:.4%} precision={exon_gff[0]:.4%} recall={exon_gff[1]:.4%}")
+    print(f"  filtered transcripts: reference={reference_count:,} query={query_count:,}")
     return 0
 
 

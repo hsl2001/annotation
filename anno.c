@@ -20,18 +20,25 @@ KSEQ_INIT(gzFile, gzread)
 
 const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9};
 static const float power_edges[7] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+static const double prominence_edges[5] = {0.25, 0.5, 1.0, 2.0, 4.0};
+static const int distance_edges[4] = {4, 12, 24, 40};
 
 enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097, KCWT = 32 * WAVE_COUNT };
+enum { PEAK_RADIUS = 32, PEAK_DISTANCE = 64, PEAK_HALO = PEAK_RADIUS + PEAK_DISTANCE + 1,
+       KPROM = 8, KDIST = 7, DIST_NONE = 5, DIST_MISSING = 6 };
 enum { OFF_T4 = 0, OFF_TPK = OFF_T4 + STATES * STATES * K4, OFF_NUC = OFF_TPK + STATES * STATES * KPK,
        OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX, BASE_WEIGHTS = OFF_CWT + STATES * KCWT,
        FLANKS = 27, OFF_SPLICE = BASE_WEIGHTS, RESERVED_WEIGHTS = STATES * 64,
-       OFF_BIAS = OFF_SPLICE + 4 * FLANKS * 17 + RESERVED_WEIGHTS, WEIGHTS = OFF_BIAS + STATES + STATES * STATES,
-       EMISSION_FEATURES = WAVE_COUNT + 3, TRANSITION_FEATURES = FLANKS + 3, MODEL_FEATURES = 191 };
+       OFF_BIAS = OFF_SPLICE + 4 * FLANKS * 17 + RESERVED_WEIGHTS, LEGACY_WEIGHTS = OFF_BIAS + STATES + STATES * STATES,
+       OFF_PROM = LEGACY_WEIGHTS, OFF_DIST = OFF_PROM + STATES * WAVE_COUNT * KPROM,
+       WEIGHTS = OFF_DIST + 2 * 2 * WAVE_COUNT * KDIST,
+       EMISSION_FEATURES = 2 * WAVE_COUNT + 3, TRANSITION_FEATURES = FLANKS + 3 + 2 * WAVE_COUNT,
+       LEGACY_FEATURES = 191, MODEL_FEATURES = LEGACY_FEATURES | 256 | 512 };
 
 typedef struct {
   uint16_t k4, hexf, hexr;
-  uint32_t cwt;
-  uint8_t nuc, pk, flank[2][FLANKS];
+  uint32_t cwt, prominence;
+  uint8_t nuc, pk, flank[2][FLANKS], peak_distance[WAVE_COUNT];
 } Site;
 
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans, preds[STATES][4], npreds[STATES];
@@ -208,6 +215,96 @@ uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int lengt
   return codes;
 }
 
+static int peak_prominence(const double *power, const double *sums, const int *invalid, int position) {
+  int lower = position - PEAK_RADIUS, upper = position + PEAK_RADIUS;
+  if (invalid[upper + 1] != invalid[lower]) return KPROM - 1;
+  double mean = (sums[upper + 1] - sums[lower]) / (2 * PEAK_RADIUS + 1);
+  if (mean <= 1e-12) return KPROM - 1;
+  double height = power[position], tolerance = 1e-10 * fmax(1.0, height);
+  if (height <= power[position - 1] + tolerance || height < power[position + 1] - tolerance) return 0;
+  int plateau_end = position + 1;
+  while (plateau_end <= upper && fabs(power[plateau_end] - height) <= tolerance) plateau_end++;
+  if (plateau_end > upper || power[plateau_end] > height) return 0;
+  double minima[2] = {height, height};
+  for (int side = 0; side < 2; side++) {
+    int direction = side ? 1 : -1;
+    for (int distance = 1; distance <= PEAK_RADIUS; distance++) {
+      double value = power[position + direction * distance];
+      if (value > height + tolerance) break;
+      minima[side] = fmin(minima[side], value);
+    }
+  }
+  double relative = (height - fmax(minima[0], minima[1])) / mean;
+  if (relative <= 1e-10) return 0;
+  int bin = 1;
+  for (int edge = 0; edge < 5; edge++) bin += relative > prominence_edges[edge];
+  return bin;
+}
+
+static int peak_distance_bin(int distance, int missing_distance) {
+  if (distance > PEAK_DISTANCE) return missing_distance <= PEAK_DISTANCE ? DIST_MISSING : DIST_NONE;
+  int bin = 0;
+  for (int edge = 0; edge < 4; edge++) bin += distance > distance_edges[edge];
+  return bin;
+}
+
+static uint32_t *cwt_peak_features(const Wavelets *wavelets, const char *sequence, int length, uint8_t **distances) {
+  uint32_t *codes = anno_alloc(length, sizeof(*codes));
+  *distances = anno_alloc(length, WAVE_COUNT);
+  int capacity = 1024 + 2 * PEAK_HALO;
+  double *features = anno_alloc((size_t)capacity * CWT_CHANNELS, sizeof(*features));
+  double *power = anno_alloc(capacity, sizeof(*power)), *sums = anno_alloc(capacity + 1, sizeof(*sums));
+  int *invalid = anno_alloc(capacity + 1, sizeof(*invalid));
+  uint8_t *peaks = anno_alloc(capacity, sizeof(*peaks));
+  for (int start = 0; start < length; start += 1024) {
+    int count = length - start < 1024 ? length - start : 1024;
+    int rows = count + 2 * PEAK_HALO;
+    cwt_extract(wavelets, sequence, length, start - PEAK_HALO, rows, features);
+    invalid[0] = 0;
+    for (int offset = 0; offset < rows; offset++) {
+      long position = (long)start - PEAK_HALO + offset;
+      invalid[offset + 1] = invalid[offset] +
+        (position < 0 || position >= length || base_index(sequence[position]) < 0);
+    }
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      sums[0] = 0;
+      for (int offset = 0; offset < rows; offset++) {
+        const double *value = features + (size_t)offset * CWT_CHANNELS + 2 * scale;
+        power[offset] = value[0] * value[0] + value[1] * value[1];
+        sums[offset + 1] = sums[offset] + power[offset];
+      }
+      for (int offset = PEAK_RADIUS; offset < rows - PEAK_RADIUS; offset++)
+        peaks[offset] = peak_prominence(power, sums, invalid, offset);
+      for (int offset = 0; offset < count; offset++)
+        codes[start + offset] |= (uint32_t)peaks[offset + PEAK_HALO] << (3 * scale);
+      int nearest = -capacity, missing = -capacity;
+      for (int offset = PEAK_RADIUS; offset < rows - PEAK_RADIUS; offset++) {
+        if (peaks[offset] == KPROM - 1) nearest = -capacity, missing = offset;
+        else if (peaks[offset]) nearest = offset;
+        int local = offset + 1 - PEAK_HALO;
+        if (local >= 0 && local < count)
+          (*distances)[(size_t)(start + local) * WAVE_COUNT + scale] =
+            peak_distance_bin(offset - nearest, offset - missing);
+      }
+      nearest = missing = 2 * capacity;
+      for (int offset = rows - PEAK_RADIUS - 1; offset >= PEAK_RADIUS; offset--) {
+        if (peaks[offset] == KPROM - 1) nearest = 2 * capacity, missing = offset;
+        else if (peaks[offset]) nearest = offset;
+        int local = offset - PEAK_HALO;
+        if (local >= 0 && local < count)
+          (*distances)[(size_t)(start + local) * WAVE_COUNT + scale] |=
+            peak_distance_bin(nearest - offset, missing - offset) << 4;
+      }
+    }
+  }
+  free(peaks);
+  free(invalid);
+  free(sums);
+  free(power);
+  free(features);
+  return codes;
+}
+
 static int kmer(const char *seq, int length, int from, int k, int reverse) {
   int code = 0;
   for (int j = 0; j < k; j++) {
@@ -230,6 +327,8 @@ static Site site_at(const Contig *c, int i) {
   Site s = {.k4 = kmer(c->seq, c->length, i - 2, 4, 0), .hexf = kmer(c->seq, c->length, i - 5, 6, 0),
             .hexr = kmer(c->seq, c->length, i, 6, 1), .cwt = c->cwt[i], .nuc = base < 0 ? 4 : base,
             .pk = (i ? peak_count(c->cwt[i - 1]) : 0) * (WAVE_COUNT + 1) + peak_count(c->cwt[i])};
+  s.prominence = c->prominence[i];
+  memcpy(s.peak_distance, c->peak_distance + (size_t)i * WAVE_COUNT, sizeof(s.peak_distance));
   for (int offset = 0; offset < FLANKS; offset++) {
     int displacement = -40 + 2 * offset;
     s.flank[0][offset] = kmer(c->seq, c->length, i + displacement, 2, 0);
@@ -295,8 +394,11 @@ static void init_transitions(void) {
 static void emission_indices(const Site *site, int state, int *indices) {
   indices[0] = OFF_NUC + state * KNUC + site->nuc;
   indices[1] = OFF_HEX + state * KHEX + (state >= 7 ? site->hexr : site->hexf);
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
     indices[scale + 2] = OFF_CWT + state * KCWT + scale * 32 + (site->cwt >> (5 * scale) & 31);
+    indices[scale + WAVE_COUNT + 2] = OFF_PROM + (state * WAVE_COUNT + scale) * KPROM +
+      (site->prominence >> (3 * scale) & 7);
+  }
   indices[EMISSION_FEATURES - 1] = OFF_BIAS + state;
 }
 
@@ -307,6 +409,13 @@ static int transition_indices(const Site *site, int previous, int current, int *
   if (kind >= 0)
     for (int offset = 0; offset < FLANKS; offset++)
       indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * 17 + site->flank[previous >= 7 || current >= 7][offset];
+  if (kind == 0 || kind == 1) {
+    int reverse = previous >= 7 || current >= 7;
+    for (int side = 0; side < 2; side++)
+      for (int scale = 0; scale < WAVE_COUNT; scale++)
+        indices[count++] = OFF_DIST + ((kind * 2 + side) * WAVE_COUNT + scale) * KDIST +
+          (site->peak_distance[scale] >> (4 * (side ^ reverse)) & 15);
+  }
   indices[count++] = OFF_BIAS + STATES + pair;
   return count;
 }
@@ -375,6 +484,8 @@ static void free_contigs(Contig *contigs, int count) {
     free(contigs[contig].name);
     free(contigs[contig].seq);
     free(contigs[contig].cwt);
+    free(contigs[contig].prominence);
+    free(contigs[contig].peak_distance);
     free(contigs[contig].label);
   }
   free(contigs);
@@ -664,7 +775,7 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
   uint32_t features = MODEL_FEATURES;
-  if (!file || fwrite("ANNOCRF4", 1, 8, file) != 8 || fwrite(&features, sizeof(features), 1, file) != 1 ||
+  if (!file || fwrite("ANNOCRF5", 1, 8, file) != 8 || fwrite(&features, sizeof(features), 1, file) != 1 ||
       fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
@@ -675,16 +786,19 @@ static void load_model(const char *path, float *w) {
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
   if (!memcmp(magic, "ANNOCRF1", 8))
     anno_fail("Model %s uses the previous CWT implementation; retrain it with this executable", path);
+  memset(w, 0, WEIGHTS * sizeof(*w));
   size_t count = BASE_WEIGHTS;
-  if (!memcmp(magic, "ANNOCRF4", 8)) {
+  int current = !memcmp(magic, "ANNOCRF5", 8);
+  if (current || !memcmp(magic, "ANNOCRF4", 8)) {
     uint32_t features;
-    if (fread(&features, sizeof(features), 1, file) != 1 || features != MODEL_FEATURES)
+    if (fread(&features, sizeof(features), 1, file) != 1 || features != (uint32_t)(current ? MODEL_FEATURES : LEGACY_FEATURES))
       anno_fail("Model uses experimental features; retrain with this executable: %s", path);
-    count = WEIGHTS;
+    count = current ? WEIGHTS : LEGACY_WEIGHTS;
   } else if (memcmp(magic, "ANNOCRF2", 8)) anno_fail("Cannot read model: %s", path);
   if (fread(w, sizeof(*w), count, file) != count || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
+  if (!current) fprintf(stderr, "Legacy model: peak prominence/distance weights are zero; retrain or warm-start with -i\n");
 }
 
 static FILE *create_in(const char *directory, const char *name) {
@@ -788,8 +902,10 @@ int main(int argc, char **argv) {
   }
   int count;
   Contig *contigs = read_fasta(args[0], &count);
-  for (int c = 0; c < count; c++)
+  for (int c = 0; c < count; c++) {
     contigs[c].cwt = cwt_features(&wavelets, contigs[c].seq, contigs[c].length);
+    contigs[c].prominence = cwt_peak_features(&wavelets, contigs[c].seq, contigs[c].length, &contigs[c].peak_distance);
+  }
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);

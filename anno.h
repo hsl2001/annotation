@@ -26,7 +26,12 @@ typedef struct {
    double _Complex *kernel[WAVE_COUNT];
    int widths[WAVE_COUNT], max_width;
 } Wavelets;
-typedef struct { char *name, *seq; int length; uint32_t *cwt; uint8_t *label; } Contig;
+typedef struct {
+   char *name, *seq;
+   int length;
+   uint32_t *cwt, *prominence;
+   uint8_t *peak_distance, *label;
+} Contig;
 
 extern const int wave_sizes[WAVE_COUNT];
 void anno_fail(const char *format, ...);

@@ -17,7 +17,7 @@
   below: 10pt,
 )[#text(weight: "light", fill: rgb("000000"))[c.f.] #h(1em) #body]
 
-#t[supplementary text 한국어 버전]
+#t[사전 작성된 supplementary text 한국어 버전]
 
 = Supplementary Text 1
 연속 웨이블릿 변환을 이용한 유전체 서열 분석
@@ -225,7 +225,7 @@ $ <zero-mean-proof-2>
 일반적인 각주파수 $omega_0$를 사용하면 보정값은 $e^(- omega_0^2 \/ 2)$이다.
 $e^(- 18) approx 1.52 times 10^(- 8)$로 매우 작지만, 엄밀하게 평균 0을 만족시키기 위해 포함하였다.
 #cf[현재 입력 DNA 신호의 평균을 빼는 것이 아니라 비교할 wavelet 자체를 보정하고 있다.]
-== 5. 유한 에너지 조건을 만족하는 Morlet wavelet의 유도 (에너지 정규화)
+== 5. 유한 에너지 조건과 적합성 조건을 만족하는 Morlet wavelet의 유도
 === 5.1. 에너지의 정의와 에너지 정규화의 목적
 유한 에너지 조건은 wavelet 식의 제곱의 적분이 유한해야 한다는 조건이다.
 에너지(제곱의 적분)이 무한하면 일반적인 유한한 신호와의 내적이 유한하다고 보장할 수 없다.
@@ -270,4 +270,50 @@ $ <energy-proof-4>
 를 사용하면 전체 에너지를 1로 맞출 수 있다.
 이 때, $e^(- 36)$은 $c^2$, $e^(- 27)$은 $c e^(- 9)$에서 나온 항이다.
 보정항이 작으므로 $N$은 $pi^(- 1 \/ 4) approx 0.7511$에 매우 가깝다.
-== 6. 적합성 조건을 만족하는 Morlet wavelet의 유도
+=== 5.3. 적합성 조건을 만족하는 Morlet wavelet의 유도
+푸리에 변환은
+$
+  hat(psi) \( xi \) = integral_(bb(R)) psi \( u \) e^(- i xi u) thin d u
+$ <fourier-transform>
+으로 정의된다.
+가우스 적분을 각 항에 적용하면,
+$
+  hat(psi) \( xi \) = N sqrt(2 pi) [e^(- \( xi - 6 \)^2 \/ 2) - e^(- 18) e^(- xi^2 \/ 2)] .
+$ <fourier-transform-wavelet>
+이 때, $xi$는 Mother wavelet 좌표에서의 각주파수이다.
+$xi = 0$에서는 두 항이 같으므로 $hat(psi) \( 0 \) = 0$이다. 평균 0을 주파수 영역에서 표현한 것이다.
+이 식은 0 근처에서는 미분 가능하므로, $\| hat(psi) \( xi \) \| lt.eq C \| xi \|$인 상수 $C$를 선택할 수 있다.
+멀리서는 가우스 함수와 같이 감소하고, 따라서 아래 적합성 적분이 유한하다.
+$
+  0 < integral_(bb(R)) frac(\| hat(psi) \( xi \) \|^2, \| xi \|) thin d xi < oo
+$ <admissibility-condition>
+이 성립한다.
+0 근처에서 분자의 크기 제곱은 $\| xi \|^2$에 비례하는 상한을 가지므로 $\| xi \|$로 나눠도 적분항은 발산하지 않는다.
+무한대에서는 가우스 항의 빠른 감소에 의해 적분이 유한하다.
+== 6. Scaling과 sliding을 통한 CWT의 정의
+=== 6.1. Wavelet의 scaling과 sliding
+Mother wavelet을 $psi \( u \)$라 하고,
+$
+  psi_(a \, b) \( t \) = 1 / sqrt(a) psi (frac(t - b, a))
+$ <daugther-wavelets>
+스케일 $a > 0$와 위치 $b$를 사용해 @daugther-wavelets 와 같이 daughter wavelet들을 정의할 수 있다.
+이 때, $t - b$는 wavelet의 중심을 위치 $b$로 이동 (sliding)하는 것이고, $\( t - b \) \/ a$는 패턴의 폭을 $a$배로 변경 (scaling) 하는 것이다.
+$1 \/ sqrt(a)$는 폭을 바꾸더라도 에너지를 1로 유지하는 계수이다.
+예를 들어, Mother wavelet의 위치 $u = 2$는 실제 신호에서 $t = b + 2 a$에 해당한다. $a = 4$이면 중심에서 8 bp 떨어진 위치, $a = 8$이면 16 bp 떨어진 위치이다.
+$a$가 커질수록 더 넓은 구간과 더 긴 주기의 염기 패턴을 비교한다.
+#cf[$a$는 창 함수의 폭을 바꾸는 배율이고, 실제 포함되는 염기의 개수와 정확히 같은 것응 아니다. 가우스 창 함수는 무한히 이어지며, 실제 컴퓨터의 계산에서는 $\| t - b \| lt.eq 8 a$인 범위만 남긴다. 예를 들어 $a = 4$이면 중심 양쪽 약 32 bp 이다. 위 절단 방식은 뒤에서 추가로 다룬다.]
+#cf[Mother wavelet은 scaling 1,  sliding 0인 기준 wavelet으로 볼 수 있다.]
+=== 6.2. scaling 과정에서 에너지를 1로 유지하기 위한 계수
+폭을 늘리기만 하면 적분 구간도 늘어나 에너지가 $a$배로 커진다. 이를 상쇄하기 위해 진폭에 $1 \/ sqrt(a)$를 곱한다.
+치환적분을 통해, $u = \( t - b \) \/ a$로 치환하면 $d t = a thin d u$이므로, 즉 @energy-scaling 에 의해
+$
+  integral_(bb(R)) \| psi_(a \, b) \( t \) \|^2 thin d t & = 1 / a integral_(bb(R)) lr(|psi (frac(t - b, a))|)^2 d t \
+                                                         & = 1 / a integral_(bb(R)) \| psi \( u \) \|^2 a thin d u = 1 .
+$ <energy-scaling>
+스케일이나 슬라이딩 위치가 바뀌어도 비교 웨이블릿의 에너지는 1로 유지된다.
+=== 6.3. 복소 내적을 통한 CWT의 계산
+$
+  W_x \( a \, b \) = integral_(bb(R)) x \( t \) overline(psi_(a \, b) \( t \)) thin d t = 1 / sqrt(a) integral_(bb(R)) x \( t \) overline(psi \( \( t - b \) \/ a \)) thin d t .
+$ <cwt-def-inner-product>
+@cwt-def-inner-product 가 현재 이 연구에서 사용하는 CWT의 정의이다.
+이는 곧 위치 $b$ 주변의 신호와 스케일 $a$인 wavelet을 비교한 하나의 복소 계수를 얻는 것이다.
