@@ -317,3 +317,50 @@ $
 $ <cwt-def-inner-product>
 @cwt-def-inner-product 가 현재 이 연구에서 사용하는 CWT의 정의이다.
 이는 곧 위치 $b$ 주변의 신호와 스케일 $a$인 wavelet을 비교한 하나의 복소 계수를 얻는 것이다.
+$x \( t \)$와 $overline(psi_(a \, b) \( t \))$를 곱하고 전체 위치에서 적분하는 방식이다.
+이러한 비교를 복소 내적 (complex inner product)라고 부른다.
+같은 위상(phase; 복소평면상 복소수의 각도)으로 맞는 성분은 보강되고, 맞지 않는 성분은 상쇄될 수 있다.
+신호가 정확히 $x \( t \) = psi_(a \, b) \( t \)$이면 $W_x \( a \, b \) = integral \| psi_(a \, b) \( t \) \|^2 d t = 1$이다.
+#cf[CWT가 웨이블릿과 유전체 신호의 '겹치는 면적'을 계산한다고 하는 것은 사실 직관적인 비유이다. 엄밀하게는, 두 그래프 사이의 기하학적 공통 면적을 구하는 것이 아니라 #text(weight: "bold")[신호와 켤레 wavelet의 곱을 적분]하는 것이다. 위치에 따라 이동시키며 비교하므로 상관(correlation) 형태이고, wavelet의 방향을 뒤집어 커널로 사용하면 합성곱(convolution)으로도 표현될 수 있다. 이 연구에서는 합성곱은 단순 복소내적이나 corrlation에 비해 계산하기 훨씬 간편하므로 convolution을 일차적으로 구한다.]
+계수 $W = p + i q$를 해석하면, 크기 $\| W \| = sqrt(p^2 + q^2)$는 해당 패턴에 대한 wavelet 응답의 크기이다. 또, 위상(phase)는 복소평면상에서 계수의 각도로, 신호와 wavelet의 진동 위치 관계를 반영한다. 파워(power)는 $\| W \|^2 = p^2 + q^2$로 계산되는 크기를 제곱한 실수 값이다.
+#cf[비교 패턴의 에너지가 1이라고 해서 모든 계수가 0과 1 사이인 것은 아니다. 입력 신호(유전체 신호)는 1로 정규화하지 않았으므로 DNA 신호에서도 $\| W \| > 1$이 나올 수 있다.] 따라서 CWT 계수를 상관계수나 확률처럼 0부터 1 사이의 유사도 점수로 해석하면 안 된다.
+#cf[유한 에너지 조건은 계수의 크기에 영향을 준다. 코시-슈바르츠 부등식(Cauchy-Schwarz) 부등식을 적용하면, $ \| W_x \( a \, b \) \| lt.eq \| x \|_2 \| psi_(a \, b) \|_2 = \| x \|_2 . $, 그리고 $\| x \|_2 = sqrt(integral_(bb(R)) \| x \( t \) \|^2 thin d t)$이다. 길이 $L$인 DNA 신호는 $\| x \|_2^2 = sum_(n = 0)^(L - 1) \| x \[ n \] \|^2 lt.eq L$이므로 계수도 유한하다.]
+=== 6.4. 알려진 신호의 CWT 응답 예시
+결과를 직접 계산할 수 있는 신호를 통해 위 정의를 검산할 수 있다.
+아래에서는 상수 신호, 정현파에서 검산 작업을 수행하였다.
+==== 6.4.1. 상수 신호의 응답
+무한히 이어진 상수 신호 $x \( t \) = c$에 대해,
+$
+  W_x \( a \, b \) = c sqrt(a) integral_(bb(R)) overline(psi \( u \)) thin d u = 0 .
+$ <constant-signal-1>
+영평균 조건에 의해 모든 스케일과 위치에서 계수가 0이다.
+#cf[한 종류의 염기만 있는 유한 contig은 무한히 이어진 상수 신호와 다르다. contig 밖은 0으로 정의되므로 양 끝에 값의 변화가 생긴다.]
+==== 6.4.2. 정현파 신호의 응답
+계산이 용이한 연속시간 정현파 신호 $x \( t \) = e^(i omega t)$를 가정하고 $t = b + a u$를 대입하면,
+$
+  W_x \( a \, b \) = sqrt(a) thin e^(i omega b) integral_(bb(R)) e^(i a omega u) overline(psi \( u \)) thin d u .
+$ <sinusoid-integral-1>
+@sinusoid-integral-1 에 $overline(psi \( u \)) = N e^(- u^2 \/ 2) \( e^(- 6 i u) - e^(- 18) \)$를 대입하면, 가우스 함수에 곱하는 진동의 각주파수는 $a omega - 6$과 $a omega$가 된다.
+가우스 적분을 두 번 사용하면,
+$
+  W_x \( a \, b \) = N sqrt(2 pi a) thin e^(i omega b) [e^(- \( a omega - 6 \)^2 \/ 2) - e^(- 18) e^(- \( a omega \)^2 \/ 2)] .
+$ <sinusoid-integral-2>
+여기서 $e^(i omega b)$는 위치에 따른 복소 위상을 나타내고, $e^(- \( a omega - 6 \)^2 \/ 2)$는 $a omega$가 6에 가까울 때 커진다.
+따라서 고정 스케일에서 중심 주파수와 대표 주기는 아래와 같이 근사될 수 있다.
+$
+  omega_c approx 6 / a \, #h(2em) f_c approx frac(6, 2 pi a) \, #h(2em) T approx frac(2 pi a, 6) upright(" bp")
+$ <sinusoid-integral-result>
+$T = 1 \/ f_c$이므로 “스케일 $a$ = 주기 $a$ bp”는 아니다.
+#cf[입력 주파수를 고정하고 스케일을 바꾸며 최대 응답을 찾으면 앞의 $sqrt(a)$도 변함. 따라서 $a omega = 6$이 정확한 최대 응답 위치라는 뜻은 아니다. 예를 들어, 주기 3 bp에 맞는 스케일은 약 $a = 9 \/ pi approx 2.86$이다. 자연수 스케일 3에 가까운 패턴을 볼 수는 있지만 정확히 같은 중심 주기는 아니다.]
+#cf[일반적인 $omega_0$에서는 $omega_c approx omega_0 \/ a$이다. 동일한 $omega_c$에서 $omega_0$를 키우려면 $a$도 키워야 한다. 스케일 1에서는 $f_c approx 0.955$ cycles/bp로, 간격 1인 샘플의 Nyquist sampling 기준 $0.5$ cycles/bp보다 크다.]
+==== 6.4.3 작은 스케일의 유효성
+정수 샘플에서는 @integer-sample 을 만족한다.
+$
+  e^(i \( omega + 2 pi k \) n) = e^(i omega n) quad \( k upright("is integer") \)
+$ <integer-sample>
+서로 다른 연속 주파수가 같은 샘플을 만들 수 있고, 이를 엘리어싱 (aliasing)이라고 한다.
+따라서 샘플만으로는 원래의 연속 주파수를 유일하게 알아낼 수 없다.
+Nyquist 샘플링 정리에 의한 복원 보정이 필요하다.
+이 연구에서는 원 신호를 복원하는 대신 아예 연속시간함수로 정의된 계단 형태의 함수를 선택했다.
+==== 6.4.4 정현파 샘플의 계단 신호화
+#t[여기부터 작성]

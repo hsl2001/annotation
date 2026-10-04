@@ -18,3 +18,5 @@ annevo/
 tmp*
 *plots-draw*
 !truth*
+*bam
+*truth.combined.slm.nip*
