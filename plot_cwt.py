@@ -14,11 +14,17 @@ import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 import numpy as np
 
+REPEAT_FREE_CONTROL_NAMES = ("control-no-repeat", "control-aggt-no-repeat",
+                             "control-aggt-p1-no-repeat")
 PLOT_NAMES = ("exons", "exons-mutated", "control", "control-aggt", "control-aggt-p1",
               "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt",
-              "abs-control-aggt-p1")
+              "abs-control-aggt-p1", "first-exons", "last-exons",
+              "abs-first-exons", "abs-last-exons", *REPEAT_FREE_CONTROL_NAMES,
+              *(f"abs-{name}" for name in REPEAT_FREE_CONTROL_NAMES))
 AGGT_CONTROL_NAMES = frozenset(("control-aggt", "control-aggt-p1"))
+REPEAT_FEATURE_TYPES = frozenset(("repeat_region", "mobile_element"))
 CONTROL_REPLICATES = 5
+ABS_RADIUS = 300
 
 
 def open_text(path):
@@ -41,7 +47,7 @@ def fasta_records(path, wanted=None):
         yield name, "".join(chunks)
 
 
-def gff_exons(path):
+def gff_records(path):
     with open_text(path) as stream:
         for line_number, row in enumerate(csv.reader(stream, delimiter="\t", quoting=csv.QUOTE_NONE), 1):
             if not row or row[0].startswith("#"):
@@ -50,8 +56,15 @@ def gff_exons(path):
                 continue
             if len(row) != 9:
                 raise ValueError(f"Expected 9 GFF/GTF columns at line {line_number}")
-            if row[2] == "exon":
-                yield row
+            yield row
+
+
+def gff_exons(path):
+    return (row for row in gff_records(path) if row[2] == "exon")
+
+
+def gff_attributes(text):
+    return dict(field.split("=", 1) for field in text.split(";") if "=" in field)
 
 
 def load_matrix(directory):
@@ -138,17 +151,64 @@ def exon_power(matrix, contig, start, end, strand, bins, flank):
     return result.T
 
 
-def read_exons(path, contigs):
+def read_exon_sets(path, contigs):
     intervals = set()
-    for row in gff_exons(path):
+    gene_ids = set()
+    parents_by_id = {}
+    exon_rows = []
+    for row in gff_records(path):
+        attributes = gff_attributes(row[8])
+        identifier = attributes.get("ID")
+        if row[2] == "gene" and identifier:
+            gene_ids.add(identifier)
+        if identifier:
+            parents_by_id[identifier] = attributes.get("Parent", "").split(",")
+        if row[2] == "exon":
+            exon_rows.append((row, attributes.get("Parent", "").split(",")))
+
+    transcript_exons = defaultdict(lambda: defaultdict(set))
+    for row, parents in exon_rows:
         name, start, end, strand = row[0], int(row[3]), int(row[4]), row[6]
         if name not in contigs:
             raise ValueError(f"Exon contig absent from CWT matrix: {name}")
+        interval = name, start, end, strand
         oriented_bounds(contigs[name], start, end, strand)
-        intervals.add((name, start, end, strand))
+        intervals.add(interval)
+        for parent in filter(None, parents):
+            ancestors, pending = set(), [parent]
+            while pending:
+                ancestor = pending.pop()
+                if ancestor in ancestors:
+                    continue
+                ancestors.add(ancestor)
+                if ancestor in gene_ids:
+                    transcript_exons[ancestor][parent].add(interval)
+                else:
+                    pending.extend(parents_by_id.get(ancestor, ()))
     if not intervals:
         raise ValueError("No exon features found; CDS is not silently substituted for exon")
-    return sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
+    first_exons, last_exons = set(), set()
+    for transcripts in transcript_exons.values():
+        for exons in transcripts.values():
+            strand = next(iter(exons))[3]
+            if strand == "+":
+                first_position = min(exon[1] for exon in exons)
+                last_position = max(exon[2] for exon in exons)
+                first_exons.update(exon for exon in exons if exon[1] == first_position)
+                last_exons.update(exon for exon in exons if exon[2] == last_position)
+            else:
+                first_position = max(exon[2] for exon in exons)
+                last_position = min(exon[1] for exon in exons)
+                first_exons.update(exon for exon in exons if exon[2] == first_position)
+                last_exons.update(exon for exon in exons if exon[1] == last_position)
+
+    sort_intervals = lambda selected: sorted(
+        selected, key=lambda item: (item[2] - item[1] + 1, item))
+    return {
+        "exons": sort_intervals(intervals),
+        "first-exons": sort_intervals(first_exons),
+        "last-exons": sort_intervals(last_exons),
+    }
 
 
 def aggregate_intervals(intervals, rows, sample_power, stem, action):
@@ -226,7 +286,7 @@ def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows,
         color_label="log(1 + mean power), common scale; top 0.5% clipped")
 
 
-def boundary_power(matrix, contig, interval, boundary, radius=100):
+def boundary_power(matrix, contig, interval, boundary, radius=ABS_RADIUS):
     name, start, end, strand = interval
     first, last = oriented_bounds(contig, start, end, strand)
     center = first if boundary == "start" else last - 1
@@ -250,8 +310,10 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
     for boundary_index, boundary in enumerate(("start", "end")):
         render_power_panels(
             display[:, boundary_index], profiles[boundary_index], contigs, widths, out / f"{boundary}.png",
-            positions=np.arange(-100, 101), extent=(-100.5, 100.5, 0, len(intervals)),
-            ticks=((-100, 0, 100), ("-100", "0", "+100")),
+            positions=np.arange(-ABS_RADIUS, ABS_RADIUS + 1),
+            extent=(-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, len(intervals)),
+            ticks=((-ABS_RADIUS, 0, ABS_RADIUS),
+                   (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}")),
             xlabel=f"Position from {boundary} boundary (bp)", height=6, maximum=maximum,
             color_label="log(1 + power), common scale; top 0.5% clipped")
 
@@ -363,8 +425,34 @@ def build_exon_mask(contigs, exons):
     return masks
 
 
-def sample_controls(contigs, exons, seed, attempts=200):
+def read_repeat_masks(path, contigs):
+    masks = {name: np.zeros(info["length"], dtype=bool) for name, info in contigs.items()}
+    found = False
+    for row in gff_records(path):
+        if row[2] not in REPEAT_FEATURE_TYPES:
+            continue
+        name, start, end = row[0], int(row[3]), int(row[4])
+        if name not in contigs:
+            raise ValueError(f"Repeat contig absent from CWT matrix: {name}")
+        if start < 1 or end < start or end > contigs[name]["length"]:
+            raise ValueError(f"Invalid repeat interval: {name}:{start}-{end}")
+        masks[name][start - 1:end] = True
+        found = True
+    if not found:
+        raise ValueError("Repeat-free controls require repeat_region or mobile_element annotations in GFF")
+    return masks
+
+
+def control_exclusion_masks(contigs, exons, repeat_masks=None):
     masks = build_exon_mask(contigs, exons)
+    if repeat_masks is not None:
+        for name in masks:
+            masks[name] |= repeat_masks[name]
+    return masks
+
+
+def sample_controls(contigs, exons, seed, attempts=200, repeat_masks=None):
+    masks = control_exclusion_masks(contigs, exons, repeat_masks)
     names = list(contigs)
     weights = np.cumsum([contigs[name]["length"] for name in names], dtype=np.float64)
     rng = np.random.default_rng(seed)
@@ -429,8 +517,8 @@ def aggt_candidates(sequences):
     return candidates, end_masks
 
 
-def prepare_aggt_controls(contigs, exons, sequences):
-    masks = build_exon_mask(contigs, exons)
+def prepare_aggt_controls(contigs, exons, sequences, repeat_masks=None):
+    masks = control_exclusion_masks(contigs, exons, repeat_masks)
     candidates, end_masks = aggt_candidates(sequences)
     if candidates["+"][0].size == 0 and candidates["-"][0].size == 0:
         raise ValueError("No AG/GT-flanked non-exon sites available in the provided FASTA")
@@ -466,28 +554,48 @@ def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attem
 
 def render_group(names, matrix_dir, fasta, args, output_dirs):
     matrix, contigs, widths = load_matrix(matrix_dir)
-    exons = read_exons(args.gff, contigs)
+    intervals = read_exon_sets(args.gff, contigs)
     requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
-    intervals = {"exons": exons}
-    if "control" in requested:
-        intervals["control"] = sample_controls(contigs, exons, args.seed)
+    repeat_free = requested & set(REPEAT_FREE_CONTROL_NAMES)
+    repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_free else None
+    for group in requested & {"control", "control-no-repeat"}:
+        intervals[group] = sample_controls(
+            contigs, intervals["exons"], args.seed,
+            repeat_masks=repeat_masks if group in repeat_free else None)
+        if group in repeat_free:
+            print(f"Sampled {len(intervals[group]):,}/{len(intervals['exons']):,} {group}; "
+                  "unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
     aggt_replicates = {}
-    if requested & AGGT_CONTROL_NAMES:
+    aggt_requested = {group for group in requested
+                      if group.removesuffix("-no-repeat") in AGGT_CONTROL_NAMES}
+    if aggt_requested:
         sequences = read_sequences(fasta, contigs)
-        prepared = prepare_aggt_controls(contigs, exons, sequences)
-        for group in requested & AGGT_CONTROL_NAMES:
-            seed_offset = CONTROL_REPLICATES if group.endswith("-p1") else 0
+        prepared = prepare_aggt_controls(contigs, intervals["exons"], sequences)
+        repeat_free_prepared = None
+        if repeat_free:
+            repeat_free_prepared = (
+                {name: mask | repeat_masks[name] for name, mask in prepared[0].items()},
+                *prepared[1:])
+        for group in aggt_requested:
+            base_group = group.removesuffix("-no-repeat")
+            seed_offset = CONTROL_REPLICATES if base_group.endswith("-p1") else 0
             aggt_replicates[group] = [
-                sample_aggt_controls(contigs, exons, sequences, args.seed + seed_offset + replicate,
-                                     length_offset=1 if group.endswith("-p1") else 0,
-                                     prepared=prepared)
+                sample_aggt_controls(contigs, intervals["exons"], sequences,
+                                     args.seed + seed_offset + replicate,
+                                     length_offset=1 if base_group.endswith("-p1") else 0,
+                                     prepared=repeat_free_prepared if group in repeat_free else prepared)
                 for replicate in range(CONTROL_REPLICATES)
             ]
+            if group in repeat_free:
+                for replicate, selected in enumerate(aggt_replicates[group], 1):
+                    print(f"Sampled {len(selected):,}/{len(intervals['exons']):,} {group} "
+                          f"replicate-{replicate}; unmatched lengths skipped after 200 attempts",
+                          file=sys.stderr, flush=True)
 
     for name in names:
         output = output_dirs[name]
         group = name.removeprefix("abs-").removesuffix("-mutated")
-        if group in AGGT_CONTROL_NAMES:
+        if group in aggt_replicates:
             for replicate, selected in enumerate(aggt_replicates[group], 1):
                 replicate_output = output / f"replicate-{replicate}"
                 replicate_output.mkdir()
@@ -504,7 +612,7 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             render_intervals(intervals[group], matrix, contigs, widths, output,
                              args.bins, args.flank, args.rows, name)
             if group == "exons":
-                plot_exon_length_distribution(exons, output)
+                plot_exon_length_distribution(intervals["exons"], output)
 
 
 def draw_plot(args):
@@ -629,7 +737,12 @@ def add_pipeline_arguments(command, output_name):
 def main():
     parser = argparse.ArgumentParser(description="Generate CWT with anno_cwt, then plot and normalize genomic intervals")
     commands = parser.add_subparsers(dest="command", required=True)
-    draw = commands.add_parser("draw", help="run exon/control plots; --no-* skips a plot")
+    draw = commands.add_parser(
+        "draw", help="run exon/control plots; --no-* skips a plot",
+        description="Repeat-free control variants are opt-in and exclude bodies overlapping GFF "
+                    "repeat_region or mobile_element features. Plotted flanks are not excluded. "
+                    f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
+                    f"+/-{ABS_RADIUS} bp boundary windows.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
     draw.add_argument("--bins", type=positive, default=200)
@@ -637,7 +750,16 @@ def main():
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
     for name in PLOT_NAMES:
-        draw.add_argument(f"--no-{name}", action="store_true")
+        if name.removeprefix("abs-") in REPEAT_FREE_CONTROL_NAMES:
+            destination = f"no_{name.replace('-', '_')}"
+            options = draw.add_mutually_exclusive_group()
+            options.add_argument(f"--{name}", dest=destination, action="store_false",
+                                 help=f"enable {name} (annotated repeats excluded from body)")
+            options.add_argument(f"--no-{name}", dest=destination, action="store_true",
+                                 help=f"skip {name} (default)")
+            draw.set_defaults(**{destination: True})
+        else:
+            draw.add_argument(f"--no-{name}", action="store_true")
     draw.set_defaults(handler=draw_plot)
     for name, handler in (("region", region_plot), ("regions", regions_plot)):
         command = commands.add_parser(name)
