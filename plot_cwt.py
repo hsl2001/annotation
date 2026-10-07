@@ -433,13 +433,13 @@ def read_repeat_masks(path, contigs):
             continue
         name, start, end = row[0], int(row[3]), int(row[4])
         if name not in contigs:
-            raise ValueError(f"Repeat contig absent from CWT matrix: {name}")
+            continue
         if start < 1 or end < start or end > contigs[name]["length"]:
             raise ValueError(f"Invalid repeat interval: {name}:{start}-{end}")
         masks[name][start - 1:end] = True
         found = True
     if not found:
-        raise ValueError("Repeat-free controls require repeat_region or mobile_element annotations in GFF")
+        return None
     return masks
 
 
@@ -558,6 +558,18 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
     requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
     repeat_free = requested & set(REPEAT_FREE_CONTROL_NAMES)
     repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_free else None
+    if repeat_free and repeat_masks is None:
+        skipped = [name for name in names
+                   if name.removeprefix("abs-").removesuffix("-mutated") in REPEAT_FREE_CONTROL_NAMES]
+        print("Skipping repeat-free plots: no repeat annotations on selected contigs",
+              file=sys.stderr, flush=True)
+        for name in skipped:
+            output_dirs[name].rmdir()
+        names = [name for name in names if name not in skipped]
+        if not names:
+            return
+        requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
+        repeat_free = requested & set(REPEAT_FREE_CONTROL_NAMES)
     for group in requested & {"control", "control-no-repeat"}:
         intervals[group] = sample_controls(
             contigs, intervals["exons"], args.seed,
@@ -573,6 +585,7 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
         prepared = prepare_aggt_controls(contigs, intervals["exons"], sequences)
         repeat_free_prepared = None
         if repeat_free:
+            assert repeat_masks is not None
             repeat_free_prepared = (
                 {name: mask | repeat_masks[name] for name, mask in prepared[0].items()},
                 *prepared[1:])
@@ -739,8 +752,8 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     draw = commands.add_parser(
         "draw", help="run exon/control plots; --no-* skips a plot",
-        description="Repeat-free control variants are opt-in and exclude bodies overlapping GFF "
-                    "repeat_region or mobile_element features. Plotted flanks are not excluded. "
+        description="The default draw includes repeat-free controls, which exclude bodies overlapping "
+                "GFF repeat_region or mobile_element features. Plotted flanks are not excluded. "
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
                     f"+/-{ABS_RADIUS} bp boundary windows.")
     add_pipeline_arguments(draw, "plots-draw")
@@ -750,16 +763,7 @@ def main():
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
     for name in PLOT_NAMES:
-        if name.removeprefix("abs-") in REPEAT_FREE_CONTROL_NAMES:
-            destination = f"no_{name.replace('-', '_')}"
-            options = draw.add_mutually_exclusive_group()
-            options.add_argument(f"--{name}", dest=destination, action="store_false",
-                                 help=f"enable {name} (annotated repeats excluded from body)")
-            options.add_argument(f"--no-{name}", dest=destination, action="store_true",
-                                 help=f"skip {name} (default)")
-            draw.set_defaults(**{destination: True})
-        else:
-            draw.add_argument(f"--no-{name}", action="store_true")
+        draw.add_argument(f"--no-{name}", action="store_true")
     draw.set_defaults(handler=draw_plot)
     for name, handler in (("region", region_plot), ("regions", regions_plot)):
         command = commands.add_parser(name)
