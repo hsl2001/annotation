@@ -43,7 +43,6 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
 uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length);
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
-size_t crf_weights(void);
 void crf_train(Contig *contigs, int count, float *weights, int epochs);
 void crf_decode(const float *weights, const Contig *contig, uint8_t *path);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);

@@ -23,17 +23,18 @@ static const float power_edges[7] = {0.25f, 0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 2.0f
 static const double prominence_edges[5] = {0.25, 0.5, 1.0, 2.0, 4.0};
 static const int distance_edges[4] = {4, 12, 24, 40};
 
-enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097, KCWT = 32 * WAVE_COUNT };
-enum { PEAK_RADIUS = 32, PEAK_DISTANCE = 64, PEAK_HALO = PEAK_RADIUS + PEAK_DISTANCE + 1,
-       KPROM = 8, KDIST = 7, DIST_NONE = 5, DIST_MISSING = 6 };
+enum { CWT_BITS = 5, CWT_CODES = 1 << CWT_BITS, CWT_PEAK_BIT = 3, PROM_BITS = 3, DIST_BITS = 4 };
+enum { K4 = 257, KPK = (WAVE_COUNT + 1) * (WAVE_COUNT + 1), KNUC = 5, KHEX = 4097,
+       KCWT = CWT_CODES * WAVE_COUNT };
+enum { CWT_BLOCK = 1024, PEAK_RADIUS = 32, PEAK_DISTANCE = 64, PEAK_HALO = PEAK_RADIUS + PEAK_DISTANCE + 1,
+       KPROM = 1 << PROM_BITS, KDIST = 7, DIST_NONE = 5, DIST_MISSING = 6 };
 enum { OFF_T4 = 0, OFF_TPK = OFF_T4 + STATES * STATES * K4, OFF_NUC = OFF_TPK + STATES * STATES * KPK,
-       OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX, BASE_WEIGHTS = OFF_CWT + STATES * KCWT,
-       FLANKS = 27, OFF_SPLICE = BASE_WEIGHTS, RESERVED_WEIGHTS = STATES * 64,
-       OFF_BIAS = OFF_SPLICE + 4 * FLANKS * 17 + RESERVED_WEIGHTS, LEGACY_WEIGHTS = OFF_BIAS + STATES + STATES * STATES,
-       OFF_PROM = LEGACY_WEIGHTS, OFF_DIST = OFF_PROM + STATES * WAVE_COUNT * KPROM,
+  OFF_HEX = OFF_NUC + STATES * KNUC, OFF_CWT = OFF_HEX + STATES * KHEX,
+  FLANKS = 27, OFF_SPLICE = OFF_CWT + STATES * KCWT,
+  OFF_BIAS = OFF_SPLICE + 4 * FLANKS * 17, OFF_PROM = OFF_BIAS + STATES + STATES * STATES,
+  OFF_DIST = OFF_PROM + STATES * WAVE_COUNT * KPROM,
        WEIGHTS = OFF_DIST + 2 * 2 * WAVE_COUNT * KDIST,
-       EMISSION_FEATURES = 2 * WAVE_COUNT + 3, TRANSITION_FEATURES = FLANKS + 3 + 2 * WAVE_COUNT,
-       LEGACY_FEATURES = 191, MODEL_FEATURES = LEGACY_FEATURES | 256 | 512 };
+  EMISSION_FEATURES = 2 * WAVE_COUNT + 3, TRANSITION_FEATURES = FLANKS + 3 + 2 * WAVE_COUNT };
 
 typedef struct {
   uint16_t k4, hexf, hexr;
@@ -58,6 +59,13 @@ void *anno_alloc(size_t count, size_t size) {
   void *memory = calloc(count ? count : 1, size);
   if (!memory) anno_fail("Out of memory");
   return memory;
+}
+
+static void *anno_resize(void *memory, size_t count, size_t size) {
+  if (size && count > SIZE_MAX / size) anno_fail("Allocation size overflow");
+  void *resized = realloc(memory, count * size);
+  if (!resized) anno_fail("Out of memory");
+  return resized;
 }
 
 int base_index(char base) {
@@ -186,12 +194,16 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int
   free(kernel_fft);
 }
 
+static double cwt_power(const double *coefficient) {
+  return coefficient[0] * coefficient[0] + coefficient[1] * coefficient[1];
+}
+
 /* Per position and scale: bit 4 = local power minimum, bit 3 = local power maximum, bits 0-2 = power bin. */
 uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length) {
   uint32_t *codes = anno_alloc(length, sizeof(*codes));
-  double *features = anno_alloc((size_t)1026 * CWT_CHANNELS, sizeof(*features));
-  for (int start = 0; start < length; start += 1024) {
-    int count = length - start < 1024 ? length - start : 1024;
+  double *features = anno_alloc((size_t)(CWT_BLOCK + 2) * CWT_CHANNELS, sizeof(*features));
+  for (int start = 0; start < length; start += CWT_BLOCK) {
+    int count = length - start < CWT_BLOCK ? length - start : CWT_BLOCK;
     cwt_extract(wavelets, sequence, length, start - 1, count + 2, features);
     for (int offset = 0; offset < count; offset++) {
       if (base_index(sequence[start + offset]) < 0) continue;
@@ -200,13 +212,13 @@ uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int lengt
         double power[3];
         for (int tap = 0; tap < 3; tap++) {
           const double *value = features + (size_t)(offset + tap) * CWT_CHANNELS + 2 * scale;
-          power[tap] = value[0] * value[0] + value[1] * value[1];
+          power[tap] = cwt_power(value);
         }
         int bin = 0;
         for (int edge = 0; edge < 7; edge++) bin += power[1] > power_edges[edge];
         int peak = power[1] > 0 && power[1] >= power[0] && power[1] >= power[2];
         int valley = power[1] <= power[0] && power[1] <= power[2];
-        code |= (uint32_t)((valley << 4 | peak << 3 | bin) << (5 * scale));
+        code |= (uint32_t)((valley << (CWT_PEAK_BIT + 1) | peak << CWT_PEAK_BIT | bin) << (CWT_BITS * scale));
       }
       codes[start + offset] = code;
     }
@@ -251,13 +263,13 @@ static int peak_distance_bin(int distance, int missing_distance) {
 static uint32_t *cwt_peak_features(const Wavelets *wavelets, const char *sequence, int length, uint8_t **distances) {
   uint32_t *codes = anno_alloc(length, sizeof(*codes));
   *distances = anno_alloc(length, WAVE_COUNT);
-  int capacity = 1024 + 2 * PEAK_HALO;
+  int capacity = CWT_BLOCK + 2 * PEAK_HALO;
   double *features = anno_alloc((size_t)capacity * CWT_CHANNELS, sizeof(*features));
   double *power = anno_alloc(capacity, sizeof(*power)), *sums = anno_alloc(capacity + 1, sizeof(*sums));
   int *invalid = anno_alloc(capacity + 1, sizeof(*invalid));
   uint8_t *peaks = anno_alloc(capacity, sizeof(*peaks));
-  for (int start = 0; start < length; start += 1024) {
-    int count = length - start < 1024 ? length - start : 1024;
+  for (int start = 0; start < length; start += CWT_BLOCK) {
+    int count = length - start < CWT_BLOCK ? length - start : CWT_BLOCK;
     int rows = count + 2 * PEAK_HALO;
     cwt_extract(wavelets, sequence, length, start - PEAK_HALO, rows, features);
     invalid[0] = 0;
@@ -270,13 +282,13 @@ static uint32_t *cwt_peak_features(const Wavelets *wavelets, const char *sequenc
       sums[0] = 0;
       for (int offset = 0; offset < rows; offset++) {
         const double *value = features + (size_t)offset * CWT_CHANNELS + 2 * scale;
-        power[offset] = value[0] * value[0] + value[1] * value[1];
+        power[offset] = cwt_power(value);
         sums[offset + 1] = sums[offset] + power[offset];
       }
       for (int offset = PEAK_RADIUS; offset < rows - PEAK_RADIUS; offset++)
         peaks[offset] = peak_prominence(power, sums, invalid, offset);
       for (int offset = 0; offset < count; offset++)
-        codes[start + offset] |= (uint32_t)peaks[offset + PEAK_HALO] << (3 * scale);
+        codes[start + offset] |= (uint32_t)peaks[offset + PEAK_HALO] << (PROM_BITS * scale);
       int nearest = -capacity, missing = -capacity;
       for (int offset = PEAK_RADIUS; offset < rows - PEAK_RADIUS; offset++) {
         if (peaks[offset] == KPROM - 1) nearest = -capacity, missing = offset;
@@ -293,7 +305,7 @@ static uint32_t *cwt_peak_features(const Wavelets *wavelets, const char *sequenc
         int local = offset - PEAK_HALO;
         if (local >= 0 && local < count)
           (*distances)[(size_t)(start + local) * WAVE_COUNT + scale] |=
-            peak_distance_bin(nearest - offset, missing - offset) << 4;
+            peak_distance_bin(nearest - offset, missing - offset) << DIST_BITS;
       }
     }
   }
@@ -318,7 +330,7 @@ static int kmer(const char *seq, int length, int from, int k, int reverse) {
 
 static int peak_count(uint32_t code) {
   int count = 0;
-  for (int scale = 0; scale < WAVE_COUNT; scale++) count += code >> (5 * scale + 3) & 1;
+  for (int scale = 0; scale < WAVE_COUNT; scale++) count += code >> (CWT_BITS * scale + CWT_PEAK_BIT) & 1;
   return count;
 }
 
@@ -395,9 +407,10 @@ static void emission_indices(const Site *site, int state, int *indices) {
   indices[0] = OFF_NUC + state * KNUC + site->nuc;
   indices[1] = OFF_HEX + state * KHEX + (state >= 7 ? site->hexr : site->hexf);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    indices[scale + 2] = OFF_CWT + state * KCWT + scale * 32 + (site->cwt >> (5 * scale) & 31);
+    indices[scale + 2] = OFF_CWT + state * KCWT + scale * CWT_CODES +
+      (site->cwt >> (CWT_BITS * scale) & (CWT_CODES - 1));
     indices[scale + WAVE_COUNT + 2] = OFF_PROM + (state * WAVE_COUNT + scale) * KPROM +
-      (site->prominence >> (3 * scale) & 7);
+      (site->prominence >> (PROM_BITS * scale) & (KPROM - 1));
   }
   indices[EMISSION_FEATURES - 1] = OFF_BIAS + state;
 }
@@ -414,7 +427,7 @@ static int transition_indices(const Site *site, int previous, int current, int *
     for (int side = 0; side < 2; side++)
       for (int scale = 0; scale < WAVE_COUNT; scale++)
         indices[count++] = OFF_DIST + ((kind * 2 + side) * WAVE_COUNT + scale) * KDIST +
-          (site->peak_distance[scale] >> (4 * (side ^ reverse)) & 15);
+          (site->peak_distance[scale] >> (DIST_BITS * (side ^ reverse)) & ((1 << DIST_BITS) - 1));
   }
   indices[count++] = OFF_BIAS + STATES + pair;
   return count;
@@ -454,8 +467,6 @@ static void add_transition(float *gradient, const Site *site, int previous, int 
   add_features(gradient, indices, count, value);
 }
 
-size_t crf_weights(void) { return WEIGHTS; }
-
 Contig *read_fasta(const char *path, int *count) {
   gzFile input = gzopen(!strcmp(path, "-") ? "/dev/stdin" : path, "rb");
   if (!input) anno_fail("Cannot open FASTA: %s", path);
@@ -464,9 +475,8 @@ Contig *read_fasta(const char *path, int *count) {
   *count = 0;
   while (kseq_read(record) >= 0) {
     if (!record->seq.l) continue;
-    if (record->seq.l > INT_MAX - 1024) anno_fail("Contig too long: %s", record->name.s);
-    contigs = realloc(contigs, (*count + 1) * sizeof(*contigs));
-    if (!contigs) anno_fail("Out of memory");
+    if (record->seq.l > INT_MAX - CWT_BLOCK) anno_fail("Contig too long: %s", record->name.s);
+    contigs = anno_resize(contigs, (size_t)*count + 1, sizeof(*contigs));
     Contig *c = contigs + (*count)++;
     memset(c, 0, sizeof(*c));
     c->name = strdup(record->name.s);
@@ -527,8 +537,8 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     while (contig < count && strcmp(contigs[contig].name, field[0])) contig++;
     int start = atoi(field[3]), end = atoi(field[4]);
     if (contig == count || start < 1 || end < start || end > contigs[contig].length) continue;
-    cds = realloc(cds, (n + 1) * sizeof(*cds));
-    if (!cds || !(cds[n].parent = strdup(parent))) anno_fail("Out of memory");
+    cds = anno_resize(cds, (size_t)n + 1, sizeof(*cds));
+    if (!(cds[n].parent = strdup(parent))) anno_fail("Out of memory");
     cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
     n++;
   }
@@ -575,7 +585,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
   return used;
 }
 
-typedef struct { Site *sites; float *emis, *grad; double *psi, *alpha, *beta, *scale; } Work;
+typedef struct { Site *sites; float *emis; double *psi, *alpha, *beta, *scale; } Work;
 
 /* Scaled forward-backward on window [s, e); leaves alpha, beta, psi, scale in k. Returns log Z. */
 static double window_posteriors(const float *w, const Contig *c, int s, int e, Work *k) {
@@ -622,7 +632,7 @@ static double window_posteriors(const float *w, const Contig *c, int s, int e, W
 
 /* Accumulates observed minus expected features for one window.
    Returns the window log-likelihood or NAN when the gold path violates the grammar. */
-static double window_gradient(const float *w, const Contig *c, int s, int e, Work *k) {
+static double window_gradient(const float *w, const Contig *c, int s, int e, Work *k, float *gradient) {
   int len = e - s;
   for (int i = 1; i < len; i++) {
     int a = c->label[s + i - 1], b = c->label[s + i];
@@ -634,14 +644,14 @@ static double window_gradient(const float *w, const Contig *c, int s, int e, Wor
     const double *al = k->alpha + (size_t)i * STATES, *be = k->beta + (size_t)i * STATES, *psi = k->psi + (size_t)i * ntrans;
     int b = c->label[s + i];
     gold += k->emis[i * STATES + b];
-    add_emission(k->grad, site, b, 1);
-    for (int st = 0; st < STATES; st++) add_emission(k->grad, site, st, -(float)(al[st] * be[st]));
+    add_emission(gradient, site, b, 1);
+    for (int st = 0; st < STATES; st++) add_emission(gradient, site, st, -(float)(al[st] * be[st]));
     if (!i) continue;
     gold += transition(w, site, c->label[s + i - 1], b);
-    add_transition(k->grad, site, c->label[s + i - 1], b, 1);
+    add_transition(gradient, site, c->label[s + i - 1], b, 1);
     for (int t = 0; t < ntrans; t++) {
       double mu = al[trans_a[t] - STATES] * psi[t] * be[trans_b[t]] / k->scale[i];
-      if (mu > 0) add_transition(k->grad, site, trans_a[t], trans_b[t], -(float)mu);
+      if (mu > 0) add_transition(gradient, site, trans_a[t], trans_b[t], -(float)mu);
     }
   }
   return gold;
@@ -650,15 +660,18 @@ static double window_gradient(const float *w, const Contig *c, int s, int e, Wor
 static int window_count(const Contig *c) { return (c->length + WINDOW - 1) / WINDOW; }
 
 static Work work_alloc(void) {
-  Work k = {anno_alloc(WINDOW, sizeof(Site)), anno_alloc((size_t)WINDOW * STATES, sizeof(float)),
-            anno_alloc(WEIGHTS, sizeof(float)), anno_alloc((size_t)WINDOW * ntrans, sizeof(double)),
-            anno_alloc((size_t)WINDOW * STATES, sizeof(double)), anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
-            anno_alloc(WINDOW, sizeof(double))};
-  return k;
+  return (Work){
+    .sites = anno_alloc(WINDOW, sizeof(Site)),
+    .emis = anno_alloc((size_t)WINDOW * STATES, sizeof(float)),
+    .psi = anno_alloc((size_t)WINDOW * ntrans, sizeof(double)),
+    .alpha = anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
+    .beta = anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
+    .scale = anno_alloc(WINDOW, sizeof(double))
+  };
 }
 
 static void work_free(Work *k) {
-  free(k->sites), free(k->emis), free(k->grad), free(k->psi), free(k->alpha), free(k->beta), free(k->scale);
+  free(k->sites), free(k->emis), free(k->psi), free(k->alpha), free(k->beta), free(k->scale);
 }
 
 void crf_train(Contig *contigs, int count, float *w, int epochs) {
@@ -667,6 +680,7 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
   int *order = anno_alloc(windows, sizeof(*order));
   for (int i = 0; i < windows; i++) order[i] = i;
   Work k = work_alloc();
+  float *gradient = anno_alloc(WEIGHTS, sizeof(*gradient));
   float *history = anno_alloc(WEIGHTS, sizeof(*history));
   double *average = anno_alloc(WEIGHTS, sizeof(*average));
   long averaged = 0;
@@ -683,12 +697,12 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
       int c = 0, index = order[n];
       while (index >= window_count(contigs + c)) index -= window_count(contigs + c++);
       int s = index * WINDOW, e = s + WINDOW < contigs[c].length ? s + WINDOW : contigs[c].length;
-      double value = window_gradient(w, contigs + c, s, e, &k);
+      double value = window_gradient(w, contigs + c, s, e, &k, gradient);
       if (isnan(value)) { skipped++; continue; }
       likelihood += value, positions += e - s;
       for (int f = 0; f < WEIGHTS; f++) {
-        float g = k.grad[f] / (e - s);
-        k.grad[f] = 0;
+        float g = gradient[f] / (e - s);
+        gradient[f] = 0;
         if (g == 0) continue;
         history[f] += g * g;
         w[f] += LEARNING_RATE * g / sqrtf(history[f] + 1e-8f);
@@ -703,7 +717,7 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
             epoch, windows - skipped, skipped, positions ? likelihood / positions : 0.0);
   }
   for (int f = 0; averaged && f < WEIGHTS; f++) w[f] = (float)(average[f] / averaged);
-  free(order), free(history), free(average), work_free(&k);
+  free(order), free(gradient), free(history), free(average), work_free(&k);
 }
 
 /* Streaming decode: Viterbi over transition + emission scores plus POSTERIOR_WEIGHT times the log
@@ -774,8 +788,7 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
-  uint32_t features = MODEL_FEATURES;
-  if (!file || fwrite("ANNOCRF5", 1, 8, file) != 8 || fwrite(&features, sizeof(features), 1, file) != 1 ||
+  if (!file || fwrite("ANNOCRF6", 1, 8, file) != 8 ||
       fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
@@ -784,21 +797,10 @@ static void load_model(const char *path, float *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (!memcmp(magic, "ANNOCRF1", 8))
-    anno_fail("Model %s uses the previous CWT implementation; retrain it with this executable", path);
-  memset(w, 0, WEIGHTS * sizeof(*w));
-  size_t count = BASE_WEIGHTS;
-  int current = !memcmp(magic, "ANNOCRF5", 8);
-  if (current || !memcmp(magic, "ANNOCRF4", 8)) {
-    uint32_t features;
-    if (fread(&features, sizeof(features), 1, file) != 1 || features != (uint32_t)(current ? MODEL_FEATURES : LEGACY_FEATURES))
-      anno_fail("Model uses experimental features; retrain with this executable: %s", path);
-    count = current ? WEIGHTS : LEGACY_WEIGHTS;
-  } else if (memcmp(magic, "ANNOCRF2", 8)) anno_fail("Cannot read model: %s", path);
-  if (fread(w, sizeof(*w), count, file) != count || fgetc(file) != EOF)
+  if (memcmp(magic, "ANNOCRF6", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
+  if (fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
-  if (!current) fprintf(stderr, "Legacy model: peak prominence/distance weights are zero; retrain or warm-start with -i\n");
 }
 
 static FILE *create_in(const char *directory, const char *name) {
@@ -834,8 +836,8 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   fputs("# anno-cwt-v2\n# scales\t", index);
   for (int scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
-  double *features = anno_alloc(1024 * CWT_CHANNELS, sizeof(*features));
-  float *values = anno_alloc(1024 * CWT_CHANNELS, sizeof(*values));
+  double *features = anno_alloc(CWT_BLOCK * CWT_CHANNELS, sizeof(*features));
+  float *values = anno_alloc(CWT_BLOCK * CWT_CHANNELS, sizeof(*values));
   size_t rows = 0;
   for (int c = 0; c < count; c++) {
     Contig *g = contigs + c;
@@ -847,8 +849,8 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : g->seq;
-      for (int start = 0; start < g->length; start += 1024) {
-        int n = g->length - start < 1024 ? g->length - start : 1024;
+      for (int start = 0; start < g->length; start += CWT_BLOCK) {
+        int n = g->length - start < CWT_BLOCK ? g->length - start : CWT_BLOCK;
         cwt_extract(wavelets, bases, g->length, start, n, features);
         for (size_t v = 0; v < (size_t)n * CWT_CHANNELS; v++) values[v] = (float)features[v];
         write_floats(matrix, values, (size_t)n * CWT_CHANNELS);

@@ -11,21 +11,15 @@ from itertools import chain
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
+plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 
-REPEAT_FREE_CONTROL_NAMES = ("control-no-repeat", "control-aggt-no-repeat",
-                             "control-aggt-p1-no-repeat")
-PLOT_NAMES = ("exons", "exons-mutated", "control", "control-aggt", "control-aggt-p1",
-              "abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt",
-              "abs-control-aggt-p1", "first-exons", "last-exons",
-              "abs-first-exons", "abs-last-exons", *REPEAT_FREE_CONTROL_NAMES,
-              *(f"abs-{name}" for name in REPEAT_FREE_CONTROL_NAMES))
-AGGT_CONTROL_NAMES = frozenset(("control-aggt", "control-aggt-p1"))
+PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt",
+              "abs-control-aggt-p1", "abs-first-exons", "abs-last-exons",
+              "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat")
 REPEAT_FEATURE_TYPES = frozenset(("repeat_region", "mobile_element"))
-CONTROL_REPLICATES = 5
+CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
-
 
 def open_text(path):
     return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "rt")
@@ -59,12 +53,9 @@ def gff_records(path):
             yield row
 
 
-def gff_exons(path):
-    return (row for row in gff_records(path) if row[2] == "exon")
-
-
 def gff_attributes(text):
-    return dict(field.split("=", 1) for field in text.split(";") if "=" in field)
+    return {key.strip(): value for key, value in
+            (field.split("=", 1) for field in text.split(";") if "=" in field)}
 
 
 def load_matrix(directory):
@@ -133,22 +124,6 @@ def resample_mean(values, bins):
     lower = np.floor(edges).astype(np.int64)
     cumulative = integral[lower] + (edges - lower)[:, None] * values[np.minimum(lower, len(values) - 1)]
     return np.diff(cumulative, axis=0) / (len(values) / bins)
-
-
-def exon_power(matrix, contig, start, end, strand, bins, flank):
-    first, last = oriented_bounds(contig, start, end, strand)
-    offset = contig[strand]
-    body = power(matrix[offset + first:offset + last])
-    result = np.full((bins + 2 * flank, matrix.shape[1]), np.nan, dtype=np.float32)
-    result[flank:flank + bins] = resample_mean(body, bins)
-    before, after = min(flank, first), min(flank, contig["length"] - last)
-    if before:
-        result[flank - before:flank] = power(matrix[offset + first - before:offset + first])
-    if after:
-        result[flank + bins:flank + bins + after] = power(matrix[offset + last:offset + last + after])
-    if not np.isfinite(body).all():
-        raise ValueError("Nonfinite CWT coefficients in exon")
-    return result.T
 
 
 def read_exon_sets(path, contigs):
@@ -239,53 +214,6 @@ def aggregate_intervals(intervals, rows, sample_power, stem, action):
     return display, mean
 
 
-def heatmap_limit(values):
-    return max(float(np.quantile(values[np.isfinite(values)], 0.995)), 1e-6)
-
-
-def render_power_panels(display, mean, contigs, widths, path, *, positions, extent, ticks,
-                        xlabel, height, maximum=None, color_label):
-    image_values = np.log1p(display)
-    if maximum is None:
-        maximum = heatmap_limit(image_values)
-    parameter = next(iter(contigs.values())).get("parameter", "Kernel width")
-    figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), height),
-                                gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
-    for scale, width in enumerate(widths):
-        axis, profile = axes[:, scale]
-        image = axis.imshow(image_values[:, scale], aspect="auto", origin="lower", interpolation="nearest",
-                            extent=extent, cmap="viridis", vmin=0, vmax=maximum)
-        axis.set_title(f"{parameter} {width} bp")
-        axis.set_ylabel("Interval rank" if scale == 0 else "")
-        profile.plot(positions, mean[scale], color="#256c87", linewidth=1.3)
-        profile.set_ylabel("Mean power" if scale == 0 else "")
-        profile.set_ylim(-0.1, 1.6)
-        for panel in (axis, profile):
-            panel.set_xticks(*ticks, fontsize=8)
-            panel.set_xlim(extent[:2])
-        profile.set_xlabel(xlabel)
-    figure.colorbar(image, ax=list(axes[0]), label=color_label, shrink=0.65, pad=0.01)
-    figure.savefig(path, dpi=160)
-    plt.close(figure)
-
-
-def render_intervals(intervals, matrix, contigs, widths, out, bins, flank, rows, stem):
-    display, mean = aggregate_intervals(
-        intervals, rows,
-        lambda interval: exon_power(matrix, contigs[interval[0]], interval[1], interval[2],
-                                    interval[3], bins, flank),
-        stem, "Normalized")
-    columns = bins + 2 * flank
-    ticks, labels = [flank, flank + bins / 2, flank + bins], ["0%", "50%", "100%"]
-    if flank:
-        ticks, labels = [0, *ticks, columns], [f"-{flank} bp", *labels, f"+{flank} bp"]
-    render_power_panels(
-        display, mean, contigs, widths, out / f"{stem}.png",
-        positions=np.arange(columns) + 0.5, extent=(0, columns, 0, len(intervals)),
-        ticks=(ticks, labels), xlabel="5' to 3': normalized body + genomic flanks", height=9,
-        color_label="log(1 + mean power), common scale; top 0.5% clipped")
-
-
 def boundary_power(matrix, contig, interval, boundary, radius=ABS_RADIUS):
     name, start, end, strand = interval
     first, last = oriented_bounds(contig, start, end, strand)
@@ -306,47 +234,43 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
         lambda interval: np.stack([boundary_power(matrix, contigs[interval[0]], interval, boundary).T
                                    for boundary in ("start", "end")]),
         stem, "Aligned")
-    maximum = heatmap_limit(np.log1p(display))
+    image_values = np.log1p(display)
+    maximum = max(float(np.quantile(image_values[np.isfinite(image_values)], 0.995)), 1e-6)
+    parameter = next(iter(contigs.values())).get("parameter", "Kernel width")
+    positions = np.arange(-ABS_RADIUS, ABS_RADIUS + 1)
+    extent = (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, len(intervals))
     for boundary_index, boundary in enumerate(("start", "end")):
-        render_power_panels(
-            display[:, boundary_index], profiles[boundary_index], contigs, widths, out / f"{boundary}.png",
-            positions=np.arange(-ABS_RADIUS, ABS_RADIUS + 1),
-            extent=(-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, len(intervals)),
-            ticks=((-ABS_RADIUS, 0, ABS_RADIUS),
-                   (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}")),
-            xlabel=f"Position from {boundary} boundary (bp)", height=6, maximum=maximum,
-            color_label="log(1 + power), common scale; top 0.5% clipped")
-
-
-def read_genome(path):
-    """Load the assembly as ordered, mutable sequences keyed by contig name."""
-    order, sequences = [], {}
-    for name, sequence in fasta_records(path):
-        if name in sequences:
-            raise ValueError(f"Duplicate FASTA contig: {name}")
-        order.append(name)
-        sequences[name] = bytearray(sequence, "ascii")
-    if not order:
-        raise ValueError("No sequences found in assembly FASTA")
-    return order, sequences
-
-
-def exon_parents(attributes_text):
-    for field in attributes_text.split(";"):
-        key, separator, value = field.partition("=")
-        if separator and key.strip() == "Parent":
-            return [parent for parent in value.split(",") if parent]
-    return []
+        figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6),
+                                    gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
+        for scale, width in enumerate(widths):
+            axis, profile = axes[:, scale]
+            image = axis.imshow(image_values[:, boundary_index, scale], aspect="auto", origin="lower",
+                                interpolation="nearest", extent=extent, cmap="viridis", vmin=0, vmax=maximum)
+            axis.set_title(f"{parameter} {width} bp")
+            axis.set_ylabel("Interval rank" if scale == 0 else "")
+            profile.plot(positions, profiles[boundary_index, scale], color="#256c87", linewidth=1.3)
+            profile.set_ylabel("Mean power" if scale == 0 else "")
+            profile.set_ylim(-0.1, 1.6)
+            for panel in (axis, profile):
+                panel.set_xticks((-ABS_RADIUS, 0, ABS_RADIUS),
+                                (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"), fontsize=8)
+                panel.set_xlim(extent[:2])
+            profile.set_xlabel(f"Position from {boundary} boundary (bp)")
+        figure.colorbar(image, ax=list(axes[0]), label="log(1 + power), common scale; top 0.5% clipped",
+                        shrink=0.65, pad=0.01)
+        figure.savefig(out / f"{boundary}.png", dpi=160)
+        plt.close(figure)
 
 
 def splice_positions(path, contigs):
-    """Return intron-boundary and transcript-terminal exon positions for mutation."""
     transcripts = defaultdict(list)
-    for row in gff_exons(path):
+    for row in gff_records(path):
+        if row[2] != "exon":
+            continue
         name, start, end = row[0], int(row[3]), int(row[4])
         if name not in contigs:
             raise ValueError(f"Exon contig absent from assembly FASTA: {name}")
-        for parent in exon_parents(row[8]):
+        for parent in filter(None, gff_attributes(row[8]).get("Parent", "").split(",")):
             transcripts[name, parent].append((start, end))
     positions = defaultdict(set)
     introns = 0
@@ -369,7 +293,15 @@ def splice_positions(path, contigs):
     return positions
 
 
-def mutate_splice_sites(sequences, positions, seed):
+def make_mutated_fasta(fasta, gff, seed, output):
+    sequences = {}
+    for name, sequence in fasta_records(fasta):
+        if name in sequences:
+            raise ValueError(f"Duplicate FASTA contig: {name}")
+        sequences[name] = bytearray(sequence, "ascii")
+    if not sequences:
+        raise ValueError("No sequences found in assembly FASTA")
+    positions = splice_positions(gff, {name: len(sequence) for name, sequence in sequences.items()})
     rng = np.random.default_rng(seed)
     alphabet = "ACGT"
     for name, sites in positions.items():
@@ -378,44 +310,12 @@ def mutate_splice_sites(sequences, positions, seed):
             current = chr(sequence[index]).upper()
             options = alphabet.replace(current, "") if current in alphabet else alphabet
             sequence[index] = ord(options[int(rng.integers(len(options)))])
-
-
-def write_genome(path, order, sequences, width=60):
-    with open(path, "w") as stream:
-        for name in order:
+    with open(output, "w") as stream:
+        for name, sequence in sequences.items():
             stream.write(f">{name}\n")
-            sequence = sequences[name]
-            for offset in range(0, len(sequence), width):
-                stream.write(sequence[offset:offset + width].decode("ascii"))
-                stream.write("\n")
-
-
-def make_mutated_fasta(fasta, gff, seed, output):
-    order, sequences = read_genome(fasta)
-    contigs = {name: len(sequence) for name, sequence in sequences.items()}
-    positions = splice_positions(gff, contigs)
-    mutate_splice_sites(sequences, positions, seed)
-    write_genome(output, order, sequences)
+            for offset in range(0, len(sequence), 60):
+                stream.write(sequence[offset:offset + 60].decode("ascii") + "\n")
     return output
-
-
-def plot_exon_length_distribution(exons, out):
-    lengths = np.array([end - start + 1 for _, start, end, _ in exons])
-    minimum, maximum = int(lengths.min()), int(lengths.max())
-    edges = np.array([minimum * 0.5, maximum * 1.5]) if minimum == maximum else np.geomspace(minimum, maximum, 46)
-    counts, edges = np.histogram(lengths, bins=edges)
-    figure, axis = plt.subplots(figsize=(9, 4.8), layout="constrained")
-    axis.stairs(counts, edges, fill=True, color="#287c8e", alpha=0.82, linewidth=1.0)
-    axis.set_xscale("log")
-    axis.set_xlim(minimum, maximum)
-    ticks = [tick for tick in (1, 3, 10, 30, 100, 300, 1000, 3000, 10000, 30000) if minimum <= tick <= maximum]
-    axis.set_xticks(ticks)
-    axis.xaxis.set_major_formatter(ScalarFormatter())
-    axis.set_xlabel("Exon length (bp)")
-    axis.set_ylabel("Unique exon count")
-    axis.grid(axis="y", color="#d8dedf", linewidth=0.7)
-    figure.savefig(out / "exon_length_distribution.png", dpi=180)
-    plt.close(figure)
 
 
 def build_exon_mask(contigs, exons):
@@ -488,10 +388,6 @@ def read_sequences(path, contigs):
 
 
 def aggt_candidates(sequences):
-    """Precompute, per strand, non-exon start positions carrying the transcript-oriented AG acceptor,
-    plus the donor dimer mask used to test the exon end. In transcript 5'->3' orientation an internal
-    exon reads ...AG | exon | GT... On the plus strand that is genomic AG before the body and GT after;
-    on the minus strand the reverse complement makes it genomic AC before and CT after the body."""
     codes = {base: ord(base) for base in "ACGT"}
     starts = {"+": [], "-": []}
     names = {"+": [], "-": []}
@@ -555,77 +451,46 @@ def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attem
 def render_group(names, matrix_dir, fasta, args, output_dirs):
     matrix, contigs, widths = load_matrix(matrix_dir)
     intervals = read_exon_sets(args.gff, contigs)
-    requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
-    repeat_free = requested & set(REPEAT_FREE_CONTROL_NAMES)
-    repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_free else None
-    if repeat_free and repeat_masks is None:
-        skipped = [name for name in names
-                   if name.removeprefix("abs-").removesuffix("-mutated") in REPEAT_FREE_CONTROL_NAMES]
+    repeat_names = [name for name in names if name.endswith("-no-repeat")]
+    repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_names else None
+    if repeat_names and repeat_masks is None:
         print("Skipping repeat-free plots: no repeat annotations on selected contigs",
               file=sys.stderr, flush=True)
-        for name in skipped:
+        for name in repeat_names:
             output_dirs[name].rmdir()
-        names = [name for name in names if name not in skipped]
-        if not names:
-            return
-        requested = {name.removeprefix("abs-").removesuffix("-mutated") for name in names}
-        repeat_free = requested & set(REPEAT_FREE_CONTROL_NAMES)
-    for group in requested & {"control", "control-no-repeat"}:
-        intervals[group] = sample_controls(
-            contigs, intervals["exons"], args.seed,
-            repeat_masks=repeat_masks if group in repeat_free else None)
-        if group in repeat_free:
-            print(f"Sampled {len(intervals[group]):,}/{len(intervals['exons']):,} {group}; "
-                  "unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
-    aggt_replicates = {}
-    aggt_requested = {group for group in requested
-                      if group.removesuffix("-no-repeat") in AGGT_CONTROL_NAMES}
-    if aggt_requested:
+        names = [name for name in names if name not in repeat_names]
+    prepared = {}
+    if any("control-aggt" in name for name in names):
         sequences = read_sequences(fasta, contigs)
-        prepared = prepare_aggt_controls(contigs, intervals["exons"], sequences)
-        repeat_free_prepared = None
-        if repeat_free:
-            assert repeat_masks is not None
-            repeat_free_prepared = (
-                {name: mask | repeat_masks[name] for name, mask in prepared[0].items()},
-                *prepared[1:])
-        for group in aggt_requested:
-            base_group = group.removesuffix("-no-repeat")
-            seed_offset = CONTROL_REPLICATES if base_group.endswith("-p1") else 0
-            aggt_replicates[group] = [
-                sample_aggt_controls(contigs, intervals["exons"], sequences,
-                                     args.seed + seed_offset + replicate,
-                                     length_offset=1 if base_group.endswith("-p1") else 0,
-                                     prepared=repeat_free_prepared if group in repeat_free else prepared)
-                for replicate in range(CONTROL_REPLICATES)
-            ]
-            if group in repeat_free:
-                for replicate, selected in enumerate(aggt_replicates[group], 1):
-                    print(f"Sampled {len(selected):,}/{len(intervals['exons']):,} {group} "
-                          f"replicate-{replicate}; unmatched lengths skipped after 200 attempts",
-                          file=sys.stderr, flush=True)
-
+        prepared[False] = prepare_aggt_controls(contigs, intervals["exons"], sequences)
+        if repeat_masks is not None:
+            masks, candidates, end_masks = prepared[False]
+            prepared[True] = ({name: mask | repeat_masks[name] for name, mask in masks.items()},
+                              candidates, end_masks)
     for name in names:
-        output = output_dirs[name]
         group = name.removeprefix("abs-").removesuffix("-mutated")
-        if group in aggt_replicates:
-            for replicate, selected in enumerate(aggt_replicates[group], 1):
-                replicate_output = output / f"replicate-{replicate}"
-                replicate_output.mkdir()
-                if name.startswith("abs-"):
-                    render_absolute_intervals(selected, matrix, contigs, widths, replicate_output,
-                                              args.rows, name)
-                else:
-                    render_intervals(selected, matrix, contigs, widths, replicate_output,
-                                     args.bins, args.flank, args.rows, name)
-            continue
-        if name.startswith("abs-"):
-            render_absolute_intervals(intervals[group], matrix, contigs, widths, output, args.rows, name)
-        else:
-            render_intervals(intervals[group], matrix, contigs, widths, output,
-                             args.bins, args.flank, args.rows, name)
-            if group == "exons":
-                plot_exon_length_distribution(intervals["exons"], output)
+        base_group = group.removesuffix("-no-repeat")
+        repeat_free = group.endswith("-no-repeat")
+        aggt = name.startswith("abs-control-aggt")
+        for replicate in range(1, CONTROL_REPLICATES + 1) if aggt else (0,):
+            output = output_dirs[name]
+            if aggt:
+                offset = int(base_group.endswith("-p1"))
+                selected = sample_aggt_controls(
+                    contigs, intervals["exons"], sequences,
+                    args.seed + offset * CONTROL_REPLICATES + replicate - 1,
+                    length_offset=offset, prepared=prepared[repeat_free])
+                output = output / f"replicate-{replicate}"
+                output.mkdir()
+            elif base_group == "control":
+                selected = sample_controls(contigs, intervals["exons"], args.seed,
+                                           repeat_masks=repeat_masks if repeat_free else None)
+            else:
+                selected = intervals[group]
+            if repeat_free:
+                print(f"Sampled {len(selected):,}/{len(intervals['exons']):,} {group} "
+                      f"{output.name}; unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
+            render_absolute_intervals(selected, matrix, contigs, widths, output, args.rows, name)
 
 
 def draw_plot(args):
@@ -718,13 +583,9 @@ def draw_roi(intervals, matrix, contigs, widths, out, flank, pixels):
 
 def region_plot(args):
     matrix, contigs, widths = load_matrix(args.matrix)
-    draw_roi([(args.seqid, args.start, args.end, args.strand)], matrix, contigs, widths,
-             args.out, args.flank, args.pixels)
-
-
-def regions_plot(args):
-    matrix, contigs, widths = load_matrix(args.matrix)
-    draw_roi(read_bed(args.bed, contigs), matrix, contigs, widths, args.out, args.flank, args.pixels)
+    intervals = ([(args.seqid, args.start, args.end, args.strand)] if args.command == "region"
+                 else read_bed(args.bed, contigs))
+    draw_roi(intervals, matrix, contigs, widths, args.out, args.flank, args.pixels)
 
 
 def positive(text):
@@ -751,21 +612,19 @@ def main():
     parser = argparse.ArgumentParser(description="Generate CWT with anno_cwt, then plot and normalize genomic intervals")
     commands = parser.add_subparsers(dest="command", required=True)
     draw = commands.add_parser(
-        "draw", help="run exon/control plots; --no-* skips a plot",
-        description="The default draw includes repeat-free controls, which exclude bodies overlapping "
-                "GFF repeat_region or mobile_element features. Plotted flanks are not excluded. "
+        "draw", help="run absolute exon/control plots; --no-* skips a plot",
+        description="draw generates abs-* patterns only. Repeat-free controls exclude bodies overlapping GFF "
+                    "repeat_region or mobile_element features; plotted flanks are not excluded. "
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
                     f"+/-{ABS_RADIUS} bp boundary windows.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
-    draw.add_argument("--bins", type=positive, default=200)
-    draw.add_argument("--flank", type=nonnegative, default=100)
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
     for name in PLOT_NAMES:
         draw.add_argument(f"--no-{name}", action="store_true")
     draw.set_defaults(handler=draw_plot)
-    for name, handler in (("region", region_plot), ("regions", regions_plot)):
+    for name in ("region", "regions"):
         command = commands.add_parser(name)
         add_pipeline_arguments(command, name)
         if name == "region":
@@ -777,7 +636,7 @@ def main():
             command.add_argument("--bed", type=pathlib.Path, required=True)
         command.add_argument("--flank", type=nonnegative, default=10)
         command.add_argument("--pixels", type=positive, default=1600)
-        command.set_defaults(handler=handler)
+        command.set_defaults(handler=region_plot)
     args = parser.parse_args()
     try:
         if args.command == "draw":
@@ -789,7 +648,6 @@ def main():
                 args.handler(args)
     except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
-
 
 if __name__ == "__main__":
     main()
