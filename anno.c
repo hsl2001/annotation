@@ -6,6 +6,7 @@
 #include <float.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,7 +35,15 @@ typedef struct {
   uint8_t nuc;
 } Site;
 
-static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans, preds[STATES][4], npreds[STATES];
+enum { HIDDEN_STATES = 47 };
+static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 28, 33, 41, 46};
+static const int hidden_counts[STATES] = {1, 3, 4, 2, 1, 3, 4, 2, 8, 5, 8, 5, 1};
+static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans;
+static uint8_t hidden_state[HIDDEN_STATES], hidden_context[HIDDEN_STATES];
+typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
+static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
+static int hidden_edge_count[KNUC];
+static uint8_t initial_states[KNUC][HIDDEN_STATES];
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -192,13 +201,13 @@ static double cwt_power(const double *coefficient) {
 
 static float *cwt_powers(const Wavelets *wavelets, const char *sequence, int length) {
   float *powers = anno_alloc((size_t)length, WAVE_COUNT * sizeof(*powers));
-  double *features = anno_alloc((size_t)(CWT_BLOCK + 2) * CWT_CHANNELS, sizeof(*features));
+  double *features = anno_alloc((size_t)CWT_BLOCK * CWT_CHANNELS, sizeof(*features));
   for (int start = 0; start < length; start += CWT_BLOCK) {
     int count = length - start < CWT_BLOCK ? length - start : CWT_BLOCK;
-    cwt_extract(wavelets, sequence, length, start - 1, count + 2, features);
+    cwt_extract(wavelets, sequence, length, start, count, features);
     for (int offset = 0; offset < count; offset++) {
       int position = start + offset;
-      const double *coefficient = features + (size_t)(offset + 1) * CWT_CHANNELS;
+      const double *coefficient = features + (size_t)offset * CWT_CHANNELS;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
         powers[(size_t)position * WAVE_COUNT + scale] = (float)cwt_power(coefficient + 2 * scale);
       }
@@ -243,29 +252,83 @@ static int allowed(int a, int b) {
   return b == a || b == a - 3;
 }
 
-static int is_stop(const char *seq, int length, int at, int reverse) {
-  int code = kmer(seq, length, at, 3, reverse);
-  return code == 48 || code == 50 || code == 56; /* TAA TAG TGA */
+/* Prefix classes carry start/stop recognition through introns without adding learned features. */
+static int grammar_next(int previous, int current, int base) {
+  int state = hidden_state[previous], context = hidden_context[previous];
+  if (!allowed(state, current)) return -1;
+  if (!state) {
+    if (!current) return 0;
+    if (current == 1) return base == 0 ? hidden_offsets[1] + 2 : -1;
+    return base == 3 ? hidden_offsets[9] + 3 : base == 1 ? hidden_offsets[9] + 4 : -1;
+  }
+  if (!current)
+    return (state == 3 || state == 7) && context == 1 ? 0 : -1;
+  if (state <= 6) {
+    if (current >= 4) {
+      if (state == 3 && context == 1) return -1;
+      return hidden_offsets[current] + (current == 4 ? 0 : context);
+    }
+    if (current == 1) {
+      if (state == 3 && context == 1) return -1;
+      return hidden_offsets[1] + (base == 3);
+    }
+    if (current == 2) {
+      if (context == 2) return base == 3 ? hidden_offsets[2] + 3 : -1;
+      int next_context = context == 1 && base == 0 ? 1 : context == 1 && base == 2 ? 2 : 0;
+      return hidden_offsets[2] + next_context;
+    }
+    if (context == 3) return base == 2 ? hidden_offsets[3] : -1;
+    int stop = (context == 1 && (base == 0 || base == 2)) || (context == 2 && base == 0);
+    return hidden_offsets[3] + stop;
+  }
+  if (current >= 10) return hidden_offsets[current] + (current == 12 ? 0 : context);
+  if (current == 9)
+    return hidden_offsets[9] + (base == 3 ? 1 : base == 1 ? 2 : 0);
+  if (current == 8) {
+    if (context == 3)
+      return base == 3 ? hidden_offsets[8] + 5 : base == 1 ? hidden_offsets[8] + 7 : -1;
+    if (context == 4) return base == 3 ? hidden_offsets[8] + 6 : -1;
+    int next_context = context == 1 && base == 3 ? 1 : context == 2 && base == 3 ? 2 :
+                       context == 1 && base == 1 ? 3 : context == 2 && base == 0 ? 4 : 0;
+    return hidden_offsets[8] + next_context;
+  }
+  if (context >= 5) return base == 0 ? hidden_offsets[7] : -1;
+  if (context >= 1 && context <= 3 && base == 0) return -1;
+  return hidden_offsets[7] + (context == 4 && base == 3);
 }
 
-static int is_start(const char *seq, int length, int at, int reverse) {
-  return kmer(seq, length, at, 3, reverse) == 14; /* ATG */
+static int initial_allowed(int base, int hidden, int full_start) {
+  return full_start ? grammar_next(0, hidden_state[hidden], base) == hidden : initial_states[base][hidden];
 }
 
-/* Gene grammar: a CDS opens at ATG, closes at the first in-frame stop, and contains no other. */
-static int blocked(const char *seq, int length, int i, int a, int b) {
-  if (a == 0 && b == 1) return !is_start(seq, length, i, 0);
-  if (a == 3) return b ? is_stop(seq, length, i - 3, 0) : !is_stop(seq, length, i - 3, 0);
-  if (a == 0 && b == 9) return !is_stop(seq, length, i, 1);
-  if ((a == 7 || a == 12) && b == 9) return is_stop(seq, length, i, 1);
-  if (a == 7 && b == 0) return !is_start(seq, length, i - 3, 1);
-  return 0;
+static int terminal_allowed(int hidden) {
+  int state = hidden_state[hidden];
+  return !state || ((state == 3 || state == 7) && hidden_context[hidden] == 1);
 }
 
 static void init_transitions(void) {
+  ntrans = 0;
   for (int a = 0; a < STATES; a++)
     for (int b = 0; b < STATES; b++)
-      if (allowed(a, b)) trans_a[ntrans] = a, trans_b[ntrans++] = b, preds[b][npreds[b]++] = a;
+      if (allowed(a, b)) trans_a[ntrans] = a, trans_b[ntrans++] = b;
+  for (int state = 0; state < STATES; state++)
+    for (int context = 0; context < hidden_counts[state]; context++) {
+      int hidden = hidden_offsets[state] + context;
+      hidden_state[hidden] = (uint8_t)state;
+      hidden_context[hidden] = (uint8_t)context;
+    }
+  memset(hidden_edge_count, 0, sizeof(hidden_edge_count));
+  memset(initial_states, 0, sizeof(initial_states));
+  for (int base = 0; base < KNUC; base++)
+    for (int previous = 0; previous < HIDDEN_STATES; previous++)
+      for (int edge = 0; edge < ntrans; edge++) {
+        if (trans_a[edge] != hidden_state[previous]) continue;
+        int current = grammar_next(previous, trans_b[edge], base);
+        if (current < 0) continue;
+        if (hidden_edge_count[base] >= HIDDEN_STATES * 4) anno_fail("Too many grammar transitions");
+        hidden_edges[base][hidden_edge_count[base]++] = (HiddenEdge){(uint8_t)previous, (uint8_t)current, (uint16_t)edge};
+        initial_states[base][current] = 1;
+      }
 }
 
 static void emission_indices(const Site *site, int state, int *indices) {
@@ -273,15 +336,14 @@ static void emission_indices(const Site *site, int state, int *indices) {
   indices[1] = OFF_E4 + state * K4 + site->k4;
 }
 
-static int transition_indices(const Site *site, int previous, int current, int *indices) {
+static void transition_indices(const Site *site, int previous, int current, int *indices) {
   int pair = previous * STATES + current;
   indices[0] = OFF_TNUC + pair * KNUC + site->nuc;
   indices[1] = OFF_T4 + pair * K4 + site->k4;
-  return TRANSITION_FEATURES;
 }
 
-static float feature_score(const float *weights, const int *indices, int count) {
-  float score = 0;
+static double feature_score(const float *weights, const int *indices, int count) {
+  double score = 0;
   for (int index = 0; index < count; index++) score += weights[indices[index]];
   return score;
 }
@@ -294,25 +356,25 @@ static void add_features(float *gradient, const int *indices, int count, float v
   for (int index = 0; index < count; index++) gradient[indices[index]] += value;
 }
 
-static float emission(const float *weights, const Site *site, int state) {
+static double emission(const float *weights, const Site *site, int state) {
   int indices[EMISSION_FEATURES];
   emission_indices(site, state, indices);
-  float score = feature_score(weights, indices, EMISSION_FEATURES);
+  double score = feature_score(weights, indices, EMISSION_FEATURES);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale);
+    score += (double)weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
+    score += (double)weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale);
   }
   return score;
 }
 
-static float transition(const float *weights, const Site *site, int previous, int current) {
+static double transition(const float *weights, const Site *site, int previous, int current) {
   int indices[TRANSITION_FEATURES];
-  int count = transition_indices(site, previous, current, indices);
+  transition_indices(site, previous, current, indices);
   int pair = previous * STATES + current;
-  float score = feature_score(weights, indices, count);
+  double score = feature_score(weights, indices, TRANSITION_FEATURES);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale);
+    score += (double)weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
+    score += (double)weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale);
   }
   return score;
 }
@@ -329,8 +391,8 @@ static void add_emission(float *gradient, const Site *site, int state, float val
 
 static void add_transition(float *gradient, const Site *site, int previous, int current, float value) {
   int indices[TRANSITION_FEATURES];
-  int count = transition_indices(site, previous, current, indices);
-  add_features(gradient, indices, count, value);
+  transition_indices(site, previous, current, indices);
+  add_features(gradient, indices, TRANSITION_FEATURES, value);
   int pair = previous * STATES + current;
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
@@ -454,74 +516,123 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
   return used;
 }
 
-typedef struct { Site *sites; float *emis; double *psi, *alpha, *beta, *scale; } Work;
+typedef struct { Site *sites; double *emis, *psi, *alpha, *beta, *scale; } Work;
 
-/* Scaled forward-backward on window [s, e); leaves alpha, beta, psi, scale in k. Returns log Z. */
+static double log_add(double left, double right) {
+  if (left == -INFINITY) return right;
+  if (right == -INFINITY) return left;
+  double maximum = fmax(left, right);
+  return maximum + log1p(exp(-fabs(left - right)));
+}
+
+/* Normalized log-space forward-backward on [s, e). */
 static double window_posteriors(const float *w, const Contig *c, int s, int e, Work *k) {
   int len = e - s;
   double logz = 0;
   for (int i = 0; i < len; i++) {
     k->sites[i] = site_at(c, s + i);
-    for (int st = 0; st < STATES; st++) k->emis[i * STATES + st] = emission(w, k->sites + i, st);
+    for (int st = 0; st < STATES; st++) {
+      k->emis[i * STATES + st] = emission(w, k->sites + i, st);
+      if (!isfinite(k->emis[i * STATES + st])) anno_fail("Non-finite CRF emission at position %d", s + i + 1);
+    }
   }
   for (int i = 0; i < len; i++) {
     const Site *site = k->sites + i;
-    const float *em = k->emis + i * STATES;
-    double *al = k->alpha + (size_t)i * STATES, *psi = k->psi + (size_t)i * ntrans, shift = -INFINITY;
+    const double *em = k->emis + i * STATES;
+    double *al = k->alpha + (size_t)i * HIDDEN_STATES, *psi = k->psi + (size_t)i * ntrans;
     if (!i) {
-      for (int st = 0; st < STATES; st++) shift = fmax(shift, em[st]);
-      for (int st = 0; st < STATES; st++) al[st] = exp(em[st] - shift);
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        al[hidden] = initial_allowed(site->nuc, hidden, s == 0) ? em[hidden_state[hidden]] : -INFINITY;
     } else {
       for (int t = 0; t < ntrans; t++) {
-        psi[t] = blocked(c->seq, c->length, s + i, trans_a[t], trans_b[t]) ? -INFINITY
-               : transition(w, site, trans_a[t], trans_b[t]) + em[trans_b[t]];
-        shift = fmax(shift, psi[t]);
+        psi[t] = transition(w, site, trans_a[t], trans_b[t]) + em[trans_b[t]];
+        if (!isfinite(psi[t])) anno_fail("Non-finite CRF transition at position %d", s + i + 1);
       }
-      memset(al, 0, STATES * sizeof(*al));
-      for (int t = 0; t < ntrans; t++) {
-        psi[t] = psi[t] == -INFINITY ? 0 : exp(psi[t] - shift);
-        al[trans_b[t]] += al[trans_a[t] - STATES] * psi[t];
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) al[hidden] = -INFINITY;
+      const HiddenEdge *edges = hidden_edges[site->nuc];
+      for (int edge = 0; edge < hidden_edge_count[site->nuc]; edge++) {
+        const HiddenEdge *step = edges + edge;
+        al[step->current] = log_add(al[step->current], al[(int)step->previous - HIDDEN_STATES] + psi[step->transition]);
       }
     }
-    double total = 0;
-    for (int st = 0; st < STATES; st++) total += al[st];
-    for (int st = 0; st < STATES; st++) al[st] /= total;
+    if (e == c->length && i == len - 1)
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        if (!terminal_allowed(hidden)) al[hidden] = -INFINITY;
+    double total = -INFINITY;
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) total = log_add(total, al[hidden]);
+    if (!isfinite(total)) anno_fail("Invalid CRF partition at position %d", s + i + 1);
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) al[hidden] -= total;
     k->scale[i] = total;
-    logz += log(total) + shift;
+    logz += total;
   }
-  for (int st = 0; st < STATES; st++) k->beta[(size_t)(len - 1) * STATES + st] = 1;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    k->beta[(size_t)(len - 1) * HIDDEN_STATES + hidden] = e < c->length || terminal_allowed(hidden) ? 0 : -INFINITY;
   for (int i = len - 2; i >= 0; i--) {
-    double *be = k->beta + (size_t)i * STATES, *next = be + STATES, *psi = k->psi + (size_t)(i + 1) * ntrans;
-    memset(be, 0, STATES * sizeof(*be));
-    for (int t = 0; t < ntrans; t++) be[trans_a[t]] += psi[t] * next[trans_b[t]];
-    for (int st = 0; st < STATES; st++) be[st] /= k->scale[i + 1];
+    double *be = k->beta + (size_t)i * HIDDEN_STATES, *next = be + HIDDEN_STATES, *psi = k->psi + (size_t)(i + 1) * ntrans;
+    int base = k->sites[i + 1].nuc;
+    const HiddenEdge *edges = hidden_edges[base];
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) be[hidden] = -INFINITY;
+    for (int edge = 0; edge < hidden_edge_count[base]; edge++) {
+      const HiddenEdge *step = edges + edge;
+      be[step->previous] = log_add(be[step->previous], psi[step->transition] + next[step->current]);
+    }
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) be[hidden] -= k->scale[i + 1];
   }
   return logz;
+}
+
+static double gold_grammar_mass(const Contig *contig, int start, int end) {
+  double previous[HIDDEN_STATES], current[HIDDEN_STATES];
+  int base = base_index(contig->seq[start]);
+  if (base < 0) base = 4;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    previous[hidden] = hidden_state[hidden] == contig->label[start] && initial_allowed(base, hidden, start == 0) ? 0 : -INFINITY;
+  for (int position = start + 1; position < end; position++) {
+    base = base_index(contig->seq[position]);
+    if (base < 0) base = 4;
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) current[hidden] = -INFINITY;
+    const HiddenEdge *edges = hidden_edges[base];
+    for (int edge = 0; edge < hidden_edge_count[base]; edge++) {
+      const HiddenEdge *step = edges + edge;
+      if (hidden_state[step->current] == contig->label[position])
+        current[step->current] = log_add(current[step->current], previous[step->previous]);
+    }
+    memcpy(previous, current, sizeof(previous));
+  }
+  double mass = -INFINITY;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    if (end < contig->length || terminal_allowed(hidden)) mass = log_add(mass, previous[hidden]);
+  return mass;
 }
 
 /* Accumulates observed minus expected features for one window.
    Returns the window log-likelihood or NAN when the gold path violates the grammar. */
 static double window_gradient(const float *w, const Contig *c, int s, int e, Work *k, float *gradient) {
   int len = e - s;
-  for (int i = 1; i < len; i++) {
-    int a = c->label[s + i - 1], b = c->label[s + i];
-    if (!allowed(a, b) || blocked(c->seq, c->length, s + i, a, b)) return NAN;
-  }
-  double gold = -window_posteriors(w, c, s, e, k);
+  double mass = gold_grammar_mass(c, s, e);
+  if (mass == -INFINITY) return NAN;
+  double gold = mass - window_posteriors(w, c, s, e, k);
   for (int i = 0; i < len; i++) {
     const Site *site = k->sites + i;
-    const double *al = k->alpha + (size_t)i * STATES, *be = k->beta + (size_t)i * STATES, *psi = k->psi + (size_t)i * ntrans;
+    const double *al = k->alpha + (size_t)i * HIDDEN_STATES, *be = k->beta + (size_t)i * HIDDEN_STATES, *psi = k->psi + (size_t)i * ntrans;
     int b = c->label[s + i];
     gold += k->emis[i * STATES + b];
     add_emission(gradient, site, b, 1);
-    for (int st = 0; st < STATES; st++) add_emission(gradient, site, st, -(float)(al[st] * be[st]));
+    double state_marginals[STATES] = {0};
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+      state_marginals[hidden_state[hidden]] += exp(al[hidden] + be[hidden]);
+    for (int st = 0; st < STATES; st++) add_emission(gradient, site, st, -(float)state_marginals[st]);
     if (!i) continue;
     gold += transition(w, site, c->label[s + i - 1], b);
     add_transition(gradient, site, c->label[s + i - 1], b, 1);
-    for (int t = 0; t < ntrans; t++) {
-      double mu = al[trans_a[t] - STATES] * psi[t] * be[trans_b[t]] / k->scale[i];
-      if (mu > 0) add_transition(gradient, site, trans_a[t], trans_b[t], -(float)mu);
+    double edge_marginals[STATES * STATES] = {0};
+    const HiddenEdge *edges = hidden_edges[site->nuc];
+    for (int edge = 0; edge < hidden_edge_count[site->nuc]; edge++) {
+      const HiddenEdge *step = edges + edge;
+      edge_marginals[step->transition] += exp(al[(int)step->previous - HIDDEN_STATES] + psi[step->transition] + be[step->current] - k->scale[i]);
     }
+    for (int t = 0; t < ntrans; t++)
+      if (edge_marginals[t] > 0) add_transition(gradient, site, trans_a[t], trans_b[t], -(float)edge_marginals[t]);
   }
   return gold;
 }
@@ -531,10 +642,10 @@ static int window_count(const Contig *c) { return (c->length + WINDOW - 1) / WIN
 static Work work_alloc(void) {
   return (Work){
     .sites = anno_alloc(WINDOW, sizeof(Site)),
-    .emis = anno_alloc((size_t)WINDOW * STATES, sizeof(float)),
+    .emis = anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
     .psi = anno_alloc((size_t)WINDOW * ntrans, sizeof(double)),
-    .alpha = anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
-    .beta = anno_alloc((size_t)WINDOW * STATES, sizeof(double)),
+    .alpha = anno_alloc((size_t)WINDOW * HIDDEN_STATES, sizeof(double)),
+    .beta = anno_alloc((size_t)WINDOW * HIDDEN_STATES, sizeof(double)),
     .scale = anno_alloc(WINDOW, sizeof(double))
   };
 }
@@ -543,14 +654,50 @@ static void work_free(Work *k) {
   free(k->sites), free(k->emis), free(k->psi), free(k->alpha), free(k->beta), free(k->scale);
 }
 
-void crf_train(Contig *contigs, int count, float *w, int epochs) {
+typedef struct {
+  Contig *contigs;
+  int window_index, length, skipped;
+  const float *weights;
+  Work work;
+  float *gradient;
+  double likelihood;
+} WindowJob;
+
+static void *train_window(void *argument) {
+  WindowJob *job = argument;
+  int contig = 0, index = job->window_index;
+  while (index >= window_count(job->contigs + contig))
+    index -= window_count(job->contigs + contig++);
+  int start = index * WINDOW;
+  Contig *sequence = job->contigs + contig;
+  int end = start + WINDOW < sequence->length ? start + WINDOW : sequence->length;
+  job->length = end - start;
+  memset(job->gradient, 0, WEIGHTS * sizeof(*job->gradient));
+  job->likelihood = window_gradient(job->weights, sequence, start, end, &job->work, job->gradient);
+  job->skipped = isnan(job->likelihood);
+  if (!job->skipped) {
+    if (!isfinite(job->likelihood)) anno_fail("Non-finite training likelihood");
+    for (int feature = 0; feature < WEIGHTS; feature++)
+      if (!isfinite(job->gradient[feature])) anno_fail("Non-finite training gradient");
+  }
+  return NULL;
+}
+
+void crf_train(Contig *contigs, int count, float *w, int epochs, int threads) {
   int windows = 0;
   for (int c = 0; c < count; c++) windows += window_count(contigs + c);
+  int worker_count = threads < windows ? threads : windows;
   int *order = anno_alloc(windows, sizeof(*order));
   for (int i = 0; i < windows; i++) order[i] = i;
-  Work k = work_alloc();
-  float *gradient = anno_alloc(WEIGHTS, sizeof(*gradient));
-  float *history = anno_alloc(WEIGHTS, sizeof(*history));
+  WindowJob *jobs = anno_alloc(worker_count, sizeof(*jobs));
+  pthread_t *thread_ids = anno_alloc(worker_count, sizeof(*thread_ids));
+  for (int worker = 0; worker < worker_count; worker++) {
+    jobs[worker].contigs = contigs;
+    jobs[worker].weights = w;
+    jobs[worker].work = work_alloc();
+    jobs[worker].gradient = anno_alloc(WEIGHTS, sizeof(*jobs[worker].gradient));
+  }
+  double *history = anno_alloc(WEIGHTS, sizeof(*history));
   double *average = anno_alloc(WEIGHTS, sizeof(*average));
   long averaged = 0;
   srand(1);
@@ -562,72 +709,120 @@ void crf_train(Contig *contigs, int count, float *w, int epochs) {
       int j = rand() % (i + 1), t = order[i];
       order[i] = order[j], order[j] = t;
     }
-    for (int n = 0; n < windows; n++) {
-      int c = 0, index = order[n];
-      while (index >= window_count(contigs + c)) index -= window_count(contigs + c++);
-      int s = index * WINDOW, e = s + WINDOW < contigs[c].length ? s + WINDOW : contigs[c].length;
-      double value = window_gradient(w, contigs + c, s, e, &k, gradient);
-      if (isnan(value)) { skipped++; continue; }
-      likelihood += value, positions += e - s;
-      for (int f = 0; f < WEIGHTS; f++) {
-        float g = gradient[f] / (e - s);
-        gradient[f] = 0;
-        if (g == 0) continue;
-        history[f] += g * g;
-        w[f] += LEARNING_RATE * g / sqrtf(history[f] + 1e-8f);
+    for (int n = 0; n < windows; n += worker_count) {
+      int batch = windows - n < worker_count ? windows - n : worker_count;
+      for (int worker = 0; worker < batch; worker++) {
+        jobs[worker].window_index = order[n + worker];
+        if (threads == 1) train_window(jobs + worker);
+        else {
+          int error = pthread_create(thread_ids + worker, NULL, train_window, jobs + worker);
+          if (error) anno_fail("Cannot create training thread: %s", strerror(error));
+        }
       }
-      /* SGD end points oscillate between over- and under-calling; the final-epoch mean is stable. */
+      if (threads > 1)
+        for (int worker = 0; worker < batch; worker++) {
+          int error = pthread_join(thread_ids[worker], NULL);
+          if (error) anno_fail("Cannot join training thread: %s", strerror(error));
+        }
+      int trained = 0;
+      for (int worker = 0; worker < batch; worker++) {
+        if (jobs[worker].skipped) skipped++;
+        else {
+          trained++;
+          likelihood += jobs[worker].likelihood;
+          positions += jobs[worker].length;
+        }
+      }
+      if (!trained) continue;
+      for (int f = 0; f < WEIGHTS; f++) {
+        float g = 0;
+        for (int worker = 0; worker < batch; worker++)
+          if (!jobs[worker].skipped) g += jobs[worker].gradient[f] / jobs[worker].length;
+        g /= trained;
+        if (g == 0) continue;
+        history[f] += (double)g * g;
+        w[f] += LEARNING_RATE * g / sqrt(history[f] + 1e-8);
+        if (!isfinite(w[f])) anno_fail("Non-finite training weight");
+      }
       if (epoch == epochs) {
-        for (int f = 0; f < WEIGHTS; f++) average[f] += w[f];
-        averaged++;
+        for (int f = 0; f < WEIGHTS; f++) average[f] += w[f] * trained;
+        averaged += trained;
       }
     }
     fprintf(stderr, "Epoch %d: %d windows trained, %d skipped, log-likelihood/bp %.4f\n",
             epoch, windows - skipped, skipped, positions ? likelihood / positions : 0.0);
   }
   for (int f = 0; averaged && f < WEIGHTS; f++) w[f] = (float)(average[f] / averaged);
-  free(order), free(gradient), free(history), free(average), work_free(&k);
+  for (int worker = 0; worker < worker_count; worker++) {
+    work_free(&jobs[worker].work);
+    free(jobs[worker].gradient);
+  }
+  free(order), free(jobs), free(thread_ids), free(history), free(average);
 }
 
-/* Streaming decode: Viterbi over transition + emission scores plus POSTERIOR_WEIGHT times the log
-   state posterior. The posterior term settles gene/no-gene calls from the full marginal mass while
-   the path scores keep boundaries sharp. Posteriors come from overlapping windows whose flanks are
-   dropped so every kept position sees full context. */
-void crf_decode(const float *w, const Contig *c, uint8_t *path) {
-  int n = c->length, margin = WINDOW / 4, step = WINDOW - 2 * margin;
-  uint32_t *back = anno_alloc(n, sizeof(*back));
-  double prev[STATES], cur[STATES];
-  Work k = work_alloc();
-  for (int start = 0; start < n; start += step) {
-    int s = start > margin ? start - margin : 0, e = s + WINDOW < n ? s + WINDOW : n;
-    window_posteriors(w, c, s, e, &k);
-    for (int i = s ? start : 0; i < (e < n ? start + step : n); i++) {
-      const Site *site = k.sites + (i - s);
-      const float *em = k.emis + (size_t)(i - s) * STATES;
-      const double *al = k.alpha + (size_t)(i - s) * STATES, *be = k.beta + (size_t)(i - s) * STATES;
-      uint32_t bits = 0;
-      for (int b = 0; b < STATES; b++) {
-        double best = i ? -INFINITY : 0, posterior = al[b] * be[b];
-        double observation = em[b] + POSTERIOR_WEIGHT * log(posterior > 1e-300 ? posterior : 1e-300);
-        int arg = 0;
-        for (int j = 0; i && j < npreds[b]; j++) {
-          int a = preds[b][j];
-          if (blocked(c->seq, n, i, a, b)) continue;
-          double value = prev[a] + transition(w, site, a, b);
-          if (value > best) best = value, arg = j;
-        }
-        cur[b] = best + observation;
-        bits |= (uint32_t)arg << 2 * b;
-      }
-      back[i] = bits;
-      memcpy(prev, cur, sizeof(cur));
-    }
-    if (e == n) break;
+static void viterbi_step(const float *weights, const Contig *contig, int position,
+                         const double *previous, double *current, uint8_t *back) {
+  Site site = site_at(contig, position);
+  double emissions[STATES], transitions[STATES * STATES];
+  for (int state = 0; state < STATES; state++) {
+    emissions[state] = emission(weights, &site, state);
+    if (!isfinite(emissions[state])) anno_fail("Non-finite prediction emission");
   }
-  work_free(&k);
-  int b = 0;
-  for (int st = 1; st < STATES; st++) if (prev[st] > prev[b]) b = st;
-  for (int i = n - 1; i >= 0; i--) path[i] = b, b = preds[b][back[i] >> 2 * b & 3];
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
+    current[hidden] = position == 0 && initial_allowed(site.nuc, hidden, 1) ? emissions[hidden_state[hidden]] : -INFINITY;
+    if (back) back[hidden] = 0;
+  }
+  if (position) {
+    for (int edge = 0; edge < ntrans; edge++) {
+      transitions[edge] = transition(weights, &site, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
+      if (!isfinite(transitions[edge])) anno_fail("Non-finite prediction transition");
+    }
+    const HiddenEdge *edges = hidden_edges[site.nuc];
+    for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
+      const HiddenEdge *step = edges + edge;
+      double score = previous[step->previous] + transitions[step->transition];
+      if (score > current[step->current]) {
+        current[step->current] = score;
+        if (back) back[step->current] = step->previous;
+      }
+    }
+  }
+  double maximum = -INFINITY;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) maximum = fmax(maximum, current[hidden]);
+  if (!isfinite(maximum)) anno_fail("No finite prediction path");
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) current[hidden] -= maximum;
+}
+
+/* Exact whole-contig MAP; recomputed checkpoint blocks bound traceback memory. */
+void crf_decode(const float *w, const Contig *c, uint8_t *path) {
+  int length = c->length, blocks = window_count(c);
+  double *checkpoints = anno_alloc((size_t)blocks * HIDDEN_STATES, sizeof(*checkpoints));
+  int capacity = length < WINDOW ? length : WINDOW;
+  uint8_t *back = anno_alloc((size_t)capacity * HIDDEN_STATES, sizeof(*back));
+  double previous[HIDDEN_STATES] = {0}, current[HIDDEN_STATES];
+  for (int position = 0; position < length; position++) {
+    if (position % WINDOW == 0)
+      memcpy(checkpoints + (size_t)(position / WINDOW) * HIDDEN_STATES, previous, sizeof(previous));
+    viterbi_step(w, c, position, previous, current, NULL);
+    memcpy(previous, current, sizeof(previous));
+  }
+  int best = 0;
+  for (int hidden = 1; hidden < HIDDEN_STATES; hidden++)
+    if (terminal_allowed(hidden) && previous[hidden] > previous[best]) best = hidden;
+  if (!isfinite(previous[best])) anno_fail("No complete prediction path");
+  for (int block = blocks - 1; block >= 0; block--) {
+    int start = block * WINDOW, end = length - start < WINDOW ? length : start + WINDOW;
+    memcpy(previous, checkpoints + (size_t)block * HIDDEN_STATES, sizeof(previous));
+    for (int position = start; position < end; position++) {
+      viterbi_step(w, c, position, previous, current, back + (size_t)(position - start) * HIDDEN_STATES);
+      memcpy(previous, current, sizeof(previous));
+    }
+    for (int position = end - 1; position >= start; position--) {
+      path[position] = hidden_state[best];
+      best = back[(size_t)(position - start) * HIDDEN_STATES + best];
+    }
+  }
+  free(checkpoints);
   free(back);
 }
 
@@ -657,7 +852,7 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRF9", 1, 8, file) != 8 ||
+  if (!file || fwrite("ANNOCRFA", 1, 8, file) != 8 ||
       fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
@@ -666,9 +861,11 @@ static void load_model(const char *path, float *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (memcmp(magic, "ANNOCRF9", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
+  if (memcmp(magic, "ANNOCRFA", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
   if (fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
+  for (int feature = 0; feature < WEIGHTS; feature++)
+    if (!isfinite(w[feature])) anno_fail("Non-finite model weight: %s", path);
   fclose(file);
 }
 
@@ -736,7 +933,7 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
 }
 
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] [-t threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
                   "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
@@ -744,12 +941,20 @@ static int usage(const char *program, int status) {
 int main(int argc, char **argv) {
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int epochs = DEFAULT_EPOCHS, option;
+  int epochs = DEFAULT_EPOCHS, threads = DEFAULT_THREADS, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:h", NULL)) >= 0) {
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:t:h", NULL)) >= 0) {
     if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
     else if (option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
+    else if (option == 't') {
+      char *end;
+      errno = 0;
+      long value = strtol(options.arg, &end, 10);
+      if (errno || end == options.arg || *end || value < 1 || value > INT_MAX)
+        return usage(argv[0], 1);
+      threads = (int)value;
+    }
     else return usage(argv[0], option != 'h');
   }
   int rest = argc - options.ind;
@@ -779,7 +984,7 @@ int main(int argc, char **argv) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, epochs);
+    crf_train(contigs, count, weights, epochs, threads);
     save_model(model, weights);
   }
   puts("##gff-version 3");

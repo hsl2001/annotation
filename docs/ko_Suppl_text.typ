@@ -400,6 +400,38 @@ $
   W_(upright("AC")) \( a \, b \)
   = 1 / sqrt(a) \[ integral_(- 1 \/ 2)^(1 \/ 2) overline(psi \( \( t - b \) \/ a \)) d t
   + i integral_(1 \/ 2)^(3 \/ 2) overline(psi \( \( t - b \) \/ a \)) d t \] .
-$ <genome-signal-example>
-적분하는 것은 켤레 wavelet이고, 앞의 1과 $i$는 염기의 값이다.
-염기가
+$ <genome-signal-example-1>
+염기 $n$의 구간은 $\[ n - 1 \/ 2 \, n + 1 \/ 2 \)$이므로
+$
+  W_x \( a \, b \) = 1 / sqrt(a) sum_(n = 0)^(L - 1) x \[ n \] integral_(n - 1 \/ 2)^(n + 1 \/ 2) overline(psi \( \( t - b \) \/ a \)) thin d t .
+$ <genome-signal-example-2>
+@genome-signal-example-2 의 의미는 '각 염기 값' $times$ '그 구간의 wavelet 적분을 모두 더한 값' 이다.
+치환적분을 통해 실제 위치 $t$를 Mother wavelet 좌표 $u$로 바꾸면,
+$u = \( t - b \) \/ a$, 그리고 $\( n - b - 1 \/ 2 \) \/ a$와 $\( n - b + 1 \/ 2 \) \/ a$이다.
+또, $d t = a d u$이기 때문에 앞의 계수는 $a \/ sqrt(a) = sqrt(a)$ 이다.
+$
+  W_x \( a \, b \) = sqrt(a) sum_(n = 0)^(L - 1) x \[ n \] integral_(\( n - b - 1 \/ 2 \) \/ a)^(\( n - b + 1 \/ 2 \) \/ a) overline(psi \( u \)) thin d u .
+$ <genome-signal-integral>
+위 @genome-signal-integral 와 같이 계산된다.
+@genome-signal-integral 의 적분 구간은 $j = n - b$에만 의존한다.
+따라서 같은 스케일, 같은 거리에서는 적분값도 같다.
+이 때문에 거리별로 한 번씩 적분해 저장해 두고, 이 적분 재열을 커널(kernel)이라고 부른다.
+$
+  k_a \[ j \] = sqrt(a) integral_(\( j - 1 \/ 2 \) \/ a)^(\( j + 1 \/ 2 \) \/ a) overline(psi \( u \)) thin d u
+$ <kernel-def>
+커널이 준비되면 이제 각 위치에서 필요한 것은 염기 값 $times$ 거리별 커널 값의 합 뿐이다.
+$
+  W_x \( a \, b \) = sum_n x \[ n \] k_a \[ n - b \]
+$ <cwt-def-by-kernel>
+예를 들어, `AC`에서 중심을 한 칸 옮기면 각 염기의 상대 거리만 바뀐다.
+#figure(
+  table(
+    columns: 4,
+    table.header([비교 위치], [A의 거리와 기여], [C의 거리와 기여], [합계]),
+    [$b = 0$], [$j = 0$: $k_a \[ 0 \]$], [$j = 1$: $i k_a \[ 1 \]$], [$k_a \[ 0 \] + i k_a \[ 1 \]$],
+    [$b = 1$], [$j = - 1$: $k_a \[ - 1 \]$], [$j = 0$: $i k_a \[ 0 \]$], [$k_a \[ - 1 \] + i k_a \[ 0 \]$],
+  ),
+  kind: table,
+)
+커널을 이용하면 중심을 이동해도 다시 적분할 필요가 없기 때문에 같은 커널을 모든 위치에서 재활용한다.
+== 8. 유한 커널과 수치 정밀도

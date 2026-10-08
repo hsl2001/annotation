@@ -250,7 +250,7 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
             axis.set_ylabel("Interval rank" if scale == 0 else "")
             profile.plot(positions, profiles[boundary_index, scale], color="#256c87", linewidth=1.3)
             profile.set_ylabel("Mean power" if scale == 0 else "")
-            profile.set_ylim(-0.1, 1.6)
+            profile.set_ylim(0.6, 1.2)
             for panel in (axis, profile):
                 panel.set_xticks((-ABS_RADIUS, 0, ABS_RADIUS),
                                 (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"), fontsize=8)
