@@ -28,7 +28,7 @@ typedef struct {
 typedef struct {
    char *name, *seq;
    int length;
-   int16_t *derivative;
+   float *cwt_power;
    uint8_t *label;
 } Contig;
 

@@ -1,0 +1,1 @@
+echo "cd `pwd`; ./anno truth.combined.slm.nip.fasta.gz truth.combined.slm.nip.gff3  > train.gff" | qsub -N train -j oe -o ~/log/train.log -v WORKDIR=`pwd` -l select=1:ncpus=4

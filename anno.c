@@ -21,13 +21,15 @@ KSEQ_INIT(gzFile, gzread)
 const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9};
 enum { CWT_BLOCK = 1024, K4 = 257, KNUC = 5, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 };
 enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
-       OFF_ED = OFF_E4 + STATES * K4, OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
+       OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
+       OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
        OFF_T4 = OFF_TNUC + STATES * STATES * KNUC,
-       OFF_TD = OFF_T4 + STATES * STATES * K4,
+       OFF_TP = OFF_T4 + STATES * STATES * K4, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
        WEIGHTS = OFF_TD + STATES * STATES * WAVE_COUNT };
 
 typedef struct {
   uint16_t k4;
+  float cwt_power[WAVE_COUNT];
   int16_t derivative[WAVE_COUNT];
   uint8_t nuc;
 } Site;
@@ -188,28 +190,22 @@ static double cwt_power(const double *coefficient) {
   return coefficient[0] * coefficient[0] + coefficient[1] * coefficient[1];
 }
 
-static int16_t *cwt_derivatives(const Wavelets *wavelets, const char *sequence, int length) {
-  int16_t *derivatives = anno_alloc((size_t)length, WAVE_COUNT * sizeof(*derivatives));
+static float *cwt_powers(const Wavelets *wavelets, const char *sequence, int length) {
+  float *powers = anno_alloc((size_t)length, WAVE_COUNT * sizeof(*powers));
   double *features = anno_alloc((size_t)(CWT_BLOCK + 2) * CWT_CHANNELS, sizeof(*features));
   for (int start = 0; start < length; start += CWT_BLOCK) {
     int count = length - start < CWT_BLOCK ? length - start : CWT_BLOCK;
     cwt_extract(wavelets, sequence, length, start - 1, count + 2, features);
     for (int offset = 0; offset < count; offset++) {
       int position = start + offset;
-      if (position == 0 || position + 1 >= length ||
-          base_index(sequence[position - 1]) < 0 || base_index(sequence[position]) < 0 ||
-          base_index(sequence[position + 1]) < 0) continue;
+      const double *coefficient = features + (size_t)(offset + 1) * CWT_CHANNELS;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        const double *left_coefficient = features + (size_t)offset * CWT_CHANNELS + 2 * scale;
-        const double *right_coefficient = features + (size_t)(offset + 2) * CWT_CHANNELS + 2 * scale;
-        double left = cwt_power(left_coefficient), right = cwt_power(right_coefficient);
-        double slope = (right - left) / (right + left + 1e-12);
-        derivatives[(size_t)position * WAVE_COUNT + scale] = (int16_t)lrint(slope * INT16_MAX);
+        powers[(size_t)position * WAVE_COUNT + scale] = (float)cwt_power(coefficient + 2 * scale);
       }
     }
   }
   free(features);
-  return derivatives;
+  return powers;
 }
 
 static int kmer(const char *seq, int length, int from, int k, int reverse) {
@@ -226,7 +222,16 @@ static int kmer(const char *seq, int length, int from, int k, int reverse) {
 static Site site_at(const Contig *c, int i) {
   int base = base_index(c->seq[i]);
   Site s = {.k4 = kmer(c->seq, c->length, i - 2, 4, 0), .nuc = base < 0 ? 4 : base};
-  memcpy(s.derivative, c->derivative + (size_t)i * WAVE_COUNT, sizeof(s.derivative));
+  memcpy(s.cwt_power, c->cwt_power + (size_t)i * WAVE_COUNT, sizeof(s.cwt_power));
+  if (i > 0 && i + 1 < c->length && base_index(c->seq[i - 1]) >= 0 &&
+      base >= 0 && base_index(c->seq[i + 1]) >= 0) {
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      double left = c->cwt_power[(size_t)(i - 1) * WAVE_COUNT + scale];
+      double right = c->cwt_power[(size_t)(i + 1) * WAVE_COUNT + scale];
+      double slope = (right - left) / (right + left + 1e-12);
+      s.derivative[scale] = (int16_t)lrint(slope * INT16_MAX);
+    }
+  }
   return s;
 }
 
@@ -293,8 +298,10 @@ static float emission(const float *weights, const Site *site, int state) {
   int indices[EMISSION_FEATURES];
   emission_indices(site, state, indices);
   float score = feature_score(weights, indices, EMISSION_FEATURES);
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale);
+  }
   return score;
 }
 
@@ -303,8 +310,10 @@ static float transition(const float *weights, const Site *site, int previous, in
   int count = transition_indices(site, previous, current, indices);
   int pair = previous * STATES + current;
   float score = feature_score(weights, indices, count);
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale);
+  }
   return score;
 }
 
@@ -312,8 +321,10 @@ static void add_emission(float *gradient, const Site *site, int state, float val
   int indices[EMISSION_FEATURES];
   emission_indices(site, state, indices);
   add_features(gradient, indices, EMISSION_FEATURES, value);
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    gradient[OFF_EP + state * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale);
+  }
 }
 
 static void add_transition(float *gradient, const Site *site, int previous, int current, float value) {
@@ -321,8 +332,10 @@ static void add_transition(float *gradient, const Site *site, int previous, int 
   int count = transition_indices(site, previous, current, indices);
   add_features(gradient, indices, count, value);
   int pair = previous * STATES + current;
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale);
+  }
 }
 
 Contig *read_fasta(const char *path, int *count) {
@@ -351,7 +364,7 @@ static void free_contigs(Contig *contigs, int count) {
   for (int contig = 0; contig < count; contig++) {
     free(contigs[contig].name);
     free(contigs[contig].seq);
-    free(contigs[contig].derivative);
+    free(contigs[contig].cwt_power);
     free(contigs[contig].label);
   }
   free(contigs);
@@ -644,7 +657,7 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRF8", 1, 8, file) != 8 ||
+  if (!file || fwrite("ANNOCRF9", 1, 8, file) != 8 ||
       fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
@@ -653,7 +666,7 @@ static void load_model(const char *path, float *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (memcmp(magic, "ANNOCRF8", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
+  if (memcmp(magic, "ANNOCRF9", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
   if (fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
@@ -761,7 +774,7 @@ int main(int argc, char **argv) {
   int count;
   Contig *contigs = read_fasta(args[0], &count);
   for (int c = 0; c < count; c++)
-    contigs[c].derivative = cwt_derivatives(&wavelets, contigs[c].seq, contigs[c].length);
+    contigs[c].cwt_power = cwt_powers(&wavelets, contigs[c].seq, contigs[c].length);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
