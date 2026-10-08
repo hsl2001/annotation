@@ -19,7 +19,6 @@
 #define MIN_CDS 30
 #define LEARNING_RATE 0.1f
 #define POSTERIOR_WEIGHT 0.01
-#define SPLICE_PENALTY 8.0
 #define DEFAULT_EPOCHS 24
 
 typedef struct {
@@ -29,8 +28,8 @@ typedef struct {
 typedef struct {
    char *name, *seq;
    int length;
-   uint32_t *cwt, *prominence;
-   uint8_t *peak_distance, *label;
+   int16_t *derivative;
+   uint8_t *label;
 } Contig;
 
 extern const int wave_sizes[WAVE_COUNT];
@@ -40,7 +39,6 @@ int base_index(char base);
 void wavelets_init(Wavelets *wavelets);
 void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
                  int start, int count, double *features);
-uint32_t *cwt_features(const Wavelets *wavelets, const char *sequence, int length);
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void crf_train(Contig *contigs, int count, float *weights, int epochs);

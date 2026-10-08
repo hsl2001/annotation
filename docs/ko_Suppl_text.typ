@@ -368,6 +368,26 @@ Nyquist 샘플링 정리에 의한 복원 보정이 필요하다.
 따라서 그 CWT에 연속 정현파에서의 공식을 그대로 적용할 수 없다.
 유전체 신호는 다음 회전 패턴들의 합으로 표현할 수 있다.
 $
-  omega = pi \/ 2\, #h(2em) Omega_k = omega + 2 pi k
+  omega = pi \/ 2\, #h(2em) Omega_k = omega + 2 pi k, #h(2em) x \( t \) = sum_(k in bb(Z)) c_k e^(i Omega_k t) \, #h(2em) c_k = frac(sin \( Omega_k \/ 2 \), Omega_k \/ 2) .
 $ <genome-signal-basis>
-@genome-signal-basis 는 푸리에 급수로,
+@genome-signal-basis 는 푸리에 급수로, 주기 함수를 여러 주파수의 진동으로 분해한 식이다.
+이 때 $bb(Z)$는 정수 전체이고, $Omega_k$들은 샘플에서는 구분되지 않는 주파수이다.
+$c_k$는 폭 1인 유전체 신호의 계단 구간 때문에 생가는 각 성분의 계수이다.
+#cf[계단의 점프 지점에서는 급수가 양쪽 값의 평균으로 수렴하고, 따라서 그 점들의 값들은 CWT 적분에 영향을 주지 않는다.
+  이를 증명하자면,
+  $
+    integral_(- 1 \/ 2)^(1 \/ 2) e^(- i Omega_k t) thin d t = frac(2 sin \( Omega_k \/ 2 \), Omega_k) = c_k .
+  $ <genome-signal-proof-1>
+  각 폭 1인 구간에서의 적분은 @genome-signal-proof-1 와 같이 표현된다.
+]
+길이 4인 한 주기에서 급수의 계수는, $1 / 4 integral_(- 1 \/ 2)^(7 \/ 2) x \( t \) e^(- i Omega_k t) d t$이다. 네 구간으로 나누고 $t = n + v$로 치환하면 $e^(i omega n) e^(- i Omega_k n) = 1$이므로
+위 구간 적분이 네 번 더해지고 앞의 $1 \/ 4$와 상쇄된다. 그 외 길이 4의 푸리에 주파수에서는 네 복소수의 등비합이 0이 되어 계수도 0이다.
+CWT는 신호에 대해 선형이고, 신호의 합을 변환한 결과는 각 변환 결과의 합이므로, 각 회전 패턴의 식에서
+정수 위치 $b$에서는 $e^(i Omega_k b) = e^(i omega b)$이므로
+$
+  W_x \( a \, b \) = e^(i omega b) N sqrt(2 pi a) sum_(k in bb(Z)) c_k [e^(- \( a Omega_k - 6 \)^2 \/ 2) - e^(- 18) e^(- \( a Omega_k \)^2 \/ 2)] .
+$ <genome-signal-proof-2>
+가우스 항 때문에 먼 주파수의 기여가 빠르게 작아진다.
+유한 합으로 근사할 수 있다.
+#cf[위 식은 무한 신호의 결과이고, contig 등으로 유한한 신호에서는 경계 효과가 추가된다.]
+=== 6.5 CWT와 커널(kernel)의 구분
