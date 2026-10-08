@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define WAVE_COUNT 6
+#define WAVE_COUNT 10
 #ifndef MAX_WAVE_SIZE
 #define MAX_WAVE_SIZE 9
 #endif

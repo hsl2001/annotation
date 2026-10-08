@@ -435,3 +435,56 @@ $ <cwt-def-by-kernel>
 )
 커널을 이용하면 중심을 이동해도 다시 적분할 필요가 없기 때문에 같은 커널을 모든 위치에서 재활용한다.
 == 8. 유한 커널과 수치 정밀도
+커널을 실제로 컴퓨터가 계산할 수 있는 유한한 수준의 배열로 계산하기 위해 다음 두 가지를 정해야 한다.
+첫 번째, 절단 범위는 wavelet의 꼬리를 어디에서 버릴지 정해야 한다.
+두 번째, 수치 적분은 남긴 구간의 적분을 유한한 함숫값으로 근사하는 것이다.
+=== 8.1. Wavelet 꼬리의 절단
+Wavelet은 중심에서 멀어질수록 함숫값이 작아지는, 꼬리가 긴 형태이다.
+컴퓨터로는 무한한 배열을 저장할 수 없으므로 Mother wavelet의 좌표에서 $\| u \| > 8$인 부분을 버린다.
+이를 염기 좌표로 표현하면 $\| t - b \| lt.eq 8 a$이다.
+$
+  r_a = ceil.l 8 a + 1 \/ 2 ceil.r \, #h(2em) M_a = 2 r_a + 1 .
+$ <finite-kernel>
+이 때, $r_a$는 배열의 반경, $M_a$는 왼쪽 $r_a$개 + 중심 1개 + 오른쪽 $r_a$개를 합한 길이이다.
+$ceil.l v ceil.r$는 $v$ 이상인 가장 작은 정수이다.
+예를 들어, $a = 4$이면 $r_a = ceil.l 32.5 ceil.r = 33$이고 $M_a = 67$이다.
+이 때는 거리 $- 33$부터 $33$까지 저장한다.
+바깥쪽 여분 구간은 실제 적분 범위와 겹치지 않이 0이 된다.
+자연수 스케일에서는 같은 계산을 $r_a = 8 a + 1$, $M_a = 16 a + 3$으로 쓸 수 있다.
+#figure(
+  align(center)[#table(
+    columns: 3,
+    align: (auto, auto, auto),
+    table.header([스케일 $a$], [반경 $r_a$], [커널 길이 $M_a$]),
+    table.hline(),
+    [1], [9], [19],
+    [4], [33], [67],
+    [9], [73], [147],
+    [64], [513], [1027],
+  )],
+  kind: table,
+)
+한 점의 값이 작다고 하여 wavelet 꼬리 전체의 적분도 작은 것은 아니다.
+먼 구간까지 전부 더한 값의 기여를 확인해야 한다.
+$\| x \( t \) \| lt.eq 1$을 이용하면 절단 전후의 계수 차이를 아래의 값으로 제한할 수 있다.
+$
+  E_(upright(t a i l)) lt.eq frac(N \( 1 + e^(- 18) \), 4) sqrt(a) thin e^(- 32)
+$ <finite-kernel-limit-1>
+이 식을 통해 절단 오차의 상한을 확인하면, $a = 4$에서 약 $4.76 times 10^(- 15)$, $a = 9$에서 약 $7.14 times 10^(- 15)$ 이하이다.
+@finite-kernel-limit-1 를 증명하기 위해 삼각부등식을 통해서 $\| e^(6 i u) - e^(- 18) \| lt.eq 1 + e^(- 18)$이다.
+$
+  \| psi \( u \) \| lt.eq N \( 1 + e^(- 18) \) e^(- u^2 \/ 2) .
+$ <finite-kernel-limit-2>
+@finite-kernel-limit-2 로 둘 수 있고, $\| x \( t \) \| lt.eq 1$이며 양쪽 꼬리가 대칭이므로,
+$
+  E_(upright(t a i l)) & lt.eq sqrt(a) integral_(\| u \| > 8) \| psi \( u \) \| thin d u \
+                       & lt.eq 2 N \( 1 + e^(- 18) \) sqrt(a) integral_8^oo e^(- u^2 \/ 2) thin d u .
+$ <finite-kernel-limit-3>
+$u gt.eq 8$에서 $1 lt.eq u \/ 8$을 이용하면
+
+$
+  integral_8^oo e^(- u^2 \/ 2) thin d u lt.eq 1 / 8 integral_8^oo u e^(- u^2 \/ 2) thin d u = e^(- 32) / 8
+$ <finite-kernel-limit-4>
+@finite-kernel-limit-4 이다.
+=== 8.2. 수치 적분
+$\[ - 8 \, 8 \]$과 겹치는 부분만 남기고, 겹치지 않으면 적분값이 0이다.

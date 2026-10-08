@@ -17,7 +17,7 @@
 KSEQ_INIT(gzFile, gzread)
 
 #ifndef CWT_SCALES
-#define CWT_SCALES 4, 5, 6, 7, 8, 9
+#define CWT_SCALES 4, 5, 6, 7, 8, 9, 16, 32, 64, 128
 #endif
 #ifndef MAX_WAVE_SIZE
 #define MAX_WAVE_SIZE 9

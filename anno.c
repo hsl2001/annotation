@@ -18,8 +18,8 @@
 
 KSEQ_INIT(gzFile, gzread)
 
-const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9};
-enum { CWT_BLOCK = 1024, K2 = 17, K4 = 257, KNUC = 5, SPLICE_RADIUS = 6,
+const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9, 16, 32, 64, 128};
+enum { CWT_BLOCK = 1024, K2 = 17, K4 = 257, KNUC = 5, SPLICE_RADIUS = 12,
        FLANKS = SPLICE_RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
 enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
@@ -825,7 +825,7 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
 
 static void save_model(const char *path, const float *w) {
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRFD", 1, 8, file) != 8 ||
+  if (!file || fwrite("ANNOCRFE", 1, 8, file) != 8 ||
       fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
 }
@@ -834,7 +834,7 @@ static void load_model(const char *path, float *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (memcmp(magic, "ANNOCRFD", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
+  if (memcmp(magic, "ANNOCRFE", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
   if (fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   for (int feature = 0; feature < WEIGHTS; feature++)
