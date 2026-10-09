@@ -123,7 +123,7 @@ void wavelets_init(Wavelets *wavelets) {
     if (!isfinite(dilation) || dilation <= 0.0 || dilation != floor(dilation))
       anno_fail("CWT scales must be positive natural numbers");
     double radius_value = ceil(8.0 * dilation + 0.5);
-    if (radius_value > (INT_MAX - 1) / 2) anno_fail("CWT scale exceeds supported kernel size");
+    if (radius_value > (INT_MAX - 1) / 2.0) anno_fail("CWT scale exceeds supported kernel size");
     int radius = (int)radius_value;
     int width = 2 * radius + 1;
     size_t capacity = MAX_WAVE_SIZE > 0 ? (size_t)MAX_WAVE_SIZE : 1;
