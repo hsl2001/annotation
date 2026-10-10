@@ -18,7 +18,7 @@
 #define WINDOW 65536
 #define MIN_CDS 30
 #define LEARNING_RATE 0.1f
-#define DEFAULT_EPOCHS 24
+#define DEFAULT_EPOCHS 72
 
 typedef struct {
    double _Complex *kernel[WAVE_COUNT];

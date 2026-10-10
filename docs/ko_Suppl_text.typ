@@ -1,7 +1,10 @@
+#import "@preview/cetz:0.5.2"
+
 #set text(lang: "kr", font: "KoPubWorldDotum_Pro", weight: "medium", size: 10pt)
 #set page(margin: 2.0cm, paper: "a4")
 #set page(numbering: "1")
 #set math.equation(numbering: "(Eq. 1)", supplement: [Eq.])
+#set figure(numbering: "1", supplement: [Fig.])
 
 #show heading.where(level: 2): it => {
   pagebreak(weak: true)
@@ -438,6 +441,7 @@ $ <cwt-def-by-kernel>
 커널을 실제로 컴퓨터가 계산할 수 있는 유한한 수준의 배열로 계산하기 위해 다음 두 가지를 정해야 한다.
 첫 번째, 절단 범위는 wavelet의 꼬리를 어디에서 버릴지 정해야 한다.
 두 번째, 수치 적분은 남긴 구간의 적분을 유한한 함숫값으로 근사하는 것이다.
+이 때, 수치 적분은 구분구적법의 응용이다.
 === 8.1. Wavelet 꼬리의 절단
 Wavelet은 중심에서 멀어질수록 함숫값이 작아지는, 꼬리가 긴 형태이다.
 컴퓨터로는 무한한 배열을 저장할 수 없으므로 Mother wavelet의 좌표에서 $\| u \| > 8$인 부분을 버린다.
@@ -471,7 +475,8 @@ $
   E_(upright(t a i l)) lt.eq frac(N \( 1 + e^(- 18) \), 4) sqrt(a) thin e^(- 32)
 $ <finite-kernel-limit-1>
 이 식을 통해 절단 오차의 상한을 확인하면, $a = 4$에서 약 $4.76 times 10^(- 15)$, $a = 9$에서 약 $7.14 times 10^(- 15)$ 이하이다.
-@finite-kernel-limit-1 를 증명하기 위해 삼각부등식을 통해서 $\| e^(6 i u) - e^(- 18) \| lt.eq 1 + e^(- 18)$이다.
+@finite-kernel-limit-1 를 증명하기 위해 아래와 같이 쓸 수 있다.
+삼각부등식을 통해, $\| e^(6 i u) - e^(- 18) \| lt.eq 1 + e^(- 18)$이다.
 $
   \| psi \( u \) \| lt.eq N \( 1 + e^(- 18) \) e^(- u^2 \/ 2) .
 $ <finite-kernel-limit-2>
@@ -502,6 +507,88 @@ $
   integral_l^h f \( u \) thin d u
   approx q sum_(r = 1)^8 w_r \[ f \( v - q z_r \) + f \( v + q z_r \) \] .
 $ <legendre-integral-1>
+#figure(
+  cetz.canvas(length: 1cm, {
+    import cetz.draw: *
+    set-style(stroke: (thickness: 0.8pt, cap: "round"))
+    let roots = (
+      0.0950125,
+      0.2816036,
+      0.4580168,
+      0.6178762,
+      0.7554044,
+      0.8656312,
+      0.9445750,
+      0.9894009,
+    )
+    let sample-height(x) = 2 + 0.55 * calc.sin(0.8 * x) + 0.25 * calc.cos(1.7 * x)
+    let chosen = roots.at(3)
+    let left = 5 * (1 - chosen)
+    let right = 5 * (1 + chosen)
+    line((0, 0), (10.5, 0), mark: (end: "stealth"))
+    line((0, 0), (0, 3.15), mark: (end: "stealth"))
+    content((10.5, -0.08), $u$, anchor: "north-west")
+    content((-0.12, 3.15), $f(u)$, anchor: "south-east")
+    line(
+      ..(
+        for i in range(0, 101) {
+          let x = i / 10
+          ((x, sample-height(x)),)
+        }
+      ),
+      stroke: rgb("2563EB") + 1.5pt,
+    )
+    for root in roots {
+      let x-left = 5 * (1 - root)
+      let x-right = 5 * (1 + root)
+      let is-chosen = root == chosen
+      let paint = if is-chosen { rgb("EA580C") } else { rgb("94A3B8") }
+      let thickness = if is-chosen { 1.2pt } else { 0.55pt }
+      line((x-left, 0), (x-left, sample-height(x-left)), stroke: paint + thickness)
+      line((x-right, 0), (x-right, sample-height(x-right)), stroke: paint + thickness)
+      circle((x-left, sample-height(x-left)), radius: if is-chosen { 0.075 } else { 0.045 }, fill: paint, stroke: none)
+      circle(
+        (x-right, sample-height(x-right)),
+        radius: if is-chosen { 0.075 } else { 0.045 },
+        fill: paint,
+        stroke: none,
+      )
+    }
+    line((0, -0.25), (0, -0.38))
+    line((5, -0.25), (5, -0.38))
+    line((10, -0.25), (10, -0.38))
+    content((0, -0.4), $l$, anchor: "north")
+    content((5, -0.4), $v$, anchor: "north")
+    content((10, -0.4), $h$, anchor: "north")
+    line((5, -0.85), (10, -0.85), mark: (end: "stealth"))
+    line((5, -0.85), (0, -0.85), mark: (end: "stealth"))
+    content((7.5, -0.72), $q$, anchor: "south")
+    content((5, -1.05), [$q = (h-l)/2$], anchor: "north")
+    for (x, label) in (
+      (0, $-1$),
+      (left, $-z_r$),
+      (5, $0$),
+      (right, $z_r$),
+      (10, $1$),
+    ) {
+      line((x, -1.65), (x, 0), stroke: rgb("CBD5E1") + 0.55pt)
+      line((x, -1.58), (x, -1.72), stroke: rgb("334155") + 0.75pt)
+      content((x, -1.76), label, anchor: "north")
+    }
+    line((0, -1.65), (10.25, -1.65), mark: (end: "stealth"))
+    content((10.3, -1.68), $z$, anchor: "west")
+    content((5, -2.25), [기준 구간: $z in [-1,1]$], anchor: "north")
+    content(
+      (5, -2.75),
+      [
+        붉은색: $w_r [f(v-q z_r) + f(v+q z_r)]$ \
+        근사된 전체 적분: $q sum_(r=1)^8$ (각 대칭쌍의 가중합)
+      ],
+      anchor: "north",
+    )
+  }),
+  caption: [기준 구간의 르장드르 근 $plus.minus z_r$를 $u = v + q z$로 $[l,h]$에 옮긴 평가점이 주황색 점이다(@legendre-integral-1). 각 대칭쌍의 함수값을 더해 가중치 $w_r$를 곱하고, 치환에 따른 폭 계수 $q$를 마지막에 곱한다.],
+)
 #cf[
   르장드르 다항식 $P_n$은 구간 $\[ - 1 \, 1 \]$에서 낮은 차수의 다항식과 직교하는 다항식 계열이다.
   점화식으로 차수를 하나씩 높여 만들 수 있다.
@@ -509,22 +596,81 @@ $ <legendre-integral-1>
     P_0 \( z \) = 1 \, quad P_1 \( z \) = z \, quad
     P_(n + 1) \( z \) = frac(\( 2 n + 1 \) z P_n \( z \) - n P_(n - 1) \( z \), n + 1) .
   $ <legendre-integral-2>
-  직교한다는 것은 $deg(q) < n$인 다항식 $q$에 대해
+  직교한다는 것은 $deg(q) < n$인 다항식 $q$에 대해(단, $deg$는 차수)
   $integral_(- 1)^1 P_n \( z \) q \( z \) thin d z = 0$임을 뜻한다.
   예를 들어 $P_2 \( z \) = \( 3 z^2 - 1 \) \/ 2$의 근은 $plus.minus 1 \/ sqrt(3)$이다.
   16점 구적법에서는 $P_16$의 서로 다른 실근 16개를 적분 위치로 사용하며, 이 근들은 모두 $\[ - 1 \, 1 \]$ 안에 있다.
   $P_16$은 짝수 차수 다항식이므로 근은 0을 기준으로 대칭이다.
   따라서 코드처럼 $z_r$인 양의 근 8개와 가중치만 저장하고, 각 $z_r$와 $- z_r$를 한 쌍으로 평가한다.
   $w_r$는 각 근에 대응하는 가중치이며, 대칭인 두 근에는 같은 가중치가 대응한다.
-  이 위치와 가중치를 쓰는 16점 Gauss-Legendre 구적법은 31차 이하 다항식을 정확히 적분한다.
+  이 위치와 가중치를 쓰는 16점 가우스-르장드르 구적법은 31차 이하 다항식을 정확히 적분한다.
   그 이유는 31차 이하의 다항식 $p$를 $P_16$으로 나누어
   $p = q P_16 + r$로 쓰면 $deg(q) lt.eq 15$이고 $deg(r) lt.eq 15$이기 때문이다.
   직교성에 따라 $q P_16$의 적분은 0이고, 모든 구적 위치에서도 $P_16$이 0이므로
   이 항의 구적합 역시 0이다.
   남은 $r$의 적분은 가중치를 정할 때 정확히 맞춘다.
 ]
-이 연구의 구현에서는 정규화 전 켤레 Morlet 함수
+구현을 위해 정규화 전 켤레 Morlet 함수
 $f \( u \) = e^(- u^2 \/ 2) \( e^(- 6 i u) - e^(- 18) \)$를 각 위치에서 평가한다.
-`morlet_integral`은 구적합에
-$N = 1 \/ sqrt\(sqrt(pi) \(1 + e^(- 36) - 2 e^(- 27)\)\)$을 곱하고,
+$N = 1 \/ sqrt(sqrt(pi) \(1 + e^(- 36) - 2 e^(- 27)\))$을 곱하고,
 커널을 만드는 단계에서 다시 $sqrt(a)$를 곱한다.
+== 9. 커널 합의 FFT를 통한 계산
+위에서 커널을 준비하는 과정과 이후의 적분 과정을 다루었다.
+그러나, 긴 유전체 서열의 모든 위치/스케일에서 단순히 이 연산을 반복하면 계산량이 폭증한다.
+여기서는 합성곱(Convolution)이라는 연산을 FFT(Fast Fourier Transform)을 통해 가속하는 법을 다룬다.
+=== 9.1. 합성곱(Convolution)
+합성곱은 두 배열(함수 또는 벡터)에서 값의 곱을 만들어 특정 규칙으로 더하는 계산이다.
+입력을 $X = \[ 1, 2, 3 \]$, 커널을 $H = \[ 10, 20 \]$, 배열 밖의 값을 0이라고 하자. 아래와 같이 계산한다.
+#figure(
+  table(
+    columns: 3,
+    table.header([출력 인덱스 $m$], [곱해서 더하는 항], [결과]),
+    [0], [$1 times 10$], [10],
+    [1], [$2 times 10 + 1 times 20$], [40],
+    [2], [$3 times 10 + 2 times 20$], [70],
+    [3], [$3 times 20$], [60],
+  ),
+  kind: table,
+)
+합성곱 결과는 $Y = \[ 10, 40, 70, 60 \]$이다.
+각 출력에서 사용하는 입력 인덱스와 커널 인덱스의 합이 출력 인덱스 $m$이 됨을 주목하자.
+일반 신호 위치 $b$에 대해 합성곱은, @convolution-1 와 같이 작성된다.
+$
+  \( x * h \) \[ b \] = sum_n x \[ n \] h \[ b - n \]
+$ <convolution-1>
+앞서 원래 적분식 @genome-signal-integral 에서 각 염기 $n$의 적분 구간은 $n-b$에만 의존한다고 보았으므로, CWT 커널 인덱스 $n-b$는 염기 위치와 비교 위치 사이의 상대 거리를 뜻한다.
+합성곱의 커널 인덱스는 $b - n$, CWT의 커널 인덱스는 $n - b$이다. 부호가 반대이므로, 아래와 같이 커널의 좌우를 뒤집는다.
+$
+  h_a \[ j \] = k_a \[ - j \]
+$ <convolution-2>
+스케일 $a$를 고정하고, CWT의 위치 $b$에서 입력값 $x \[ n \]$에 곱해지는 커널 값은 $k_a \[ n - b \]$이다.
+반면 합성곱은 출력 위치 $b$에서 입력 $x \[ n \]$에 $h_a \[ b - n \]$을 곱한다.
+두 식의 차이는 커널 인덱스의 부호뿐이다. @convolution-2 에 따라 합성곱에 사용할 커널을 $k_a$의 좌우 반전으로 정의하면,
+$
+  \( x * h_a \) \[ b \] & = sum_n x \[ n \] h_a \[ b - n \] \
+                        & = sum_n x \[ n \] k_a \[ - \( b - n \) \] \
+                        & = sum_n x \[ n \] k_a \[ n - b \] \
+                        & = W_x \( a \, b \) .
+$
+즉, 각 입력 $x \[ n \]$과 그 입력 위치에서 $b$까지의 상대 거리 $n-b$에 해당하는 CWT 커널 값을 곱해 더하는 것과,
+좌우를 뒤집은 커널 $h_a$로 합성곱을 계산하는 것은 항별로 완전히 같다.
+따라서 스케일마다 $h_a \[ j \] = k_a \[ -j \]$를 한 번 준비하면, 합성곱의 출력 위치 $b$가 CWT의 위치 $b$에 대응하여 모든 위치의 CWT 계수를 구할 수 있다.
+입력 배열 범위 밖의 $x \[ n \]$은 0으로 두므로, 경계에서도 두 계산의 합 범위가 일치한다.
+#cf[음수 인덱스의 저장\
+  거리 $j$는 음수일 수 있으나 저장 배열은 0부터 시작한다. 
+  예를 들어, 반경 $r = 1$인 커널은 아래와 같이 저장된다. 
+  #figure(
+    table(
+      columns: 4,
+      table.header([배열 인덱스 $q$], [0], [1], [2]),
+      [거리 $j$], [$- 1$], [0], [1],
+      [저장 배열 $K$], [$k_a \[ - 1 \]$], [$k_a \[ 0 \]$], [$k_a \[ 1 \]$],
+      [뒤집은 배열 $H$], [$k_a \[ 1 \]$], [$k_a \[ 0 \]$], [$k_a \[ - 1 \]$],
+    ),
+    kind: table,
+  )
+  반경 $r$에서는 거리 $- r, dots.h, r$를 인덱스 $0, dots.h, 2 r$에 저장한다. 즉, $K \[ q \] = k_a \[ q - r \]$이고 뒤집힌 배열은 $H \[ q \] = K \[ 2 r - q \] = k_a \[ r - q \]$이다. 중심이 배열의 $r$번에 있으므로 합성곱의 결과를 분석할 때도 그만큼의 이동을 반영해야 한다. 입력 배열이 contig의 위치 $s$부터 시작한다면, 원하는 위치 $b$의 계수는 입력 안의 위치 $b -s + r$ ($r$은 커널 중심의 배열 위치)에서 읽을 수 있다. 따라서 $m = b - s + r$와 같이 쓸 수 있다. 예를 들어 입력을 위치 100부터 읽었고, 위치 105의 계수가 필요하며, 커널 반경이 9이면 $m = 105 - 100 + 9 = 14$이다. 
+  위 식 $m = b - s + r$을 증명하자면, 입력 배열의 상대 위치 $p$에 대해 $X \[ p \] = x \[ s + p \]$로 놓고 $Y \[ m \] = sum_p X \[ p \] H \[ m - p \] = sum_p x \[ s + p \] k_a \[ r - m + p \].$라 할 수 있다. 원하는 커널 인덱스가 $s + p - b$이므로 $r - m + p = s + p - b$를 풀면 $m = b - s + r$이다. 
+]
+=== 9.2. DFT를 통한 신호 패턴의 분해
+DFT(Discrete Fourier Transform; 이산 푸리에 변환)는 위치별 값을 주파수별 값으로 바꾼다. 
