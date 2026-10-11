@@ -3,7 +3,7 @@ CFLAGS = -O3 -std=c11 -Wall -Wextra -pthread
 LIBS = -lz -lm
 
 TARGET = anno
-HEADERS = anno.h crf.h lbfgs.h kseq.h ketopt.h rfft.h
+HEADERS = anno.h crf.h kseq.h ketopt.h rfft.h
 
 .PHONY: all clean
 

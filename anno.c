@@ -15,8 +15,6 @@
 
 #define RFFT_IMPLEMENTATION
 #include "rfft.h"
-#define LBFGS_IMPLEMENTATION
-#include "lbfgs.h"
 #define CRF_IMPLEMENTATION
 #include "crf.h"
 
@@ -426,7 +424,7 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
 }
 
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] [-b block] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] [-p threads] [-b block] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
                   "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
@@ -434,12 +432,12 @@ static int usage(const char *program, int status) {
 int main(int argc, char **argv) {
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int iterations = DEFAULT_ITERATIONS, threads = DEFAULT_THREADS, block = DEFAULT_BLOCK, option;
+  int epochs = DEFAULT_EPOCHS, threads = DEFAULT_THREADS, block = DEFAULT_BLOCK, option;
   ketopt_t options = KETOPT_INIT;
   while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:b:h", NULL)) >= 0) {
     if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
-    else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
+    else if (option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
     else if (option == 'p' && atoi(options.arg) > 0) threads = atoi(options.arg);
     else if (option == 'b' && atoi(options.arg) > 0) block = atoi(options.arg);
     else return usage(argv[0], option != 'h');
@@ -471,7 +469,7 @@ int main(int argc, char **argv) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, iterations, block, threads);
+    crf_train(contigs, count, weights, epochs, block, threads);
     save_model(model, weights);
   }
   puts("##gff-version 3");

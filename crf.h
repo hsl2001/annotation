@@ -19,14 +19,13 @@ enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        WEIGHTS = OFF_SPLICE + 4 * FLANKS * K2 };
 
 void crf_init(void);
-void crf_train(Contig *contigs, int count, double *weights, int iterations, int block, int threads);
+void crf_train(Contig *contigs, int count, double *weights, int epochs, int block, int threads);
 void crf_decode(const double *weights, const Contig *contig, uint8_t *path, int block);
 
 #endif
 
 #ifdef CRF_IMPLEMENTATION
 
-#include "lbfgs.h"
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -393,90 +392,118 @@ static void work_free(Work *k) {
   free(k->sites), free(k->emis), free(k->psi), free(k->alpha), free(k->beta), free(k->scale);
 }
 
-/* CRF++-style batch training: gradients of all windows are evaluated in parallel
-   at a fixed weight vector, summed, and passed to L-BFGS once per iteration. */
+/* Stochastic CRF training with AdaGrad: each mini-batch evaluates `threads`
+   windows in parallel at the current weights, then applies one per-feature
+   normalized gradient-ascent update. Online updates converge in tens of epochs
+   on gigabase genomes where batch L-BFGS stalls (each batch iteration there
+   costs several full forward-backward passes over the whole training set). */
+#define CRF_LEARNING_RATE 0.1
+
 typedef struct {
   Contig *contigs;
   int block, threads, windows;
-  long positions;
-  int skipped;
 } CrfTrain;
 
 typedef struct {
   const CrfTrain *train;
   const double *w;
+  const int *order;
   int first, last;
   double likelihood;
   long positions;
   int skipped;
+  Work work;
   double *gradient;
 } CrfWorker;
 
 static void *crf_worker(void *arg) {
   CrfWorker *worker = arg;
   const CrfTrain *train = worker->train;
-  Work work = work_alloc(train->block);
-  worker->gradient = anno_alloc(WEIGHTS, sizeof(*worker->gradient));
-  for (int window = worker->first; window < worker->last; window++) {
-    int contig = 0, index = window;
+  worker->likelihood = 0;
+  worker->positions = 0;
+  worker->skipped = 0;
+  memset(worker->gradient, 0, WEIGHTS * sizeof(*worker->gradient));
+  for (int slot = worker->first; slot < worker->last; slot++) {
+    int contig = 0, index = worker->order[slot];
     while (index >= window_count(train->contigs + contig, train->block))
       index -= window_count(train->contigs + contig++, train->block);
     Contig *c = train->contigs + contig;
     int start = index * train->block;
     int end = c->length - start < train->block ? c->length : start + train->block;
-    double score = window_gradient(worker->w, c, start, end, &work, worker->gradient);
+    double score = window_gradient(worker->w, c, start, end, &worker->work, worker->gradient);
     if (isnan(score)) { worker->skipped++; continue; }
     if (!isfinite(score)) anno_fail("Non-finite training likelihood");
     worker->likelihood += score;
     worker->positions += end - start;
   }
-  work_free(&work);
   return NULL;
 }
 
-static double crf_evaluate(const double *w, double *gradient, void *context) {
-  CrfTrain *train = context;
-  CrfWorker *workers = anno_alloc((size_t)train->threads, sizeof(*workers));
-  pthread_t *tid = anno_alloc((size_t)train->threads, sizeof(*tid));
-  memset(gradient, 0, WEIGHTS * sizeof(*gradient));
-  train->positions = 0;
-  train->skipped = 0;
-  double likelihood = 0;
-  for (int t = 0; t < train->threads; t++) {
-    workers[t] = (CrfWorker){.train = train, .w = w,
-                             .first = (int)((long)train->windows * t / train->threads),
-                             .last = (int)((long)train->windows * (t + 1) / train->threads)};
-    if (train->threads > 1 && pthread_create(tid + t, NULL, crf_worker, workers + t))
-      anno_fail("Cannot spawn training thread");
-  }
-  for (int t = 0; t < train->threads; t++) {
-    if (train->threads > 1) pthread_join(tid[t], NULL); else crf_worker(workers + t);
-    likelihood += workers[t].likelihood;
-    train->positions += workers[t].positions;
-    train->skipped += workers[t].skipped;
-    for (int f = 0; f < WEIGHTS; f++) gradient[f] -= workers[t].gradient[f]; /* minimize -loglik */
-    free(workers[t].gradient);
-  }
-  free(workers);
-  free(tid);
-  return -likelihood;
-}
-
-static void crf_progress(void *context, int iteration, double objective, size_t n, const double *gradient) {
-  const CrfTrain *train = context;
-  double norm = 0;
-  for (size_t i = 0; i < n; i++) norm += gradient[i] * gradient[i];
-  fprintf(stderr, "Iteration %d: log-likelihood/bp %.4f, |gradient| %.4g, %d windows skipped\n",
-          iteration, train->positions ? -objective / train->positions : 0.0, sqrt(norm), train->skipped);
-}
-
-void crf_train(Contig *contigs, int count, double *w, int iterations, int block, int threads) {
+void crf_train(Contig *contigs, int count, double *w, int epochs, int block, int threads) {
   CrfTrain train = {.contigs = contigs, .block = block, .threads = threads < 1 ? 1 : threads};
   for (int c = 0; c < count; c++) train.windows += window_count(contigs + c, block);
   if (!train.windows) anno_fail("No training windows");
   if (train.threads > train.windows) train.threads = train.windows;
-  if (lbfgs_minimize(WEIGHTS, w, crf_evaluate, crf_progress, &train, iterations, 10) < 0)
-    anno_fail("Out of memory");
+  int *order = anno_alloc(train.windows, sizeof(*order));
+  for (int i = 0; i < train.windows; i++) order[i] = i;
+  CrfWorker *workers = anno_alloc((size_t)train.threads, sizeof(*workers));
+  pthread_t *tid = anno_alloc((size_t)train.threads, sizeof(*tid));
+  for (int t = 0; t < train.threads; t++)
+    workers[t] = (CrfWorker){.train = &train, .order = order,
+                             .work = work_alloc(block),
+                             .gradient = anno_alloc(WEIGHTS, sizeof(*workers->gradient))};
+  double *gradient = anno_alloc(WEIGHTS, sizeof(*gradient));
+  double *history = anno_alloc(WEIGHTS, sizeof(*history));
+  double *average = anno_alloc(WEIGHTS, sizeof(*average));
+  long averaged = 0;
+  srand(1);
+  for (int epoch = 1; epoch <= epochs; epoch++) {
+    for (int i = train.windows - 1; i > 0; i--) {
+      int j = rand() % (i + 1), t = order[i];
+      order[i] = order[j], order[j] = t;
+    }
+    double likelihood = 0;
+    long positions = 0;
+    int skipped = 0;
+    for (int base = 0; base < train.windows; base += train.threads) {
+      int active = train.windows - base < train.threads ? train.windows - base : train.threads;
+      for (int t = 0; t < active; t++) {
+        workers[t].w = w;
+        workers[t].first = base + t;
+        workers[t].last = base + t + 1;
+        if (train.threads > 1 && pthread_create(tid + t, NULL, crf_worker, workers + t))
+          anno_fail("Cannot spawn training thread");
+      }
+      memset(gradient, 0, WEIGHTS * sizeof(*gradient));
+      long batch_positions = 0;
+      for (int t = 0; t < active; t++) {
+        if (train.threads > 1) pthread_join(tid[t], NULL); else crf_worker(workers + t);
+        likelihood += workers[t].likelihood;
+        positions += workers[t].positions;
+        skipped += workers[t].skipped;
+        batch_positions += workers[t].positions;
+        for (int f = 0; f < WEIGHTS; f++) gradient[f] += workers[t].gradient[f];
+      }
+      if (!batch_positions) continue;
+      for (int f = 0; f < WEIGHTS; f++) {
+        if (!isfinite(gradient[f])) anno_fail("Non-finite training gradient");
+        double normalized = gradient[f] / batch_positions;
+        if (!normalized) continue;
+        history[f] += normalized * normalized;
+        w[f] += CRF_LEARNING_RATE * normalized / sqrt(history[f] + 1e-8);
+        if (!isfinite(w[f])) anno_fail("Non-finite training weight");
+      }
+      if (epoch == epochs) {
+        for (int f = 0; f < WEIGHTS; f++) average[f] += w[f];
+        averaged++;
+      }
+    }
+    fprintf(stderr, "Epoch %d: %d windows trained, %d skipped, log-likelihood/bp %.4f\n",
+            epoch, train.windows - skipped, skipped, positions ? likelihood / positions : 0.0);
+  }
+  for (int f = 0; averaged && f < WEIGHTS; f++) w[f] = average[f] / averaged;
+  for (int t = 0; t < train.threads; t++) work_free(&workers[t].work), free(workers[t].gradient);
+  free(order), free(workers), free(tid), free(gradient), free(history), free(average);
 }
 
 static void viterbi_step(const double *weights, const Contig *contig, int position,
