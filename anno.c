@@ -131,22 +131,19 @@ static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
   return size;
 }
 
-void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int start, int count, double *features) {
-  if (count <= 0) return;
-  memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
-  if (start >= length || (long)start + count <= 0) return;
-
-  long context_start = (long)start - wavelets->max_width / 2;
-  long context_end = (long)start + count + wavelets->max_width / 2;
-  if (context_start < 0) context_start = 0;
-  if (context_end > length) context_end = length;
-  size_t signal_length = (size_t)(context_end - context_start);
+static void cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
+                          double *features, float *complex_values, float *powers) {
+  if (length <= 0) return;
+  if (features && (size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*features)))
+    anno_fail("CWT feature size overflow");
+  if (features) memset(features, 0, (size_t)length * CWT_CHANNELS * sizeof(*features));
+  size_t signal_length = (size_t)length;
   size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
   double complex *signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
   double complex *kernel_fft = anno_alloc(fft_size, sizeof(*kernel_fft));
 
   for (size_t index = 0; index < signal_length; index++)
-    signal_fft[index] = base_signal(sequence[context_start + (long)index]);
+    signal_fft[index] = base_signal(sequence[index]);
   fft_transform(signal_fft, fft_size, false);
 
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
@@ -158,13 +155,14 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int
     for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
     fft_transform(kernel_fft, fft_size, true);
 
-    for (int offset = 0; offset < count; offset++) {
-      long position = (long)start + offset;
-      if (position < 0 || position >= length) continue;
-      size_t convolution_index = (size_t)(position - context_start) + width - 1 - width / 2;
+    for (int position = 0; position < length; position++) {
+      size_t convolution_index = (size_t)position + width - 1 - width / 2;
       double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale] = creal(coefficient);
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale + 1] = cimag(coefficient);
+      double real = creal(coefficient), imaginary = cimag(coefficient);
+      size_t feature = (size_t)position * CWT_CHANNELS + 2 * scale;
+      if (features) features[feature] = real, features[feature + 1] = imaginary;
+      if (complex_values) complex_values[feature] = (float)real, complex_values[feature + 1] = (float)imaginary;
+      if (powers) powers[(size_t)position * WAVE_COUNT + scale] = (float)(real * real + imaginary * imaginary);
     }
   }
 
@@ -172,25 +170,13 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, int
   free(kernel_fft);
 }
 
-static double cwt_power(const double *coefficient) {
-  return coefficient[0] * coefficient[0] + coefficient[1] * coefficient[1];
+void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, double *features) {
+  cwt_transform(wavelets, sequence, length, features, NULL, NULL);
 }
 
-static float *cwt_powers(const Wavelets *wavelets, const char *sequence, int length, int block) {
+static float *cwt_powers(const Wavelets *wavelets, const char *sequence, int length) {
   float *powers = anno_alloc((size_t)length, WAVE_COUNT * sizeof(*powers));
-  double *features = anno_alloc((size_t)block * CWT_CHANNELS, sizeof(*features));
-  for (int start = 0; start < length; start += block) {
-    int count = length - start < block ? length - start : block;
-    cwt_extract(wavelets, sequence, length, start, count, features);
-    for (int offset = 0; offset < count; offset++) {
-      int position = start + offset;
-      const double *coefficient = features + (size_t)offset * CWT_CHANNELS;
-      for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        powers[(size_t)position * WAVE_COUNT + scale] = (float)cwt_power(coefficient + 2 * scale);
-      }
-    }
-  }
-  free(features);
+  cwt_transform(wavelets, sequence, length, NULL, NULL, powers);
   return powers;
 }
 
@@ -385,7 +371,7 @@ static void write_floats(FILE *stream, const float *values, size_t count) {
 }
 
 /* Raw complex64 CWT export for plot_cwt.py: plus strand rows then reverse-complement rows. */
-static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *directory, int block) {
+static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *directory) {
   int count;
   Contig *contigs = read_fasta(fasta, &count);
   if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
@@ -393,12 +379,11 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   fputs("# anno-cwt-v2\n# scales\t", index);
   for (int scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
-  double *features = anno_alloc((size_t)block * CWT_CHANNELS, sizeof(*features));
-  float *values = anno_alloc((size_t)block * CWT_CHANNELS, sizeof(*values));
   size_t rows = 0;
   for (int c = 0; c < count; c++) {
     Contig *g = contigs + c;
     fprintf(index, "%s\t%d\t%zu\t%zu\n", g->name, g->length, rows, rows + g->length);
+    float *values = anno_alloc((size_t)g->length, CWT_CHANNELS * sizeof(*values));
     char *reverse = anno_alloc((size_t)g->length + 1, 1);
     for (int i = 0; i < g->length; i++) {
       int base = base_index(g->seq[g->length - 1 - i]);
@@ -406,25 +391,21 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : g->seq;
-      for (int start = 0; start < g->length; start += block) {
-        int n = g->length - start < block ? g->length - start : block;
-        cwt_extract(wavelets, bases, g->length, start, n, features);
-        for (size_t v = 0; v < (size_t)n * CWT_CHANNELS; v++) values[v] = (float)features[v];
-        write_floats(matrix, values, (size_t)n * CWT_CHANNELS);
-      }
+      cwt_transform(wavelets, bases, g->length, NULL, values, NULL);
+      size_t count = (size_t)g->length * CWT_CHANNELS;
+      write_floats(matrix, values, count);
     }
     free(reverse);
+    free(values);
     rows += 2 * (size_t)g->length;
   }
   if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
   free_contigs(contigs, count);
-  free(features);
-  free(values);
   fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
 }
 
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] [-p threads] [-b block] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
                   "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
@@ -432,14 +413,12 @@ static int usage(const char *program, int status) {
 int main(int argc, char **argv) {
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int epochs = DEFAULT_EPOCHS, threads = DEFAULT_THREADS, block = DEFAULT_BLOCK, option;
+  int epochs = DEFAULT_EPOCHS, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:b:h", NULL)) >= 0) {
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:h", NULL)) >= 0) {
     if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
     else if (option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
-    else if (option == 'p' && atoi(options.arg) > 0) threads = atoi(options.arg);
-    else if (option == 'b' && atoi(options.arg) > 0) block = atoi(options.arg);
     else return usage(argv[0], option != 'h');
   }
   int rest = argc - options.ind;
@@ -451,7 +430,7 @@ int main(int argc, char **argv) {
   Wavelets wavelets;
   wavelets_init(&wavelets);
   if (export) {
-    export_cwt(&wavelets, args[1], args[2], block);
+    export_cwt(&wavelets, args[1], args[2]);
     wavelets_free(&wavelets);
     return 0;
   }
@@ -464,19 +443,19 @@ int main(int argc, char **argv) {
   int count;
   Contig *contigs = read_fasta(args[0], &count);
   for (int c = 0; c < count; c++)
-    contigs[c].cwt_power = cwt_powers(&wavelets, contigs[c].seq, contigs[c].length, block);
+    contigs[c].cwt_power = cwt_powers(&wavelets, contigs[c].seq, contigs[c].length);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, epochs, block, threads);
+    crf_train(contigs, count, weights, epochs);
     save_model(model, weights);
   }
   puts("##gff-version 3");
   unsigned long genes = 0;
   for (int c = 0; c < count; c++) {
     uint8_t *path = anno_alloc(contigs[c].length, 1);
-    crf_decode(weights, contigs + c, path, block);
+    crf_decode(weights, contigs + c, path);
     write_gff(contigs + c, path, &genes);
     free(path);
     fprintf(stderr, "Annotated %s: %d bp\n", contigs[c].name, contigs[c].length);

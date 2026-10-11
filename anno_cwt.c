@@ -128,22 +128,15 @@ static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
 }
 
 static void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                        int start, int count, double *features) {
-  if (count <= 0) return;
-  memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
-  if (start >= length || (long)start + count <= 0) return;
-
-  long context_start = (long)start - wavelets->max_width / 2;
-  long context_end = (long)start + count + wavelets->max_width / 2;
-  if (context_start < 0) context_start = 0;
-  if (context_end > length) context_end = length;
-  size_t signal_length = (size_t)(context_end - context_start);
+                        float *features) {
+  if (length <= 0) return;
+  size_t signal_length = (size_t)length;
   size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
   double complex *signal_fft = alloc(fft_size, sizeof(*signal_fft));
   double complex *kernel_fft = alloc(fft_size, sizeof(*kernel_fft));
 
   for (size_t index = 0; index < signal_length; index++)
-    signal_fft[index] = base_signal(sequence[context_start + (long)index]);
+    signal_fft[index] = base_signal(sequence[index]);
   fft_transform(signal_fft, fft_size, false);
 
   for (size_t scale = 0; scale < WAVE_COUNT; scale++) {
@@ -155,13 +148,11 @@ static void cwt_extract(const Wavelets *wavelets, const char *sequence, int leng
     for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
     fft_transform(kernel_fft, fft_size, true);
 
-    for (int offset = 0; offset < count; offset++) {
-      long position = (long)start + offset;
-      if (position < 0 || position >= length) continue;
-      size_t convolution_index = (size_t)(position - context_start) + width - 1 - width / 2;
+    for (int position = 0; position < length; position++) {
+      size_t convolution_index = (size_t)position + width - 1 - width / 2;
       double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale] = creal(coefficient);
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale + 1] = cimag(coefficient);
+      features[(size_t)position * CWT_CHANNELS + 2 * scale] = (float)creal(coefficient);
+      features[(size_t)position * CWT_CHANNELS + 2 * scale + 1] = (float)cimag(coefficient);
     }
   }
 
@@ -177,7 +168,7 @@ static Contig *read_fasta(const char *path, int *count) {
   *count = 0;
   while (kseq_read(record) >= 0) {
     if (!record->seq.l) continue;
-    if (record->seq.l > INT_MAX - 1024) fail("Contig too long: %s", record->name.s);
+    if (record->seq.l > INT_MAX) fail("Contig too long: %s", record->name.s);
     Contig *grown = realloc(contigs, (size_t)(*count + 1) * sizeof(*contigs));
     if (!grown) fail("Out of memory");
     contigs = grown;
@@ -226,12 +217,11 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   fputs("# anno-cwt-v2\n# scales\t", index);
   for (size_t scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%.17g", scale ? "," : "", wave_scales[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
-  double *features = alloc(1024 * CWT_CHANNELS, sizeof(*features));
-  float *values = alloc(1024 * CWT_CHANNELS, sizeof(*values));
   size_t rows = 0;
   for (int contig_index = 0; contig_index < count; contig_index++) {
     Contig *contig = contigs + contig_index;
     fprintf(index, "%s\t%d\t%zu\t%zu\n", contig->name, contig->length, rows, rows + contig->length);
+    float *values = alloc((size_t)contig->length, CWT_CHANNELS * sizeof(*values));
     char *reverse = alloc((size_t)contig->length + 1, 1);
     for (int position = 0; position < contig->length; position++) {
       int base = base_index(contig->seq[contig->length - 1 - position]);
@@ -239,14 +229,12 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : contig->seq;
-      for (int start = 0; start < contig->length; start += 1024) {
-        int length = contig->length - start < 1024 ? contig->length - start : 1024;
-        cwt_extract(wavelets, bases, contig->length, start, length, features);
-        for (size_t value = 0; value < (size_t)length * CWT_CHANNELS; value++) values[value] = (float)features[value];
-        write_floats(matrix, values, (size_t)length * CWT_CHANNELS);
-      }
+      cwt_extract(wavelets, bases, contig->length, values);
+      size_t feature_count = (size_t)contig->length * CWT_CHANNELS;
+      write_floats(matrix, values, feature_count);
     }
     free(reverse);
+    free(values);
     rows += 2 * (size_t)contig->length;
   }
   if (fclose(matrix)) fail("Cannot finish CWT matrix");
@@ -256,8 +244,6 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     free(contigs[contig_index].seq);
   }
   free(contigs);
-  free(features);
-  free(values);
   fprintf(stderr, "Saved %zu rows x %zu complex64 scales\n", rows, WAVE_COUNT);
 }
 

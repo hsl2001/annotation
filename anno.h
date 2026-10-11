@@ -12,9 +12,7 @@
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
 #define MIN_CDS 30
-#define DEFAULT_EPOCHS 72
-#define DEFAULT_THREADS 1
-#define DEFAULT_BLOCK 65536
+#define DEFAULT_EPOCHS 24
 
 typedef struct {
    double _Complex *kernel[WAVE_COUNT];
@@ -32,8 +30,7 @@ void anno_fail(const char *format, ...);
 void *anno_alloc(size_t count, size_t size);
 int base_index(char base);
 void wavelets_init(Wavelets *wavelets);
-void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                 int start, int count, double *features);
+void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, double *features);
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);

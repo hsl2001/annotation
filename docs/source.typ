@@ -934,7 +934,7 @@ CWT 계산의 전체 흐름을 다시 연결하면 다음과 같음.
 + $1 \/ P$ 정규화를 포함한 역 DFT로 위치 좌표로 돌아옴.
 + 원하는 위치 $b$마다 합성곱 배열의 $b - s + r$번 값을 읽음.
 
-같은 입력 청크의 FFT는 여러 스케일에서 재사용할 수 있음.
+같은 contig 입력의 FFT는 여러 스케일에서 재사용할 수 있음.
 스케일마다 바뀌는 것은 커널과 그 FFT임.
 
 === 9.8 FFT에서 길이를 절반으로 나누는 이유
@@ -949,25 +949,10 @@ $ hat(X) \[ k \] = E \[ k \] + zeta^k O \[ k \] \, #h(1em) hat(X) \[ k + P \/ 2 
 - 절반 길이의 두 DFT를 재사용해 전체 $P$개 값을 만듦.
 - 각 분할 단계의 결합 연산량은 $P$에 비례하고 단계 수는 $log_2 P$임. 따라서 전체는 $P log_2 P$에 비례함.
 
-=== 9.9 청크 경계와 contig 경계의 구분
-<청크-경계와-contig-경계는-다릅니다>
-- 긴 출력 배열을 묶음으로 나누면 중간 계산의 메모리를 줄일 수 있음. 이 묶음을 청크(chunk)라고 부름.
-- 청크는 계산 단위이지 새로운 contig가 아님.
-- 청크 끝의 계수에도 이웃 염기가 필요함. 따라서 양쪽으로 최대 커널 반경만큼 더 읽음.
-
-e.g.) 출력할 위치가 $1000, dots.h, 2023$이고 최대 반경이 73이면,
-입력은 위치 927부터 2096까지 필요함. \
-추가로 읽은 부분은 주변 문맥이며, 이번 청크에서는 원래 요청한 1024개 위치의 결과만 저장함.
-contig 밖으로 나간 부분에는 실제 염기가 없으므로 0을 사용함.
-
-청크 시작을 $s_0$, 출력 개수를 $B$, 최대 반경을 $R$이라 하면 입력 문맥은
-
-$ \[ s_0 - R \, #h(0em) s_0 + B + R \) $
-
-과 contig 구간의 교집합임.
-이 문맥이 있어야 청크 경계에서도 전체 신호를 한 번에 계산한 것과 같은 결과를 얻음.
-- 청크 경계: 계산 편의를 위해 나눈 경계. 그 밖의 신호도 존재하므로 주변 염기를 읽음.
-- contig 경계: 입력 서열 자체의 경계. 신호 정의에 따라 그 밖은 0으로 처리함.
+=== 9.9 contig 전체와 유한 신호 경계
+- CWT는 각 contig 전체를 입력으로 한 번에 계산함. contig 사이의 염기는 연결하지 않음.
+- FFT 크기를 선형 합성곱이 되도록 잡고, contig 밖은 0인 유한 신호로 취급함.
+- 따라서 contig 끝의 계수에는 contig 안의 염기만 기여하고, 별도의 청크 경계는 없음.
 
 == 10. 출력 행렬과 결과 해석
 <설정과-출력>
@@ -1272,30 +1257,23 @@ static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
 ```
 
 === 11.7 CWT 계수 계산
-- `context_start` = $s$, `position` = $b$, `fft_size` = $P$임.
-- 9.9절처럼 청크 양쪽으로 최대 반경의 문맥을 읽음. 실제 청크 크기는 11.9절에서 1024로 지정함.
+- `signal_length`는 전체 contig 길이, `fft_size`는 $P$임.
+- contig 전체를 FFT하고 각 위치의 선형 합성곱 계수를 계산함.
 - `alloc`이 0 초기화하므로 입력 뒤의 남은 공간은 zero-padding이 됨.
-- `width - 1 - width/2` = $r$임. 9.2절의 출력 위치 $b - s + r$를 읽는 부분임.
+- `width - 1 - width/2` = $r$임. 위치 $b$의 합성곱 인덱스 $b + r$를 읽음.
 - `features`: 위치별로 스케일 순서의 실수부·허수부를 번갈아 저장함.
 
 ```c
 static void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                        int start, int count, double *features) {
-  if (count <= 0) return;
-  memset(features, 0, (size_t)count * CWT_CHANNELS * sizeof(double));
-  if (start >= length || (long)start + count <= 0) return;
-
-  long context_start = (long)start - wavelets->max_width / 2;
-  long context_end = (long)start + count + wavelets->max_width / 2;
-  if (context_start < 0) context_start = 0;
-  if (context_end > length) context_end = length;
-  size_t signal_length = (size_t)(context_end - context_start);
+                        float *features) {
+  if (length <= 0) return;
+  size_t signal_length = (size_t)length;
   size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
   double complex *signal_fft = alloc(fft_size, sizeof(*signal_fft));
   double complex *kernel_fft = alloc(fft_size, sizeof(*kernel_fft));
 
   for (size_t index = 0; index < signal_length; index++)
-    signal_fft[index] = base_signal(sequence[context_start + (long)index]);
+    signal_fft[index] = base_signal(sequence[index]);
   fft_transform(signal_fft, fft_size, false);
 
   for (size_t scale = 0; scale < WAVE_COUNT; scale++) {
@@ -1307,13 +1285,11 @@ static void cwt_extract(const Wavelets *wavelets, const char *sequence, int leng
     for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
     fft_transform(kernel_fft, fft_size, true);
 
-    for (int offset = 0; offset < count; offset++) {
-      long position = (long)start + offset;
-      if (position < 0 || position >= length) continue;
-      size_t convolution_index = (size_t)(position - context_start) + width - 1 - width / 2;
+    for (int position = 0; position < length; position++) {
+      size_t convolution_index = (size_t)position + width - 1 - width / 2;
       double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale] = creal(coefficient);
-      features[(size_t)offset * CWT_CHANNELS + 2 * scale + 1] = cimag(coefficient);
+      features[(size_t)position * CWT_CHANNELS + 2 * scale] = (float)creal(coefficient);
+      features[(size_t)position * CWT_CHANNELS + 2 * scale + 1] = (float)cimag(coefficient);
     }
   }
 
@@ -1325,7 +1301,7 @@ static void cwt_extract(const Wavelets *wavelets, const char *sequence, int leng
 === 11.8 FASTA 입력과 바이너리 출력
 - `kseq.h`로 FASTA를 파싱함. zlib을 통해 일반 파일·gzip 파일을 읽음.
 - 입력 경로 `-`: 표준 입력.
-- 모든 contig를 메모리에 올림. CWT가 청크 단위라고 입력도 스트리밍하는 것은 아님.
+- 모든 contig를 메모리에 올리고, 한 contig씩 전체 CWT 계수와 FFT 작업 배열을 할당함.
 
 ```c
 static Contig *read_fasta(const char *path, int *count) {
@@ -1336,7 +1312,7 @@ static Contig *read_fasta(const char *path, int *count) {
   *count = 0;
   while (kseq_read(record) >= 0) {
     if (!record->seq.l) continue;
-    if (record->seq.l > INT_MAX - 1024) fail("Contig too long: %s", record->name.s);
+    if (record->seq.l > INT_MAX) fail("Contig too long: %s", record->name.s);
     Contig *grown = realloc(contigs, (size_t)(*count + 1) * sizeof(*contigs));
     if (!grown) fail("Out of memory");
     contigs = grown;
@@ -1381,9 +1357,9 @@ static void write_floats(FILE *stream, const float *values, size_t count) {
 - 실행 환경과 관계없이 little-endian으로 기록함. 읽는 쪽의 complex64 해석 규칙을 고정한 것임.
 
 === 11.9 행렬 저장
-- 배정밀도 `features` → 32비트 실수 배열 `values` → 파일 순서임.
+- 배정밀도 FFT 계수를 binary32 `values`로 변환해 complex64 파일에 기록함.
 - complex64: 실수부·허수부가 각각 32비트인 복소 형식임. 여기서 정밀도 변환의 반올림이 추가됨.
-- 두 가닥을 각각 1024개 위치씩 계산함. 마지막 청크는 남은 길이만 사용함.
+- 각 contig의 plus와 reverse-complement 가닥을 각각 전체 입력으로 한 번에 계산함.
 - `read_fasta`, `create_in`, `write_floats`는 11.8절에 정의함.
 
 ```c
@@ -1396,12 +1372,11 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   fputs("# anno-cwt-v2\n# scales\t", index);
   for (size_t scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%.17g", scale ? "," : "", wave_scales[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
-  double *features = alloc(1024 * CWT_CHANNELS, sizeof(*features));
-  float *values = alloc(1024 * CWT_CHANNELS, sizeof(*values));
   size_t rows = 0;
   for (int contig_index = 0; contig_index < count; contig_index++) {
     Contig *contig = contigs + contig_index;
     fprintf(index, "%s\t%d\t%zu\t%zu\n", contig->name, contig->length, rows, rows + contig->length);
+    float *values = alloc((size_t)contig->length, CWT_CHANNELS * sizeof(*values));
     char *reverse = alloc((size_t)contig->length + 1, 1);
     for (int position = 0; position < contig->length; position++) {
       int base = base_index(contig->seq[contig->length - 1 - position]);
@@ -1409,14 +1384,12 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : contig->seq;
-      for (int start = 0; start < contig->length; start += 1024) {
-        int length = contig->length - start < 1024 ? contig->length - start : 1024;
-        cwt_extract(wavelets, bases, contig->length, start, length, features);
-        for (size_t value = 0; value < (size_t)length * CWT_CHANNELS; value++) values[value] = (float)features[value];
-        write_floats(matrix, values, (size_t)length * CWT_CHANNELS);
-      }
+      cwt_extract(wavelets, bases, contig->length, values);
+      size_t feature_count = (size_t)contig->length * CWT_CHANNELS;
+      write_floats(matrix, values, feature_count);
     }
     free(reverse);
+    free(values);
     rows += 2 * (size_t)contig->length;
   }
   if (fclose(matrix)) fail("Cannot finish CWT matrix");
@@ -1426,8 +1399,6 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     free(contigs[contig_index].seq);
   }
   free(contigs);
-  free(features);
-  free(values);
   fprintf(stderr, "Saved %zu rows x %zu complex64 scales\n", rows, WAVE_COUNT);
 }
 ```
@@ -1435,8 +1406,8 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
 === 11.10 실행 순서와 함수 연결
 실행 순서는 다음과 같음.
 + `wavelets_init`: 스케일별 구간 적분 커널 생성.
-+ `export_cwt`: FASTA 입력, 역상보 서열 생성, 양쪽 가닥을 청크 단위로 처리.
-+ `cwt_extract`: 주변 문맥을 포함한 FFT 합성곱으로 계수 계산.
++ `export_cwt`: FASTA 입력, 역상보 서열 생성, 양쪽 가닥의 contig 전체를 처리.
++ `cwt_extract`: contig 전체를 입력으로 한 FFT 합성곱으로 계수 계산.
 + `write_floats`: complex64 형식으로 변환된 값을 파일에 기록.
 + 계산이 끝나면 입력 배열과 커널 메모리 해제.
 
@@ -1511,7 +1482,7 @@ power 구간·극대·극소 특성은 모든 실험에서 유지됨.
 
 구간 경계와 특성 배치는 고정된 모델 스키마에 속함. 새로운 정답 통계는
 Col에서 계산하지 않으며, CRF 가중치는 Nip의 정답으로만 학습함.
-원시 복소 계수를 염색체 전체에 상주시켜 저장하지 않고, 청크 계산 결과를
+원시 복소 계수를 염색체 전체에 상주시켜 저장하지 않고, contig 전체를 한 번에 계산한 결과를
 가닥별 64비트 CWT 코드와 32비트 서열 문맥 코드로 압축함.
 압축은 모델 입력 특성의 표현이며, 위에서 유도한 CWT 계산의 축소가 아님.
 
