@@ -5,6 +5,8 @@
 #include "lbfgs.h"
 #include <stdint.h>
 
+#define CRF_L2_C2 1.0
+
 /* Linear-chain CRF decoded jointly for both strands.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
@@ -300,7 +302,8 @@ static double forward_step(const double *w, const Contig *c, int position,
                                      previous[step->previous] + psi[step->transition]);
     }
   }
-  if (position == c->length - 1)
+  if (position == c->length - 1 &&
+      c->offset + c->length == c->genome_length)
     for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
       if (!terminal_allowed(hidden)) alpha[hidden] = -INFINITY;
 
@@ -371,8 +374,9 @@ static double contig_gradient(const double *w, const Contig *c, Work *k, double 
 
   double likelihood = mass - logz;
   double beta[HIDDEN_STATES];
+  int reaches_contig_end = c->offset + c->length == c->genome_length;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    beta[hidden] = terminal_allowed(hidden) ? 0 : -INFINITY;
+    beta[hidden] = !reaches_contig_end || terminal_allowed(hidden) ? 0 : -INFINITY;
 
   for (int block_start = ((c->length - 1) / block_size) * block_size;
        block_start >= 0;) {
@@ -535,8 +539,6 @@ typedef struct {
   double likelihood;
   size_t positions, skipped;
 } CrfObjective;
-
-#define CRF_L2_C2 1.0
 
 static double crf_objective(const double *w, double *gradient, void *context) {
   CrfObjective *objective = context;
