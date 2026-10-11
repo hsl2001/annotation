@@ -11,14 +11,10 @@
 #endif
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
-/* Linear-chain CRF decoded jointly for both strands.
-   0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
-   next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
-#define STATES 13
-#define WINDOW 65536
 #define MIN_CDS 30
-#define LEARNING_RATE 0.1f
-#define DEFAULT_EPOCHS 72
+#define DEFAULT_ITERATIONS 12
+#define DEFAULT_THREADS 1
+#define DEFAULT_BLOCK 65536
 
 typedef struct {
    double _Complex *kernel[WAVE_COUNT];
@@ -40,8 +36,6 @@ void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
                  int start, int count, double *features);
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
-void crf_train(Contig *contigs, int count, float *weights, int epochs);
-void crf_decode(const float *weights, const Contig *contig, uint8_t *path);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
 
 #endif
