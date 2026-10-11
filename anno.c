@@ -1,3 +1,6 @@
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 #define _POSIX_C_SOURCE 200809L
 #include "anno.h"
 #include "kseq.h"
@@ -12,6 +15,9 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 #include <zlib.h>
 
@@ -329,9 +335,17 @@ static int usage(const char *program, int status, int cwt_only) {
 }
 
 static int default_threads(void) {
+#ifdef __APPLE__
+  int count;
+  size_t count_size = sizeof(count);
+  if (sysctlbyname("hw.logicalcpu", &count, &count_size, NULL, 0) != 0 || count < 1)
+    anno_fail("Cannot determine online CPU count");
+  return count;
+#else
   long count = sysconf(_SC_NPROCESSORS_ONLN);
   if (count < 1 || count > INT_MAX) anno_fail("Cannot determine online CPU count");
   return (int)count;
+#endif
 }
 
 static int parse_threads(const char *value) {
