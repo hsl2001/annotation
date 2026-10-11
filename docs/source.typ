@@ -950,9 +950,12 @@ $ hat(X) \[ k \] = E \[ k \] + zeta^k O \[ k \] \, #h(1em) hat(X) \[ k + P \/ 2 
 - 각 분할 단계의 결합 연산량은 $P$에 비례하고 단계 수는 $log_2 P$임. 따라서 전체는 $P log_2 P$에 비례함.
 
 === 9.9 contig 전체와 유한 신호 경계
-- CWT는 각 contig 전체를 입력으로 한 번에 계산함. contig 사이의 염기는 연결하지 않음.
-- FFT 크기를 선형 합성곱이 되도록 잡고, contig 밖은 0인 유한 신호로 취급함.
-- 따라서 contig 끝의 계수에는 contig 안의 염기만 기여하고, 별도의 청크 경계는 없음.
+- contig를 `CWT_WINDOW_SIZE` 출력 구간으로 나누고, 각 구간은 scale별 kernel 반경만큼
+  contig 안쪽 입력 halo를 붙여 계산함. contig 사이의 염기는 연결하지 않음.
+- 반경은 `wavelets->widths[scale] / 2`임. 입력 구간 바깥의 contig 끝에서는 0 padding을 적용함.
+  halo 계수는 버리고 core window 위치만 기록하므로 window 경계가 결과에 영향을 주지 않음.
+- 각 `(window, scale)` 조합은 독립 작업으로 실행함. 따라서 contig 전체의 경계 정의를 유지하면서
+  window와 scale 양쪽으로 병렬화함.
 
 == 10. 출력 행렬과 결과 해석
 <설정과-출력>
@@ -1037,7 +1040,7 @@ c.f.) 해석의 한계.
 == 11. C 구현과 실행
 <구현과-수식의-대응>
 - 앞 절까지는 정의·유도·수치 계산·결과 해석을 다뤘음. 여기서는 실제 구현을 한곳에 모음.
-- 아래 9개 C 코드 블록은 현재 `anno_cwt.c` 전체를 원래 소스 순서로 나눈 것임.
+- CWT 수치 구현은 `cwt.h`에 공통으로 두고, `anno.c`와 `anno_cwt.c`가 함께 사용함.
 - 실행 설정을 먼저 확인하고, 공통 정의 → 인코딩 → 구간 적분 → 커널 → FFT → 입출력 순서로 읽음.
 
 #figure(
@@ -1046,33 +1049,52 @@ c.f.) 해석의 한계.
     align: (auto, auto),
     table.header([구현 요소], [수학적 역할]),
     table.hline(),
-    [`base_signal`], [염기를 $x \[ n \]$으로 변환],
-    [`morlet_integral`],
+    [`cwt_base_signal`], [염기를 $x \[ n \]$으로 변환],
+    [`cwt_morlet_integral`],
     [$overline(psi \( u \))$의 구간 적분, 꼬리
       절단, 수치 구적],
     [`wavelets_init`],
     [각 스케일의 $k_a \[ j \]$, 반경과 커널 길이
       계산],
     [`convolution_fft_size`], [선형 합성곱에 충분한 FFT 길이 선택],
-    [`cwt_extract`],
-    [역순 커널과 입력의 FFT 곱, 역변환, 위치 이동,
-      $1 \/ P$ 적용],
+    [`cwt_worker`],
+    [window·scale별 선형 합성곱 작업],
     [`export_cwt`], [두 가닥의 정수 위치 계수를 complex64로 저장],
   )],
   kind: table,
 )
 
 === 11.1 빌드·실행 설정과 출력 형식
-- `wave_scales`는 `CWT_SCALES`로 설정함. 기본값은 `4,5,6,7,8,9`임.
+- `anno.h`의 `CWT_SCALES`가 `anno`와 `anno_cwt`의 공통 스케일을 정함.
+  기본값은 `4,5,6,7,8,9,16,32,64,128`임.
+- `CWT_WINDOW_SIZE`는 CWT 출력 window 크기이며 현재 `1024` bp임. halo는 여기에 포함되지 않음.
 - 스케일은 양의 자연수임. 개수·순서를 지정할 수 있고 중복도 허용함.
 - 커널 크기는 8.1절의 반경으로 정해짐. 지원 범위와 메모리 용량 안에서 선택해야 함.
+- `-p threads`는 CWT `(window, scale)` 작업과 CRF window 작업의 worker 수를 제한하며,
+  생략하면 온라인 CPU 수를 사용함.
+- CRF 학습은 contig를 약 1,000,000 bp 단위 window로 나누고, 각 window를 학습 instance로 사용함.
+  경계가 연속된 비영(非零) label run 안에 놓이면 그 run의 앞이나 뒤로 옮겨 잘리지 않게 함.
+  하나의 run이 목표 크기보다 크면 해당 window도 더 커질 수 있음.
+- 각 L-BFGS 평가에서 모든 window의 observed-minus-expected gradient를 worker별로 계산하고,
+  thread-local 결과를 합산함. 최적화 목적함수는 window log-likelihood 합의 음수에
+  `c2 * sum(w^2)` (`c2=1`)을 더한 값이며 gradient에는 `2*c2*w`를 더함. 이는 CRFsuite
+  기본 L2 목적함수임.
+- L-BFGS는 correction memory 6, 초기 step `1/||g||`, More-Thuente line search
+  (`ftol=1e-4`, `gtol=0.9`, 최대 20회), 상대 gradient 기준 `1e-5`, 10회 간격의 목적함수
+  변화 기준 `1e-5`를 사용함. line-search 후보마다 모든 window를 다시 평가하며 worker 병렬화를
+  유지함. `-e`는 최대 iteration 수이고, 생략하면 수렴 기준까지 수행함.
+- 각 window는 독립 CRF instance이므로 목적함수는 전체 contig의 CRF partition function과 같지는 않음.
+- CRF checkpoint block 크기는 고정 상수 대신 각 학습 window 길이의 제곱근으로 정함.
+  alpha 일부를 저장한 뒤 backward에서 구간을 재계산해 worker 메모리를 줄이며, 전체 alpha 저장과
+  같은 forward 수식·gradient를 사용함.
+  k-mer·splice 문맥 특성은 원래 contig 좌표를 참조하지만, CRF 전이와 partition 계산은 window 안에서 수행함.
 
 e.g.) 다음과 같이 설정할 수 있음. 출력 디렉터리는 아직 존재하지 않는 경로여야 함.
 
 ```sh
-cc -O3 -std=c11 -Wall -Wextra '-DCWT_SCALES=1,2,8,32' \
+cc -O3 -std=c11 -Wall -Wextra -pthread '-DCWT_SCALES=1,2,8,32' \
   anno_cwt.c -lz -lm -o anno_cwt_custom
-./anno_cwt_custom genome.fa new_output_directory
+./anno_cwt_custom -p 4 genome.fa new_output_directory
 ```
 
 출력 파일)
@@ -1085,59 +1107,25 @@ cc -O3 -std=c11 -Wall -Wextra '-DCWT_SCALES=1,2,8,32' \
 === 11.2 공통 정의와 메모리 할당
 - `WAVE_COUNT`: 스케일 개수.
 - `CWT_CHANNELS`: 실수부·허수부를 따로 센 채널 개수. 스케일 개수의 2배임.
+- `CWT_WINDOW_SIZE`: halo를 제외한 CWT 출력 window 크기.
 - `Wavelets`: 스케일별 커널과 길이.
 - `MAX_WAVE_SIZE`: 초기 할당 크기의 기준. 절단 상한이 아님.
   - 커널에 맞춰 공간을 확장함. 초기 기준이 0 이하이면 1을 사용함.
-- `alloc`: `calloc`으로 0 초기화함. 크기 초과·할당 실패도 확인함.
+- `anno_alloc`: 0 초기화와 크기 초과·할당 실패를 공통 처리하며 `cwt.h`에서 사용함.
+- CWT 구현은 `anno_alloc`·`anno_fail`을 직접 호출해 실행기별 할당·오류 래퍼를 두지 않음.
 
 ```c
-#define _POSIX_C_SOURCE 200809L
-#include "kseq.h"
-#include <complex.h>
-#include <float.h>
-#include <limits.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <zlib.h>
-
-#define RFFT_IMPLEMENTATION
-#include "rfft.h"
-
-KSEQ_INIT(gzFile, gzread)
-
 #ifndef CWT_SCALES
-#define CWT_SCALES 4, 5, 6, 7, 8, 9
+#define CWT_SCALES 4, 5, 6, 7, 8, 9, 16, 32, 64, 128
 #endif
-#ifndef MAX_WAVE_SIZE
-#define MAX_WAVE_SIZE 9
-#endif
-static const double wave_scales[] = {CWT_SCALES};
-#define WAVE_COUNT (sizeof(wave_scales) / sizeof(wave_scales[0]))
+#define WAVE_COUNT CWT_COUNT(CWT_SCALES)
+#define CWT_WINDOW_SIZE 1024
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
 typedef struct {
   double complex *kernel[WAVE_COUNT];
   int widths[WAVE_COUNT], max_width;
 } Wavelets;
-typedef struct { char *name, *seq; int length; } Contig;
-
-#define fail(...) do { \
-  fputs("Error: ", stderr); \
-  fprintf(stderr, __VA_ARGS__); \
-  fputc('\n', stderr); \
-  exit(EXIT_FAILURE); \
-} while (0)
-
-static void *alloc(size_t count, size_t size) {
-  if (size && count > SIZE_MAX / size) fail("Allocation size overflow");
-  void *memory = calloc(count ? count : 1, size);
-  if (!memory) fail("Out of memory");
-  return memory;
-}
 ```
 
 === 11.3 C 언어를 통한 DNA 인코딩 구현
@@ -1156,7 +1144,7 @@ static int base_index(char base) {
   }
 }
 
-static double complex base_signal(char base) {
+static double complex cwt_base_signal(char base) {
   const double complex mapping[4] = {1.0, I, -I, -1.0}; // 이거 나중에 꼭 매핑 바꿔봐야 함.
   int index = base_index(base);
   return index < 0 ? 0.0 : mapping[index];
@@ -1170,7 +1158,7 @@ static double complex base_signal(char base) {
 - `cexp(-I * 6.0 * ...)`의 음수는 #text(weight: "bold")[켤레 wavelet]이기 때문임. 다시 켤레를 적용하면 안 됨.
 
 ```c
-static double complex morlet_integral(double lower, double upper) {
+static double complex cwt_morlet_integral(double lower, double upper) {
   static const double nodes[8] = {
     0.09501250983763744, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438,
     0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499
@@ -1209,29 +1197,29 @@ static double complex morlet_integral(double lower, double upper) {
 - `sqrt(dilation)`: 7.1절의 변수 치환에서 나온 $sqrt(a)$임.
 
 - `dilation` = $a$, `tap - radius` = $j$임.
-- `morlet_integral`은 11.4절, `alloc`과 `Wavelets`는 11.2절에 정의함.
+- `cwt_morlet_integral`은 11.4절, `anno_alloc`과 `Wavelets`는 11.2절에 정의함.
 - 커널의 제곱합을 다시 1로 맞추지 않음. 정규화 대상은 연속 wavelet이며, 커널을 별도로 정규화하면 7절의 CWT 식이 달라짐.
 
 ```c
 static void wavelets_init(Wavelets *wavelets) {
   memset(wavelets, 0, sizeof(*wavelets));
-  for (size_t scale = 0; scale < WAVE_COUNT; scale++) {
-    double dilation = wave_scales[scale];
+  for (int scale = 0; scale < WAVE_COUNT; scale++) {
+    double dilation = wave_sizes[scale];
     if (!isfinite(dilation) || dilation <= 0.0 || dilation != floor(dilation))
-      fail("CWT scales must be positive natural numbers");
+      anno_fail("CWT scales must be positive natural numbers");
     double radius_value = ceil(8.0 * dilation + 0.5);
-    if (radius_value > (INT_MAX - 1) / 2) fail("CWT scale exceeds supported kernel size");
+    if (radius_value > (INT_MAX - 1) / 2.0) anno_fail("CWT scale exceeds supported kernel size");
     int radius = (int)radius_value;
     int width = 2 * radius + 1;
     size_t capacity = MAX_WAVE_SIZE > 0 ? (size_t)MAX_WAVE_SIZE : 1;
     if (capacity > (size_t)width) capacity = (size_t)width;
     while (capacity < (size_t)width) capacity *= 2;
-    wavelets->kernel[scale] = alloc(capacity, sizeof(double complex));
+    wavelets->kernel[scale] = anno_alloc(capacity, sizeof(double complex));
     wavelets->widths[scale] = width;
     if (width > wavelets->max_width) wavelets->max_width = width;
     for (int tap = 0; tap < width; tap++) {
       double displacement = tap - radius;
-      wavelets->kernel[scale][tap] = sqrt(dilation) * morlet_integral(
+      wavelets->kernel[scale][tap] = sqrt(dilation) * cwt_morlet_integral(
         (displacement - 0.5) / dilation, (displacement + 0.5) / dilation);
     }
   }
@@ -1245,11 +1233,11 @@ static void wavelets_init(Wavelets *wavelets) {
 
 ```c
 static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
-  if (signal_length > SIZE_MAX - (kernel_length - 1)) fail("CWT FFT size overflow");
+  if (signal_length > SIZE_MAX - (kernel_length - 1)) anno_fail("CWT FFT size overflow");
   size_t required = signal_length + kernel_length - 1;
   size_t size = 1;
   while (size < required) {
-    if (size > SIZE_MAX / 2) fail("CWT FFT size overflow");
+    if (size > SIZE_MAX / 2) anno_fail("CWT FFT size overflow");
     size <<= 1;
   }
   return size;
@@ -1257,149 +1245,131 @@ static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
 ```
 
 === 11.7 CWT 계수 계산
-- `signal_length`는 전체 contig 길이, `fft_size`는 $P$임.
-- contig 전체를 FFT하고 각 위치의 선형 합성곱 계수를 계산함.
-- `alloc`이 0 초기화하므로 입력 뒤의 남은 공간은 zero-padding이 됨.
-- `width - 1 - width/2` = $r$임. 위치 $b$의 합성곱 인덱스 $b + r$를 읽음.
-- `features`: 위치별로 스케일 순서의 실수부·허수부를 번갈아 저장함.
+- `CWT_WINDOW_SIZE` 위치를 한 core로 정하고, 해당 scale의 kernel 반경만큼 입력 구간을 좌우로 확장함.
+- FFT 길이는 halo를 포함한 입력 길이와 해당 kernel의 선형 합성곱을 수용하는 최소 2의 거듭제곱임.
+- halo 출력은 버리고 core만 기록함. `width - 1 - width/2`가 convolution 결과의 중심 offset임.
+- `(window, scale)` 쌍을 atomic 작업 큐에 넣어 병렬 처리하며, worker별 FFT workspace는 재사용함.
+  `-p`는 동시에 실행하는 쌍의 수를 제한함.
+- 계수는 complex 출력에, 제곱 크기는 power 출력에 기록함. `features`는 위치별로
+  스케일 순서의 실수부·허수부를 번갈아 저장함.
 
 ```c
-static void cwt_extract(const Wavelets *wavelets, const char *sequence, int length,
-                        float *features) {
-  if (length <= 0) return;
-  size_t signal_length = (size_t)length;
-  size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
-  double complex *signal_fft = alloc(fft_size, sizeof(*signal_fft));
-  double complex *kernel_fft = alloc(fft_size, sizeof(*kernel_fft));
+size_t window = task_index / WAVE_COUNT;
+int scale = (int)(task_index % WAVE_COUNT);
+size_t start = window * CWT_WINDOW_SIZE;
+size_t window_length = task->length - start;
+if (window_length > CWT_WINDOW_SIZE) window_length = CWT_WINDOW_SIZE;
+size_t end = start + window_length;
+int width = wavelets->widths[scale];
+size_t radius = (size_t)(width / 2);
+size_t input_start = start > radius ? start - radius : 0;
+size_t input_end = radius > task->length - end ? task->length : end + radius;
+size_t fft_size = convolution_fft_size(input_end - input_start, (size_t)width);
 
-  for (size_t index = 0; index < signal_length; index++)
-    signal_fft[index] = base_signal(sequence[index]);
-  fft_transform(signal_fft, fft_size, false);
-
-  for (size_t scale = 0; scale < WAVE_COUNT; scale++) {
-    int width = wavelets->widths[scale];
-    memset(kernel_fft, 0, fft_size * sizeof(*kernel_fft));
-    for (int tap = 0; tap < width; tap++)
-      kernel_fft[width - 1 - tap] = wavelets->kernel[scale][tap];
-    fft_transform(kernel_fft, fft_size, false);
-    for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
-    fft_transform(kernel_fft, fft_size, true);
-
-    for (int position = 0; position < length; position++) {
-      size_t convolution_index = (size_t)position + width - 1 - width / 2;
-      double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
-      features[(size_t)position * CWT_CHANNELS + 2 * scale] = (float)creal(coefficient);
-      features[(size_t)position * CWT_CHANNELS + 2 * scale + 1] = (float)cimag(coefficient);
-    }
-  }
-
-  free(signal_fft);
-  free(kernel_fft);
+memset(signal_fft, 0, fft_size * sizeof(*signal_fft));
+memset(kernel_fft, 0, fft_size * sizeof(*kernel_fft));
+for (size_t i = input_start; i < input_end; i++)
+  signal_fft[i - input_start] = cwt_base_signal(task->sequence[i]);
+for (int tap = 0; tap < width; tap++)
+  kernel_fft[width - 1 - tap] = wavelets->kernel[scale][tap];
+fft_transform(signal_fft, fft_size, false);
+fft_transform(kernel_fft, fft_size, false);
+for (size_t index = 0; index < fft_size; index++)
+  signal_fft[index] *= kernel_fft[index];
+fft_transform(signal_fft, fft_size, true);
+for (size_t position = start; position < end; position++) {
+  size_t index = position - input_start + (size_t)(width - 1 - width / 2);
+  double complex coefficient = signal_fft[index] / (double)fft_size;
 }
 ```
 
 === 11.8 FASTA 입력과 바이너리 출력
 - `kseq.h`로 FASTA를 파싱함. zlib을 통해 일반 파일·gzip 파일을 읽음.
 - 입력 경로 `-`: 표준 입력.
-- 모든 contig를 메모리에 올리고, 한 contig씩 전체 CWT 계수와 FFT 작업 배열을 할당함.
+- contig 서열은 유지하지만, 학습용 CWT power와 export 행렬은 file-backed mapping을 사용함.
+- FFT workspace는 1024 bp core와 scale halo를 처리할 크기로 worker마다 재사용함. 메모리 사용량은
+  전체 contig 길이가 아니라 동시 worker 수와 window·scale 크기에 좌우됨.
 
 ```c
 static Contig *read_fasta(const char *path, int *count) {
   gzFile input = gzopen(!strcmp(path, "-") ? "/dev/stdin" : path, "rb");
-  if (!input) fail("Cannot open FASTA: %s", path);
+  if (!input) anno_fail("Cannot open FASTA: %s", path);
   kseq_t *record = kseq_init(input);
   Contig *contigs = NULL;
   *count = 0;
   while (kseq_read(record) >= 0) {
     if (!record->seq.l) continue;
-    if (record->seq.l > INT_MAX) fail("Contig too long: %s", record->name.s);
-    Contig *grown = realloc(contigs, (size_t)(*count + 1) * sizeof(*contigs));
-    if (!grown) fail("Out of memory");
-    contigs = grown;
+    if (record->seq.l > (size_t)INT_MAX) anno_fail("Contig too long: %s", record->name.s);
+    contigs = anno_resize(contigs, (size_t)*count + 1, sizeof(*contigs));
     Contig *contig = contigs + (*count)++;
+    memset(contig, 0, sizeof(*contig));
     contig->name = strdup(record->name.s);
     contig->seq = strdup(record->seq.s);
     contig->length = (int)record->seq.l;
-    if (!contig->name || !contig->seq) fail("Out of memory");
+    contig->genome_length = contig->length;
+    if (!contig->name || !contig->seq) anno_fail("Out of memory");
   }
   kseq_destroy(record);
-  if (gzclose(input) != Z_OK || !*count) fail("No readable FASTA records: %s", path);
+  if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
   return contigs;
 }
 
 static FILE *create_in(const char *directory, const char *name) {
-  char *path = alloc(strlen(directory) + strlen(name) + 2, 1);
+  char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
   sprintf(path, "%s/%s", directory, name);
-  FILE *file = fopen(path, "wb");
-  if (!file) fail("Cannot create %s", path);
+  FILE *file = fopen(path, "w+b");
+  if (!file) anno_fail("Cannot create %s", path);
   free(path);
   return file;
 }
-
-static void write_floats(FILE *stream, const float *values, size_t count) {
-  _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
-                 "CWT export requires binary32 floats");
-  uint16_t endian = 1;
-  if (*(unsigned char *)&endian) {
-    if (fwrite(values, sizeof(float), count, stream) != count) fail("Cannot write CWT matrix");
-    return;
-  }
-  for (size_t index = 0; index < count; index++) {
-    unsigned char bytes[4], swapped[4];
-    memcpy(bytes, values + index, 4);
-    for (int byte = 0; byte < 4; byte++) swapped[byte] = bytes[3 - byte];
-    if (fwrite(swapped, 1, 4, stream) != 4) fail("Cannot write CWT matrix");
-  }
-}
 ```
 
-- `write_floats`는 실수부·허수부 순서를 유지함.
-- 실행 환경과 관계없이 little-endian으로 기록함. 읽는 쪽의 complex64 해석 규칙을 고정한 것임.
+- `cwt_map_output`은 최종 행렬 파일의 해당 구간을 직접 매핑함.
+- 실행 환경과 관계없이 little-endian으로 기록함. big-endian에서는 매핑 구간을 변환한 뒤 flush함.
 
 === 11.9 행렬 저장
-- 배정밀도 FFT 계수를 binary32 `values`로 변환해 complex64 파일에 기록함.
+- 배정밀도 FFT 계수를 binary32로 변환해 complex64 파일의 매핑 구간에 직접 기록함.
 - complex64: 실수부·허수부가 각각 32비트인 복소 형식임. 여기서 정밀도 변환의 반올림이 추가됨.
-- 각 contig의 plus와 reverse-complement 가닥을 각각 전체 입력으로 한 번에 계산함.
-- `read_fasta`, `create_in`, `write_floats`는 11.8절에 정의함.
+- 각 contig의 plus와 reverse-complement 가닥은 각각 전체 입력의 경계 문맥으로 계산함.
+- `-p`로 scale별 변환을 병렬화하며, 결과는 중간 RAM 배열 없이 `matrix.bin`에 저장함.
 
 ```c
-static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *directory) {
+static void export_cwt(const Wavelets *wavelets, const char *fasta,
+                       const char *directory, int threads) {
   int count;
   Contig *contigs = read_fasta(fasta, &count);
-  if (mkdir(directory, 0777)) fail("Cannot create directory %s", directory);
+  if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s", directory);
   FILE *matrix = create_in(directory, "matrix.bin");
   FILE *index = create_in(directory, "contigs.tsv");
   fputs("# anno-cwt-v2\n# scales\t", index);
-  for (size_t scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%.17g", scale ? "," : "", wave_scales[scale]);
+  for (int scale = 0; scale < WAVE_COUNT; scale++)
+    fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
   fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
   size_t rows = 0;
   for (int contig_index = 0; contig_index < count; contig_index++) {
     Contig *contig = contigs + contig_index;
     fprintf(index, "%s\t%d\t%zu\t%zu\n", contig->name, contig->length, rows, rows + contig->length);
-    float *values = alloc((size_t)contig->length, CWT_CHANNELS * sizeof(*values));
-    char *reverse = alloc((size_t)contig->length + 1, 1);
+    size_t value_count = (size_t)contig->length * CWT_CHANNELS;
+    char *reverse = anno_alloc((size_t)contig->length + 1, 1);
     for (int position = 0; position < contig->length; position++) {
       int base = base_index(contig->seq[contig->length - 1 - position]);
       reverse[position] = base < 0 ? 'N' : "TGCA"[base];
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : contig->seq;
-      cwt_extract(wavelets, bases, contig->length, values);
-      size_t feature_count = (size_t)contig->length * CWT_CHANNELS;
-      write_floats(matrix, values, feature_count);
+      void *mapping;
+      size_t mapping_size;
+      off_t file_position;
+      float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
+      cwt_transform(wavelets, bases, contig->length, threads, NULL, values, NULL);
+      cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
     }
     free(reverse);
-    free(values);
     rows += 2 * (size_t)contig->length;
   }
-  if (fclose(matrix)) fail("Cannot finish CWT matrix");
-  if (fclose(index)) fail("Cannot finish CWT index");
-  for (int contig_index = 0; contig_index < count; contig_index++) {
-    free(contigs[contig_index].name);
-    free(contigs[contig_index].seq);
-  }
-  free(contigs);
-  fprintf(stderr, "Saved %zu rows x %zu complex64 scales\n", rows, WAVE_COUNT);
+  if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
+  free_contigs(contigs, count);
+  fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
 }
 ```
 
@@ -1407,26 +1377,29 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
 실행 순서는 다음과 같음.
 + `wavelets_init`: 스케일별 구간 적분 커널 생성.
 + `export_cwt`: FASTA 입력, 역상보 서열 생성, 양쪽 가닥의 contig 전체를 처리.
-+ `cwt_extract`: contig 전체를 입력으로 한 FFT 합성곱으로 계수 계산.
-+ `write_floats`: complex64 형식으로 변환된 값을 파일에 기록.
++ `cwt_transform`: window별 halo 입력을 만들고 `(window, scale)` 작업으로 분배.
++ `cwt_map_output` / `cwt_unmap_output`: 최종 행렬 파일에 complex64를 직접 기록.
 + 계산이 끝나면 입력 배열과 커널 메모리 해제.
 
 ```c
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    fprintf(stderr, "Usage: %s <genome.fa[.gz]> <new_directory>\n", argv[0]);
-    return EXIT_FAILURE;
+  int threads = default_threads(), option;
+  ketopt_t options = KETOPT_INIT;
+  while ((option = ketopt(&options, argc, argv, 0, "p:h", NULL)) >= 0) {
+    if (option != 'p') return EXIT_FAILURE;
+    threads = parse_threads(options.arg);
   }
+  if (argc - options.ind != 2) return EXIT_FAILURE;
   Wavelets wavelets;
   wavelets_init(&wavelets);
-  export_cwt(&wavelets, argv[1], argv[2]);
-  for (size_t scale = 0; scale < WAVE_COUNT; scale++) free(wavelets.kernel[scale]);
+  export_cwt(&wavelets, argv[options.ind], argv[options.ind + 1], threads);
+  wavelets_free(&wavelets);
   return EXIT_SUCCESS;
 }
 ```
 
-c.f.) 11.2절부터 11.10절까지의 C 코드 블록은 #text(weight: "bold")[위에서 아래로 연결하면 원래 소스 순서]임.\
-외부 헤더 `kseq.h`, `rfft.h`와 zlib은 별도로 필요함.
+c.f.) 수치 핵심은 공용 `cwt.h`에 있고, 실행 파일은 입력·출력을 담당함.\
+외부 헤더 `cwt.h`, `kseq.h`, `ketopt.h`, `rfft.h`와 zlib은 별도로 필요함.
 
 == 12. anno의 CWT 보존형 특성 공학
 
@@ -1482,7 +1455,7 @@ power 구간·극대·극소 특성은 모든 실험에서 유지됨.
 
 구간 경계와 특성 배치는 고정된 모델 스키마에 속함. 새로운 정답 통계는
 Col에서 계산하지 않으며, CRF 가중치는 Nip의 정답으로만 학습함.
-원시 복소 계수를 염색체 전체에 상주시켜 저장하지 않고, contig 전체를 한 번에 계산한 결과를
+원시 복소 계수를 염색체 전체에 상주시켜 저장하지 않고, contig 전체와 같은 경계 정확성을 갖는 결과를
 가닥별 64비트 CWT 코드와 32비트 서열 문맥 코드로 압축함.
 압축은 모델 입력 특성의 표현이며, 위에서 유도한 CWT 계산의 축소가 아님.
 

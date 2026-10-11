@@ -2,6 +2,7 @@
 #define CRF_H
 
 #include "anno.h"
+#include "lbfgs.h"
 #include <stdint.h>
 
 /* Linear-chain CRF decoded jointly for both strands.
@@ -19,7 +20,7 @@ enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        WEIGHTS = OFF_SPLICE + 4 * FLANKS * K2 };
 
 void crf_init(void);
-void crf_train(Contig *contigs, int count, double *weights, int epochs);
+void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
 void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 
 #endif
@@ -32,7 +33,6 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 typedef struct {
   uint16_t k4[2];
@@ -62,20 +62,22 @@ static int kmer(const char *seq, int length, int from, int size, int reverse) {
 }
 
 static Site site_at(const Contig *c, int i) {
-  int base = base_index(c->seq[i]);
-  Site s = {.k4 = {kmer(c->seq, c->length, i - 2, 4, 0),
-                   kmer(c->seq, c->length, i - 2, 4, 1)}, .nuc = base < 0 ? 4 : base};
+  int position = c->offset + i;
+  int base = base_index(c->seq[position]);
+  Site s = {.k4 = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
+                   kmer(c->seq, c->genome_length, position - 2, 4, 1)}, .nuc = base < 0 ? 4 : base};
   for (int offset = 0; offset < FLANKS; offset++) {
     int displacement = -SPLICE_RADIUS + 2 * offset;
-    s.flank[0][offset] = kmer(c->seq, c->length, i + displacement, 2, 0);
-    s.flank[1][offset] = kmer(c->seq, c->length, i - displacement - 2, 2, 1);
+    s.flank[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
+    s.flank[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 2, 2, 1);
   }
-  memcpy(s.cwt_power, c->cwt_power + (size_t)i * WAVE_COUNT, sizeof(s.cwt_power));
-  if (i > 0 && i + 1 < c->length && base_index(c->seq[i - 1]) >= 0 &&
-      base >= 0 && base_index(c->seq[i + 1]) >= 0) {
+  memcpy(s.cwt_power, c->cwt_power + (size_t)position * WAVE_COUNT, sizeof(s.cwt_power));
+  if (position > 0 && position + 1 < c->genome_length &&
+      base_index(c->seq[position - 1]) >= 0 && base >= 0 &&
+      base_index(c->seq[position + 1]) >= 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      double left = c->cwt_power[(size_t)(i - 1) * WAVE_COUNT + scale];
-      double right = c->cwt_power[(size_t)(i + 1) * WAVE_COUNT + scale];
+      double left = c->cwt_power[(size_t)(position - 1) * WAVE_COUNT + scale];
+      double right = c->cwt_power[(size_t)(position + 1) * WAVE_COUNT + scale];
       double slope = (right - left) / (right + left + 1e-12);
       s.derivative[scale] = (int16_t)lrint(slope * INT16_MAX);
     }
@@ -254,7 +256,8 @@ static void add_transition(double *gradient, const Site *site, int previous, int
   }
 }
 
-typedef struct { double *alpha, *scale; } Work;
+enum { CRF_WINDOW_SIZE = 1000000 };
+typedef struct { double *checkpoint, *alpha, *scale; int block_size; } Work;
 
 static double log_add(double left, double right) {
   if (left == -INFINITY) return right;
@@ -287,7 +290,7 @@ static double forward_step(const double *w, const Contig *c, int position,
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) alpha[hidden] = -INFINITY;
   if (!position) {
     for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-      if (initial_allowed(site.nuc, hidden, 1))
+      if (initial_allowed(site.nuc, hidden, c->offset == 0))
         alpha[hidden] = emissions[hidden_state[hidden]];
   } else {
     const HiddenEdge *edges = hidden_edges[site.nuc];
@@ -322,39 +325,48 @@ static void backward_step(const Site *next_site, const double *next_psi,
 
 static double gold_grammar_mass(const Contig *contig, int start, int end) {
   double previous[HIDDEN_STATES], current[HIDDEN_STATES];
-  int base = base_index(contig->seq[start]);
+  int position = contig->offset + start;
+  int base = base_index(contig->seq[position]);
   if (base < 0) base = 4;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    previous[hidden] = hidden_state[hidden] == contig->label[start] && initial_allowed(base, hidden, start == 0) ? 0 : -INFINITY;
+    previous[hidden] = hidden_state[hidden] == contig->label[position] &&
+      initial_allowed(base, hidden, contig->offset == 0) ? 0 : -INFINITY;
   for (int position = start + 1; position < end; position++) {
-    base = base_index(contig->seq[position]);
+    int genome_position = contig->offset + position;
+    base = base_index(contig->seq[genome_position]);
     if (base < 0) base = 4;
     for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) current[hidden] = -INFINITY;
     const HiddenEdge *edges = hidden_edges[base];
     for (int edge = 0; edge < hidden_edge_count[base]; edge++) {
       const HiddenEdge *step = edges + edge;
-      if (hidden_state[step->current] == contig->label[position])
+      if (hidden_state[step->current] == contig->label[genome_position])
         current[step->current] = log_add(current[step->current], previous[step->previous]);
     }
     memcpy(previous, current, sizeof(previous));
   }
   double mass = -INFINITY;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    if (end < contig->length || terminal_allowed(hidden)) mass = log_add(mass, previous[hidden]);
+    if (contig->offset + end < contig->genome_length || terminal_allowed(hidden))
+      mass = log_add(mass, previous[hidden]);
   return mass;
 }
 
-/* Accumulates the exact observed-minus-expected gradient for one whole contig. */
+/* Accumulates the exact observed-minus-expected gradient for one training window. */
 static double contig_gradient(const double *w, const Contig *c, Work *k, double *gradient) {
   double mass = gold_grammar_mass(c, 0, c->length);
   if (mass == -INFINITY) return NAN;
 
-  double logz = 0;
+  int block_size = k->block_size;
+  double logz = 0, alpha_a[HIDDEN_STATES], alpha_b[HIDDEN_STATES];
+  const double *alpha_previous = NULL;
+  double *alpha_current = alpha_a;
   for (int position = 0; position < c->length; position++) {
-    double *alpha = k->alpha + (size_t)position * HIDDEN_STATES;
-    const double *previous = position ? alpha - HIDDEN_STATES : NULL;
-    k->scale[position] = forward_step(w, c, position, previous, alpha);
-    logz += k->scale[position];
+    logz += forward_step(w, c, position, alpha_previous, alpha_current);
+    if (position + 1 < c->length && (position + 1) % block_size == 0)
+      memcpy(k->checkpoint + (size_t)(position / block_size) * HIDDEN_STATES,
+             alpha_current, sizeof(alpha_a));
+    alpha_previous = alpha_current;
+    alpha_current = alpha_current == alpha_a ? alpha_b : alpha_a;
   }
 
   double likelihood = mass - logz;
@@ -362,74 +374,129 @@ static double contig_gradient(const double *w, const Contig *c, Work *k, double 
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
     beta[hidden] = terminal_allowed(hidden) ? 0 : -INFINITY;
 
-  for (int position = c->length - 1; position >= 0; position--) {
-    Site site;
-    double emissions[STATES], psi[STATES * STATES];
-    site = site_scores(w, c, position, emissions, psi);
-    const double *alpha = k->alpha + (size_t)position * HIDDEN_STATES;
-    int state = c->label[position];
-    likelihood += emissions[state];
-    add_emission(gradient, &site, state, 1);
-
-    double state_marginals[STATES] = {0};
-    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-      state_marginals[hidden_state[hidden]] += exp(alpha[hidden] + beta[hidden]);
-    for (int st = 0; st < STATES; st++)
-      add_emission(gradient, &site, st, -state_marginals[st]);
-
-    if (position) {
-      const double *previous_alpha = alpha - HIDDEN_STATES;
-      likelihood += transition(w, &site, c->label[position - 1], state);
-      add_transition(gradient, &site, c->label[position - 1], state, 1);
-
-      double edge_marginals[STATES * STATES] = {0};
-      const HiddenEdge *edges = hidden_edges[site.nuc];
-      for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
-        const HiddenEdge *step = edges + edge;
-        edge_marginals[step->transition] += exp(
-          previous_alpha[step->previous] + psi[step->transition] +
-          beta[step->current] - k->scale[position]);
-      }
-      for (int edge = 0; edge < ntrans; edge++)
-        if (edge_marginals[edge] > 0)
-          add_transition(gradient, &site, trans_a[edge], trans_b[edge], -edge_marginals[edge]);
-
-      double beta_previous[HIDDEN_STATES];
-      backward_step(&site, psi, beta, k->scale[position], beta_previous);
-      memcpy(beta, beta_previous, sizeof(beta));
+  for (int block_start = ((c->length - 1) / block_size) * block_size;
+       block_start >= 0;) {
+    int block_length = c->length - block_start;
+    if (block_length > block_size) block_length = block_size;
+    int block_end = block_start + block_length;
+    const double *checkpoint = block_start
+      ? k->checkpoint + (size_t)(block_start / block_size - 1) * HIDDEN_STATES : NULL;
+    for (int position = block_start; position < block_end; position++) {
+      int local = position - block_start;
+      double *alpha = k->alpha + (size_t)local * HIDDEN_STATES;
+      const double *before = position == block_start ? checkpoint : alpha - HIDDEN_STATES;
+      k->scale[local] = forward_step(w, c, position, before, alpha);
     }
+    for (int position = block_end - 1; position >= block_start; position--) {
+      int local = position - block_start;
+      Site site;
+      double emissions[STATES], psi[STATES * STATES];
+      site = site_scores(w, c, position, emissions, psi);
+      const double *alpha = k->alpha + (size_t)local * HIDDEN_STATES;
+      int state = c->label[c->offset + position];
+      likelihood += emissions[state];
+      add_emission(gradient, &site, state, 1);
+
+      double state_marginals[STATES] = {0};
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        state_marginals[hidden_state[hidden]] += exp(alpha[hidden] + beta[hidden]);
+      for (int st = 0; st < STATES; st++)
+        add_emission(gradient, &site, st, -state_marginals[st]);
+
+      if (position) {
+        const double *previous_alpha = local
+          ? alpha - HIDDEN_STATES : checkpoint;
+        int previous_state = c->label[c->offset + position - 1];
+        likelihood += transition(w, &site, previous_state, state);
+        add_transition(gradient, &site, previous_state, state, 1);
+
+        double edge_marginals[STATES * STATES] = {0};
+        const HiddenEdge *edges = hidden_edges[site.nuc];
+        for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
+          const HiddenEdge *step = edges + edge;
+          edge_marginals[step->transition] += exp(
+            previous_alpha[step->previous] + psi[step->transition] +
+            beta[step->current] - k->scale[local]);
+        }
+        for (int edge = 0; edge < ntrans; edge++)
+          if (edge_marginals[edge] > 0)
+            add_transition(gradient, &site, trans_a[edge], trans_b[edge], -edge_marginals[edge]);
+
+        double beta_previous[HIDDEN_STATES];
+        backward_step(&site, psi, beta, k->scale[local], beta_previous);
+        memcpy(beta, beta_previous, sizeof(beta));
+      }
+    }
+    if (!block_start) break;
+    block_start -= block_size;
   }
   return likelihood;
 }
 
 static Work work_alloc(int length) {
+  int block_size = (int)ceil(sqrt((double)length));
+  int checkpoint_count = (length - 1) / block_size;
   return (Work){
-    .alpha = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(double)),
-    .scale = anno_alloc((size_t)length, sizeof(double))
+    .checkpoint = anno_alloc((size_t)checkpoint_count, HIDDEN_STATES * sizeof(double)),
+    .alpha = anno_alloc((size_t)block_size, HIDDEN_STATES * sizeof(double)),
+    .scale = anno_alloc((size_t)block_size, sizeof(double)),
+    .block_size = block_size
   };
 }
 
 static void work_free(Work *k) {
-  free(k->alpha), free(k->scale);
+  free(k->checkpoint), free(k->alpha), free(k->scale);
 }
 
-/* Full-batch CRF training: workers sum exact whole-contig gradients independently,
-   then the main thread reduces them and performs one AdaGrad update per epoch. */
-#define CRF_LEARNING_RATE 0.1
+typedef struct {
+  Contig *contig;
+  int start, length;
+} CrfWindow;
+
+static int next_window_end(const Contig *contig, int start) {
+  int end = contig->length - start > CRF_WINDOW_SIZE ? start + CRF_WINDOW_SIZE : contig->length;
+  if (end == contig->length || !contig->label[end - 1] || !contig->label[end]) return end;
+  int gene_start = end - 1, gene_end = end;
+  while (gene_start > start && contig->label[gene_start - 1]) gene_start--;
+  while (gene_end < contig->length && contig->label[gene_end]) gene_end++;
+  return gene_start > start && end - gene_start <= gene_end - end ? gene_start : gene_end;
+}
+
+static size_t make_windows(Contig *contigs, int count, CrfWindow **windows) {
+  size_t window_count = 0, capacity = 0;
+  for (int i = 0; i < count; i++) {
+    Contig *contig = contigs + i;
+    for (int start = 0; start < contig->length;) {
+      int end = next_window_end(contig, start);
+      if (end <= start) anno_fail("Cannot split contig into CRF windows: %s", contig->name);
+      if (window_count == capacity) {
+        if (capacity > SIZE_MAX / 2 / sizeof(**windows))
+          anno_fail("Too many CRF windows");
+        size_t next_capacity = capacity ? capacity * 2 : 16;
+        CrfWindow *grown = realloc(*windows, next_capacity * sizeof(**windows));
+        if (!grown) anno_fail("Out of memory");
+        *windows = grown;
+        capacity = next_capacity;
+      }
+      (*windows)[window_count++] = (CrfWindow){contig, start, end - start};
+      start = end;
+    }
+  }
+  return window_count;
+}
 
 typedef struct {
-  Contig *contigs;
-  int count, threads;
+  CrfWindow *windows;
+  size_t count;
+  int threads;
   atomic_size_t next_instance;
 } CrfTrain;
 
 typedef struct {
   CrfTrain *train;
   const double *w;
-  const int *order;
   double likelihood;
-  long positions;
-  int skipped;
+  size_t positions, skipped;
   double *gradient;
 } CrfWorker;
 
@@ -441,79 +508,128 @@ static void *crf_worker(void *arg) {
   worker->skipped = 0;
   memset(worker->gradient, 0, WEIGHTS * sizeof(*worker->gradient));
   size_t slot = atomic_fetch_add_explicit(&train->next_instance, 1, memory_order_relaxed);
-  while (slot < (size_t)train->count) {
-    Contig *c = train->contigs + worker->order[slot];
-    Work work = work_alloc(c->length);
-    double score = contig_gradient(worker->w, c, &work, worker->gradient);
+  while (slot < train->count) {
+    const CrfWindow *window = train->windows + slot;
+    Contig instance = *window->contig;
+    instance.offset = window->start;
+    instance.length = window->length;
+    Work work = work_alloc(instance.length);
+    double score = contig_gradient(worker->w, &instance, &work, worker->gradient);
     work_free(&work);
     if (isnan(score)) {
       worker->skipped++;
     } else {
       if (!isfinite(score)) anno_fail("Non-finite training likelihood");
       worker->likelihood += score;
-      worker->positions += c->length;
+      worker->positions += (size_t)instance.length;
     }
     slot = atomic_fetch_add_explicit(&train->next_instance, 1, memory_order_relaxed);
   }
   return NULL;
 }
 
-void crf_train(Contig *contigs, int count, double *w, int epochs) {
-  if (count < 1 || epochs < 1) anno_fail("CRF training requires instances and positive epochs");
-  long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-  if (online_cpus < 1) anno_fail("Cannot determine online CPU count");
-  CrfTrain train = {.contigs = contigs, .count = count,
-                    .threads = online_cpus < count ? (int)online_cpus : count};
-  atomic_init(&train.next_instance, 0);
-  fprintf(stderr, "Using %d worker threads for %d contigs\n", train.threads, count);
-  int *order = anno_alloc((size_t)train.count, sizeof(*order));
-  for (int i = 0; i < train.count; i++) order[i] = i;
-  CrfWorker *workers = anno_alloc((size_t)train.threads, sizeof(*workers));
-  pthread_t *tid = anno_alloc((size_t)train.threads, sizeof(*tid));
-  for (int t = 0; t < train.threads; t++)
-    workers[t] = (CrfWorker){.train = &train, .order = order,
-                             .gradient = anno_alloc(WEIGHTS, sizeof(*workers->gradient))};
-  double *gradient = anno_alloc(WEIGHTS, sizeof(*gradient));
-  double *history = anno_alloc(WEIGHTS, sizeof(*history));
-  srand(1);
-  for (int epoch = 1; epoch <= epochs; epoch++) {
-    for (int i = train.count - 1; i > 0; i--) {
-      int j = rand() % (i + 1), t = order[i];
-      order[i] = order[j], order[j] = t;
-    }
-    atomic_store_explicit(&train.next_instance, 0, memory_order_relaxed);
-    memset(gradient, 0, WEIGHTS * sizeof(*gradient));
-    for (int t = 0; t < train.threads; t++) {
-      workers[t].w = w;
-      if (train.threads > 1 && pthread_create(tid + t, NULL, crf_worker, workers + t))
-        anno_fail("Cannot spawn training thread");
-    }
-    double likelihood = 0;
-    long positions = 0;
-    int skipped = 0;
-    for (int t = 0; t < train.threads; t++) {
-      if (train.threads > 1 && pthread_join(tid[t], NULL))
-        anno_fail("Cannot join training thread");
-      if (train.threads == 1) crf_worker(workers + t);
-      likelihood += workers[t].likelihood;
-      positions += workers[t].positions;
-      skipped += workers[t].skipped;
-      for (int f = 0; f < WEIGHTS; f++) gradient[f] += workers[t].gradient[f];
-    }
-    if (!positions)
-      anno_fail("No valid CRF training instances (%d contigs skipped)", skipped);
-    for (int f = 0; f < WEIGHTS; f++) {
-      if (!isfinite(gradient[f])) anno_fail("Non-finite training gradient");
-      if (!gradient[f]) continue;
-      history[f] += gradient[f] * gradient[f];
-      w[f] += CRF_LEARNING_RATE * gradient[f] / sqrt(history[f] + 1e-8);
-      if (!isfinite(w[f])) anno_fail("Non-finite training weight");
-    }
-    fprintf(stderr, "Epoch %d: %d contigs trained, %d skipped, log-likelihood/bp %.4f\n",
-            epoch, count - skipped, skipped, likelihood / positions);
+typedef struct {
+  CrfTrain train;
+  CrfWorker *workers;
+  pthread_t *threads;
+  double likelihood;
+  size_t positions, skipped;
+} CrfObjective;
+
+#define CRF_L2_C2 1.0
+
+static double crf_objective(const double *w, double *gradient, void *context) {
+  CrfObjective *objective = context;
+  CrfTrain *train = &objective->train;
+  atomic_store_explicit(&train->next_instance, 0, memory_order_relaxed);
+  memset(gradient, 0, WEIGHTS * sizeof(*gradient));
+  for (int t = 0; t < train->threads; t++) {
+    objective->workers[t].w = w;
+    if (train->threads > 1 &&
+        pthread_create(objective->threads + t, NULL, crf_worker, objective->workers + t))
+      anno_fail("Cannot spawn training thread");
   }
-  for (int t = 0; t < train.threads; t++) free(workers[t].gradient);
-  free(order), free(workers), free(tid), free(gradient), free(history);
+
+  double likelihood = 0;
+  size_t positions = 0, skipped = 0;
+  for (int t = 0; t < train->threads; t++) {
+    if (train->threads > 1 && pthread_join(objective->threads[t], NULL))
+      anno_fail("Cannot join training thread");
+    if (train->threads == 1) crf_worker(objective->workers + t);
+    likelihood += objective->workers[t].likelihood;
+    positions += objective->workers[t].positions;
+    skipped += objective->workers[t].skipped;
+    for (int f = 0; f < WEIGHTS; f++) gradient[f] += objective->workers[t].gradient[f];
+  }
+  if (!positions) anno_fail("No valid CRF training windows (%zu windows skipped)", skipped);
+  if (!isfinite(likelihood)) anno_fail("Non-finite training likelihood");
+
+  objective->likelihood = likelihood;
+  objective->positions = positions;
+  objective->skipped = skipped;
+  double penalty = 0;
+  for (int f = 0; f < WEIGHTS; f++) {
+    penalty += w[f] * w[f];
+    gradient[f] = -gradient[f] + 2 * CRF_L2_C2 * w[f];
+    if (!isfinite(gradient[f])) anno_fail("Non-finite training gradient");
+  }
+  double loss = -likelihood + CRF_L2_C2 * penalty;
+  if (!isfinite(loss)) anno_fail("Non-finite training objective");
+  return loss;
+}
+
+static void crf_progress(void *context, int iteration, double objective, double step,
+                         int line_search_trials, size_t n, const double *gradient) {
+  const CrfObjective *evaluation = context;
+  double gradient_norm = 0;
+  for (size_t f = 0; f < n; f++) gradient_norm = hypot(gradient_norm, gradient[f]);
+  fprintf(stderr,
+          "Iteration %d: %zu windows trained, %zu skipped, log-likelihood/bp %.8g, "
+          "objective %.8g, gradient-norm %.3g, step %.3g, line-search %d\n",
+          iteration, evaluation->train.count - evaluation->skipped, evaluation->skipped,
+          evaluation->likelihood / evaluation->positions, objective, gradient_norm,
+          step, line_search_trials);
+}
+
+void crf_train(Contig *contigs, int count, double *w, int iterations, int threads) {
+  if (count < 1 || iterations < 1)
+    anno_fail("CRF training requires instances and positive iterations");
+  if (threads < 1) anno_fail("CRF training requires at least one worker thread");
+  CrfWindow *windows = NULL;
+  size_t window_count = make_windows(contigs, count, &windows);
+  if (!window_count) anno_fail("CRF training requires instances");
+  CrfObjective objective = {
+    .train = {.windows = windows, .count = window_count, .threads = threads}
+  };
+  if (window_count < (size_t)objective.train.threads)
+    objective.train.threads = (int)window_count;
+  atomic_init(&objective.train.next_instance, 0);
+  fprintf(stderr, "Using %d worker threads for %zu training windows\n",
+          objective.train.threads, objective.train.count);
+  objective.workers = anno_alloc((size_t)objective.train.threads, sizeof(*objective.workers));
+  objective.threads = anno_alloc((size_t)objective.train.threads, sizeof(*objective.threads));
+  for (int t = 0; t < objective.train.threads; t++)
+    objective.workers[t] = (CrfWorker){
+      .train = &objective.train,
+      .gradient = anno_alloc(WEIGHTS, sizeof(*objective.workers->gradient))
+    };
+
+  int completed = 0;
+  LbfgsStatus status = lbfgs_minimize(WEIGHTS, w, crf_objective, crf_progress, &objective,
+                                      iterations, &completed);
+  for (int t = 0; t < objective.train.threads; t++) free(objective.workers[t].gradient);
+  free(objective.workers), free(objective.threads), free(windows);
+  if (status == LBFGS_ALLOCATION_FAILURE) anno_fail("Out of memory in L-BFGS optimizer");
+  if (status == LBFGS_NONFINITE) anno_fail("Non-finite value in L-BFGS optimizer");
+  if (status == LBFGS_LINE_SEARCH_FAILURE)
+    anno_fail("L-BFGS line search failed after %d iterations", completed);
+  if (status == LBFGS_INVALID_ARGUMENT) anno_fail("Invalid L-BFGS optimizer configuration");
+  if (status == LBFGS_CONVERGED)
+    fprintf(stderr, "L-BFGS converged after %d iterations\n", completed);
+  if (status == LBFGS_STOPPING_CRITERION)
+    fprintf(stderr, "L-BFGS stopped by objective history after %d iterations\n", completed);
+  if (status == LBFGS_MAX_ITERATIONS)
+    fprintf(stderr, "L-BFGS reached the %d-iteration limit\n", completed);
 }
 
 static void viterbi_step(const double *weights, const Contig *contig, int position,

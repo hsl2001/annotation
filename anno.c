@@ -10,17 +10,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <zlib.h>
 
 #define RFFT_IMPLEMENTATION
 #include "rfft.h"
+#define LBFGS_IMPLEMENTATION
+#include "lbfgs.h"
 #define CRF_IMPLEMENTATION
 #include "crf.h"
 
 KSEQ_INIT(gzFile, gzread)
 
-const int wave_sizes[WAVE_COUNT] = {4, 5, 6, 7, 8, 9, 16, 32, 64, 128};
+const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
+
+#include "cwt.h"
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -32,15 +38,25 @@ void anno_fail(const char *format, ...) {
   exit(EXIT_FAILURE);
 }
 
-void *anno_alloc(size_t count, size_t size) {
+static void check_allocation_size(size_t count, size_t size) {
   if (size && count > SIZE_MAX / size) anno_fail("Allocation size overflow");
+}
+
+static char *anno_strdup(const char *text) {
+  char *copy = strdup(text);
+  if (!copy) anno_fail("Out of memory");
+  return copy;
+}
+
+void *anno_alloc(size_t count, size_t size) {
+  check_allocation_size(count ? count : 1, size);
   void *memory = calloc(count ? count : 1, size);
   if (!memory) anno_fail("Out of memory");
   return memory;
 }
 
 static void *anno_resize(void *memory, size_t count, size_t size) {
-  if (size && count > SIZE_MAX / size) anno_fail("Allocation size overflow");
+  check_allocation_size(count, size);
   void *resized = realloc(memory, count * size);
   if (!resized) anno_fail("Out of memory");
   return resized;
@@ -56,128 +72,33 @@ int base_index(char base) {
   }
 }
 
-static double complex base_signal(char base) {
-  const double complex mapping[4] = {1.0, I, -I, -1.0};
-  int index = base_index(base);
-  return index < 0 ? 0.0 : mapping[index];
+static void cwt_powers(const Wavelets *wavelets, const char *sequence, int length,
+                       int threads, float *powers) {
+  cwt_transform(wavelets, sequence, length, threads, NULL, NULL, powers);
 }
 
-static double complex morlet_integral(double lower, double upper) {
-  static const double nodes[8] = {
-    0.09501250983763744, 0.2816035507792589, 0.4580167776572274, 0.6178762444026438,
-    0.7554044083550030, 0.8656312023878318, 0.9445750230732326, 0.9894009349916499
-  };
-  static const double weights[8] = {
-    0.1894506104550685, 0.1826034150449236, 0.1691565193950025, 0.1495959888165767,
-    0.1246289712555339, 0.0951585116824928, 0.0622535239386479, 0.0271524594117541
-  };
-  lower = fmax(lower, -8.0);
-  upper = fmin(upper, 8.0);
-  if (lower >= upper) return 0.0;
-  double normalization = 1.0 / sqrt(sqrt(acos(-1.0)) *
-                                   (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
-  int segments = (int)ceil((upper - lower) * 2.0);
-  double step = (upper - lower) / segments;
-  double complex integral = 0.0;
-  for (int segment = 0; segment < segments; segment++) {
-    double middle = lower + (segment + 0.5) * step;
-    for (int node = 0; node < 8; node++) {
-      double left = middle - nodes[node] * step / 2.0;
-      double right = middle + nodes[node] * step / 2.0;
-      integral += weights[node] * step / 2.0 * (
-        exp(-0.5 * left * left) * (cexp(-I * 6.0 * left) - exp(-18.0)) +
-        exp(-0.5 * right * right) * (cexp(-I * 6.0 * right) - exp(-18.0)));
-    }
+typedef struct { float *data; size_t size; } CwtStore;
+
+static CwtStore cwt_store(Contig *contigs, int count) {
+  size_t bases = 0;
+  for (int i = 0; i < count; i++) {
+    if ((size_t)contigs[i].length > SIZE_MAX - bases) anno_fail("CWT size overflow");
+    bases += (size_t)contigs[i].length;
   }
-  return normalization * integral;
-}
-
-void wavelets_init(Wavelets *wavelets) {
-  memset(wavelets, 0, sizeof(*wavelets));
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    double dilation = wave_sizes[scale];
-    if (!isfinite(dilation) || dilation <= 0.0 || dilation != floor(dilation))
-      anno_fail("CWT scales must be positive natural numbers");
-    double radius_value = ceil(8.0 * dilation + 0.5);
-    if (radius_value > (INT_MAX - 1) / 2.0) anno_fail("CWT scale exceeds supported kernel size");
-    int radius = (int)radius_value;
-    int width = 2 * radius + 1;
-    size_t capacity = MAX_WAVE_SIZE > 0 ? (size_t)MAX_WAVE_SIZE : 1;
-    if (capacity > (size_t)width) capacity = (size_t)width;
-    while (capacity < (size_t)width) capacity *= 2;
-    wavelets->kernel[scale] = anno_alloc(capacity, sizeof(double complex));
-    wavelets->widths[scale] = width;
-    if (width > wavelets->max_width) wavelets->max_width = width;
-    for (int tap = 0; tap < width; tap++) {
-      double displacement = tap - radius;
-      wavelets->kernel[scale][tap] = sqrt(dilation) * morlet_integral(
-        (displacement - 0.5) / dilation, (displacement + 0.5) / dilation);
-    }
+  if (bases > SIZE_MAX / (WAVE_COUNT * sizeof(float))) anno_fail("CWT size overflow");
+  size_t bytes = bases * WAVE_COUNT * sizeof(float);
+  FILE *backing = tmpfile();
+  if (!backing) anno_fail("Cannot create CWT scratch file: %s", strerror(errno));
+  void *mapping;
+  size_t mapping_size;
+  float *data = cwt_map_file(backing, bytes, 0, &mapping, &mapping_size, "CWT scratch");
+  if (fclose(backing)) anno_fail("Cannot close CWT scratch file: %s", strerror(errno));
+  size_t offset = 0;
+  for (int i = 0; i < count; i++) {
+    contigs[i].cwt_power = data + offset * WAVE_COUNT;
+    offset += (size_t)contigs[i].length;
   }
-}
-
-static void wavelets_free(Wavelets *wavelets) {
-  for (int scale = 0; scale < WAVE_COUNT; scale++) free(wavelets->kernel[scale]);
-}
-
-static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
-  if (signal_length > SIZE_MAX - (kernel_length - 1)) anno_fail("CWT FFT size overflow");
-  size_t required = signal_length + kernel_length - 1;
-  size_t size = 1;
-  while (size < required) {
-    if (size > SIZE_MAX / 2) anno_fail("CWT FFT size overflow");
-    size <<= 1;
-  }
-  return size;
-}
-
-static void cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
-                          double *features, float *complex_values, float *powers) {
-  if (length <= 0) return;
-  if (features && (size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*features)))
-    anno_fail("CWT feature size overflow");
-  if (features) memset(features, 0, (size_t)length * CWT_CHANNELS * sizeof(*features));
-  size_t signal_length = (size_t)length;
-  size_t fft_size = convolution_fft_size(signal_length, (size_t)wavelets->max_width);
-  double complex *signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
-  double complex *kernel_fft = anno_alloc(fft_size, sizeof(*kernel_fft));
-
-  for (size_t index = 0; index < signal_length; index++)
-    signal_fft[index] = base_signal(sequence[index]);
-  fft_transform(signal_fft, fft_size, false);
-
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    int width = wavelets->widths[scale];
-    memset(kernel_fft, 0, fft_size * sizeof(*kernel_fft));
-    for (int tap = 0; tap < width; tap++)
-      kernel_fft[width - 1 - tap] = wavelets->kernel[scale][tap];
-    fft_transform(kernel_fft, fft_size, false);
-    for (size_t index = 0; index < fft_size; index++) kernel_fft[index] *= signal_fft[index];
-    fft_transform(kernel_fft, fft_size, true);
-
-    for (int position = 0; position < length; position++) {
-      size_t convolution_index = (size_t)position + width - 1 - width / 2;
-      double complex coefficient = kernel_fft[convolution_index] / (double)fft_size;
-      double real = creal(coefficient), imaginary = cimag(coefficient);
-      size_t feature = (size_t)position * CWT_CHANNELS + 2 * scale;
-      if (features) features[feature] = real, features[feature + 1] = imaginary;
-      if (complex_values) complex_values[feature] = (float)real, complex_values[feature + 1] = (float)imaginary;
-      if (powers) powers[(size_t)position * WAVE_COUNT + scale] = (float)(real * real + imaginary * imaginary);
-    }
-  }
-
-  free(signal_fft);
-  free(kernel_fft);
-}
-
-void cwt_extract(const Wavelets *wavelets, const char *sequence, int length, double *features) {
-  cwt_transform(wavelets, sequence, length, features, NULL, NULL);
-}
-
-static float *cwt_powers(const Wavelets *wavelets, const char *sequence, int length) {
-  float *powers = anno_alloc((size_t)length, WAVE_COUNT * sizeof(*powers));
-  cwt_transform(wavelets, sequence, length, NULL, NULL, powers);
-  return powers;
+  return (CwtStore){data, mapping_size};
 }
 
 Contig *read_fasta(const char *path, int *count) {
@@ -192,10 +113,10 @@ Contig *read_fasta(const char *path, int *count) {
     contigs = anno_resize(contigs, (size_t)*count + 1, sizeof(*contigs));
     Contig *c = contigs + (*count)++;
     memset(c, 0, sizeof(*c));
-    c->name = strdup(record->name.s);
-    c->seq = strdup(record->seq.s);
+    c->name = anno_strdup(record->name.s);
+    c->seq = anno_strdup(record->seq.s);
     c->length = (int)record->seq.l;
-    if (!c->name || !c->seq) anno_fail("Out of memory");
+    c->genome_length = c->length;
   }
   kseq_destroy(record);
   if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
@@ -206,7 +127,6 @@ static void free_contigs(Contig *contigs, int count) {
   for (int contig = 0; contig < count; contig++) {
     free(contigs[contig].name);
     free(contigs[contig].seq);
-    free(contigs[contig].cwt_power);
     free(contigs[contig].label);
   }
   free(contigs);
@@ -249,7 +169,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     int start = atoi(field[3]), end = atoi(field[4]);
     if (contig == count || start < 1 || end < start || end > contigs[contig].length) continue;
     cds = anno_resize(cds, (size_t)n + 1, sizeof(*cds));
-    if (!(cds[n].parent = strdup(parent))) anno_fail("Out of memory");
+    cds[n].parent = anno_strdup(parent);
     cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
     n++;
   }
@@ -349,29 +269,15 @@ static void load_model(const char *path, double *w) {
 static FILE *create_in(const char *directory, const char *name) {
   char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
   sprintf(path, "%s/%s", directory, name);
-  FILE *file = fopen(path, "wb");
+  FILE *file = fopen(path, "w+b");
   if (!file) anno_fail("Cannot create %s", path);
   free(path);
   return file;
 }
 
-static void write_floats(FILE *stream, const float *values, size_t count) {
-  _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24, "CWT export requires binary32 floats");
-  uint16_t endian = 1;
-  if (*(unsigned char *)&endian) {
-    if (fwrite(values, sizeof(float), count, stream) != count) anno_fail("Cannot write CWT matrix");
-    return;
-  }
-  for (size_t index = 0; index < count; index++) {
-    unsigned char bytes[4], swapped[4];
-    memcpy(bytes, values + index, 4);
-    for (int j = 0; j < 4; j++) swapped[j] = bytes[3 - j];
-    if (fwrite(swapped, 1, 4, stream) != 4) anno_fail("Cannot write CWT matrix");
-  }
-}
-
 /* Raw complex64 CWT export for plot_cwt.py: plus strand rows then reverse-complement rows. */
-static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *directory) {
+static void export_cwt(const Wavelets *wavelets, const char *fasta,
+                       const char *directory, int threads) {
   int count;
   Contig *contigs = read_fasta(fasta, &count);
   if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
@@ -383,7 +289,8 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   for (int c = 0; c < count; c++) {
     Contig *g = contigs + c;
     fprintf(index, "%s\t%d\t%zu\t%zu\n", g->name, g->length, rows, rows + g->length);
-    float *values = anno_alloc((size_t)g->length, CWT_CHANNELS * sizeof(*values));
+    if ((size_t)g->length > SIZE_MAX / CWT_CHANNELS) anno_fail("CWT output size overflow");
+    size_t value_count = (size_t)g->length * CWT_CHANNELS;
     char *reverse = anno_alloc((size_t)g->length + 1, 1);
     for (int i = 0; i < g->length; i++) {
       int base = base_index(g->seq[g->length - 1 - i]);
@@ -391,12 +298,14 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
     }
     for (int strand = 0; strand < 2; strand++) {
       const char *bases = strand ? reverse : g->seq;
-      cwt_transform(wavelets, bases, g->length, NULL, values, NULL);
-      size_t count = (size_t)g->length * CWT_CHANNELS;
-      write_floats(matrix, values, count);
+      void *mapping;
+      size_t mapping_size;
+      off_t file_position;
+      float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
+      cwt_transform(wavelets, bases, g->length, threads, NULL, values, NULL);
+      cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
     }
     free(reverse);
-    free(values);
     rows += 2 * (size_t)g->length;
   }
   if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
@@ -404,36 +313,68 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *
   fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
 }
 
-static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                  "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
+static int cwt_program(const char *program) {
+  const char *name = strrchr(program, '/');
+  name = name ? name + 1 : program;
+  return !strncmp(name, "anno_cwt", 8) && (!name[8] || name[8] == '_');
+}
+
+static int usage(const char *program, int status, int cwt_only) {
+  if (cwt_only)
+    fprintf(stderr, "Usage: %s [-p threads] <genome.fa[.gz]> <new_directory>\n", program);
+  else
+    fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+                    "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
 
+static int default_threads(void) {
+  long count = sysconf(_SC_NPROCESSORS_ONLN);
+  if (count < 1 || count > INT_MAX) anno_fail("Cannot determine online CPU count");
+  return (int)count;
+}
+
+static int parse_threads(const char *value) {
+  char *end;
+  errno = 0;
+  long count = strtol(value, &end, 10);
+  if (errno || end == value || *end || count < 1 || count > INT_MAX)
+    anno_fail("Invalid thread count: %s", value);
+  return (int)count;
+}
+
 int main(int argc, char **argv) {
+  int cwt_only = cwt_program(argv[0]);
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int epochs = DEFAULT_EPOCHS, option;
+  int iterations = DEFAULT_ITERATIONS, threads = 0, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:h", NULL)) >= 0) {
-    if (option == 'm') model = options.arg;
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
+    if (option == 'h') return usage(argv[0], 0, cwt_only);
+    if (option == 'p') threads = parse_threads(options.arg);
+    else if (cwt_only) return usage(argv[0], 1, cwt_only);
+    else if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
-    else if (option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
-    else return usage(argv[0], option != 'h');
+    else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
+    else return usage(argv[0], 1, cwt_only);
   }
+  if (!threads) threads = default_threads();
   int rest = argc - options.ind;
   char **args = argv + options.ind;
-  int export = rest == 3 && !strcmp(args[0], "cwt");
-  if (!export && (rest < 1 || rest > 2)) return usage(argv[0], 1);
-  if (initial_model && rest != 2) anno_fail("Initial model is only supported for training");
-  crf_init();
+  int export = cwt_only ? rest == 2 : rest == 3 && !strcmp(args[0], "cwt");
+  if (cwt_only ? !export : (!export && (rest < 1 || rest > 2)))
+    return usage(argv[0], 1, cwt_only);
+  if (initial_model && (cwt_only || rest != 2))
+    anno_fail("Initial model is only supported for training");
   Wavelets wavelets;
   wavelets_init(&wavelets);
   if (export) {
-    export_cwt(&wavelets, args[1], args[2]);
+    export_cwt(&wavelets, cwt_only ? args[0] : args[1],
+               cwt_only ? args[1] : args[2], threads);
     wavelets_free(&wavelets);
     return 0;
   }
+  crf_init();
   double *weights = anno_alloc(WEIGHTS, sizeof(*weights));
   if (rest == 1) load_model(model, weights);
   if (initial_model) {
@@ -442,13 +383,15 @@ int main(int argc, char **argv) {
   }
   int count;
   Contig *contigs = read_fasta(args[0], &count);
-  for (int c = 0; c < count; c++)
-    contigs[c].cwt_power = cwt_powers(&wavelets, contigs[c].seq, contigs[c].length);
+  CwtStore cwt = cwt_store(contigs, count);
+  for (int c = 0; c < count; c++) {
+    cwt_powers(&wavelets, contigs[c].seq, contigs[c].length, threads, contigs[c].cwt_power);
+  }
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, epochs);
+    crf_train(contigs, count, weights, iterations, threads);
     save_model(model, weights);
   }
   puts("##gff-version 3");
@@ -464,6 +407,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "Predicted %lu genes\n", genes);
   wavelets_free(&wavelets);
   free_contigs(contigs, count);
+  if (munmap(cwt.data, cwt.size)) anno_fail("Cannot release CWT scratch mapping: %s", strerror(errno));
   free(weights);
   return 0;
 }
