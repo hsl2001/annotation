@@ -10,16 +10,23 @@ from itertools import chain
 
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib.font_manager import FontProperties
+from matplotlib.patches import PathPatch
 import matplotlib.pyplot as plt
+from matplotlib.textpath import TextPath
+from matplotlib.transforms import Affine2D
 plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 
-PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-control", "abs-control-aggt",
+PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-logo", "abs-control", "abs-control-aggt",
               "abs-control-aggt-p1", "abs-first-exons", "abs-last-exons",
               "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat")
 REPEAT_FEATURE_TYPES = frozenset(("repeat_region", "mobile_element"))
 CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
+EXON_LOGO_RADIUS = 15
+EXON_LOGO_WINDOWS = (("start", -50, -10), ("end", 30, 90))
+DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
 
 def open_text(path):
     return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path, "rt")
@@ -91,7 +98,7 @@ def load_matrix(directory):
 def run_anno_cwt(binary, fasta, output):
     executable = str(binary.resolve()) if binary.exists() else str(binary)
     matrix_dir = output / "cwt"
-    subprocess.run([executable, str(fasta), str(matrix_dir)], check=True)
+    subprocess.run([executable, "cwt", str(fasta), str(matrix_dir)], check=True)
     return matrix_dir
 
 
@@ -260,6 +267,118 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
                         shrink=0.65, pad=0.01)
         figure.savefig(out / f"{boundary}.png", dpi=160)
         plt.close(figure)
+
+
+def exon_logo_counts(intervals, sequences, matrix, contigs, radius=EXON_LOGO_RADIUS):
+    counts = np.zeros((2, matrix.shape[1], 2 * radius + 1, 4), dtype=np.int64)
+    offsets = [np.zeros((matrix.shape[1], upper - lower + 1), dtype=np.int64)
+               for _, lower, upper in EXON_LOGO_WINDOWS]
+    base_indices = np.full(256, -1, dtype=np.int8)
+    for index, base in enumerate("ACGT"):
+        base_indices[ord(base)] = index
+    for interval_index, interval in enumerate(intervals):
+        name, start, end, strand = interval
+        contig = contigs[name]
+        sequence = sequences[name]
+        first, last = oriented_bounds(contig, start, end, strand)
+        for boundary_index, (boundary, lower, upper) in enumerate(EXON_LOGO_WINDOWS):
+            center = first if boundary == "start" else last - 1
+            left = max(0, center + lower)
+            right = min(contig["length"], center + upper + 1)
+            if left >= right:
+                continue
+            values = power(matrix[contig[strand] + left:contig[strand] + right])
+            finite = np.isfinite(values)
+            peaks = left + np.argmax(np.where(finite, values, -np.inf), axis=0)
+            for scale in np.flatnonzero(finite.any(axis=0)):
+                peak = int(peaks[scale])
+                offsets[boundary_index][scale, peak - center - lower] += 1
+                logo_left, logo_right = max(0, peak - radius), min(contig["length"], peak + radius + 1)
+                if strand == "+":
+                    fragment = sequence[logo_left:logo_right]
+                else:
+                    fragment = sequence[contig["length"] - logo_right:contig["length"] - logo_left]
+                    fragment = fragment.translate(DNA_COMPLEMENT)[::-1]
+                codes = base_indices[np.frombuffer(fragment.encode("ascii"), dtype=np.uint8)]
+                positions = np.arange(logo_left, logo_right) - peak + radius
+                valid = codes >= 0
+                counts[boundary_index, scale, positions[valid], codes[valid]] += 1
+        if (interval_index + 1) % 10000 == 0:
+            print(f"Aligned {interval_index + 1:,}/{len(intervals):,} abs-exon-logo maxima",
+                  file=sys.stderr, flush=True)
+    return counts, offsets
+
+
+def render_logo_panel(axis, counts, positions, title):
+    totals = counts.sum(axis=1, keepdims=True)
+    probabilities = np.divide(counts, totals, out=np.zeros_like(counts, dtype=np.float64),
+                              where=totals > 0)
+    heights = probabilities
+    colors = ("#2ca25f", "#3182bd", "#f28e2b", "#d73027")
+    font = FontProperties(weight="bold")
+    glyphs = {base: TextPath((0, 0), base, size=1, prop=font) for base in "ACGT"}
+    bounds = {base: glyph.get_extents() for base, glyph in glyphs.items()}
+    for column, position in enumerate(positions):
+        bottom = 0.0
+        for index in np.argsort(heights[column]):
+            height = float(heights[column, index])
+            if height <= 0:
+                continue
+            base = "ACGT"[index]
+            box = bounds[base]
+            scale_x, scale_y = 0.82 / box.width, height / box.height
+            transform = (Affine2D().translate(-box.x0, -box.y0).scale(scale_x, scale_y)
+                         .translate(position - 0.41, bottom) + axis.transData)
+            axis.add_patch(PathPatch(glyphs[base], transform=transform, color=colors[index]))
+            bottom += height
+    axis.set_title(title, loc="left")
+    axis.set_ylabel("Base frequency")
+    axis.set_ylim(0, 1.02)
+    axis.set_yticks((0, 0.5, 1))
+    axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
+    axis.set_axisbelow(True)
+    axis.set_xticks(np.linspace(positions[0], positions[-1], 5, dtype=int))
+    axis.set_xlabel("Position from exon boundary (bp)")
+
+
+def render_exon_logo(intervals, sequences, matrix, contigs, widths, out):
+    counts, offsets = exon_logo_counts(intervals, sequences, matrix, contigs)
+    positions = np.arange(-EXON_LOGO_RADIUS, EXON_LOGO_RADIUS + 1)
+    parameter = next(iter(contigs.values())).get("parameter", "Kernel width")
+    figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6),
+                                sharey=True, layout="constrained", squeeze=False)
+    for boundary_index, (boundary, lower, upper) in enumerate(EXON_LOGO_WINDOWS):
+        for scale, width in enumerate(widths):
+            axis = axes[boundary_index, scale]
+            samples = int(offsets[boundary_index][scale].sum())
+            render_logo_panel(axis, counts[boundary_index, scale], positions,
+                              f"Exon {boundary}; {parameter} {width} bp\n{samples:,} maxima")
+            axis.title.set_fontsize(10)
+            axis.set_xlim(-EXON_LOGO_RADIUS - 0.5, EXON_LOGO_RADIUS + 0.5)
+            axis.set_xticks((-EXON_LOGO_RADIUS, 0, EXON_LOGO_RADIUS))
+            axis.axvline(0, color="#555555", linestyle="--", linewidth=0.8)
+            axis.set_xlabel("Position from individual CWT power maximum (bp)")
+    figure.suptitle("CWT-maxima-aligned exon logos; " + "; ".join(
+        f"{boundary} search {lower:+d}..{upper:+d} bp" for boundary, lower, upper in EXON_LOGO_WINDOWS),
+        fontsize=12)
+    figure.savefig(out / "logo.png", dpi=180)
+    plt.close(figure)
+    with open(out / "maxima-offsets.tsv", "w", newline="") as stream:
+        writer = csv.writer(stream, delimiter="\t")
+        writer.writerow(("boundary", "scale", "offset_bp", "n_maxima", "at_window_edge"))
+        for boundary_index, (boundary, lower, upper) in enumerate(EXON_LOGO_WINDOWS):
+            for scale, width in enumerate(widths):
+                for offset in range(lower, upper + 1):
+                    writer.writerow((boundary, width, offset, int(offsets[boundary_index][scale, offset - lower]),
+                                     int(offset in (lower, upper))))
+    with open(out / "maxima-counts.tsv", "w", newline="") as stream:
+        writer = csv.writer(stream, delimiter="\t")
+        writer.writerow(("boundary", "scale", "offset_from_maximum", "n_valid", "A", "C", "G", "T"))
+        for boundary_index, (boundary, _, _) in enumerate(EXON_LOGO_WINDOWS):
+            for scale, width in enumerate(widths):
+                for position_index, position in enumerate(positions):
+                    row = counts[boundary_index, scale, position_index]
+                    writer.writerow((boundary, width, int(position), int(row.sum()), *row.tolist()))
 
 
 def splice_positions(path, contigs):
@@ -460,14 +579,19 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             output_dirs[name].rmdir()
         names = [name for name in names if name not in repeat_names]
     prepared = {}
-    if any("control-aggt" in name for name in names):
+    needs_sequences = "abs-exon-logo" in names or any("control-aggt" in name for name in names)
+    if needs_sequences:
         sequences = read_sequences(fasta, contigs)
+    if any("control-aggt" in name for name in names):
         prepared[False] = prepare_aggt_controls(contigs, intervals["exons"], sequences)
         if repeat_masks is not None:
             masks, candidates, end_masks = prepared[False]
             prepared[True] = ({name: mask | repeat_masks[name] for name, mask in masks.items()},
                               candidates, end_masks)
     for name in names:
+        if name == "abs-exon-logo":
+            render_exon_logo(intervals["exons"], sequences, matrix, contigs, widths, output_dirs[name])
+            continue
         group = name.removeprefix("abs-").removesuffix("-mutated")
         base_group = group.removesuffix("-no-repeat")
         repeat_free = group.endswith("-no-repeat")
@@ -605,18 +729,20 @@ def nonnegative(text):
 def add_pipeline_arguments(command, output_name):
     command.add_argument("fasta", type=pathlib.Path)
     command.add_argument("--out", type=pathlib.Path, default=pathlib.Path(output_name))
-    command.add_argument("--anno-cwt", type=pathlib.Path, default=pathlib.Path("./anno_cwt"))
+    command.add_argument("--anno-cwt", type=pathlib.Path, default=pathlib.Path("./anno"))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate CWT with anno_cwt, then plot and normalize genomic intervals")
+    parser = argparse.ArgumentParser(description="Generate CWT with anno cwt, then plot and normalize genomic intervals")
     commands = parser.add_subparsers(dest="command", required=True)
     draw = commands.add_parser(
         "draw", help="run absolute exon/control plots; --no-* skips a plot",
         description="draw generates abs-* patterns only. Repeat-free controls exclude bodies overlapping GFF "
                     "repeat_region or mobile_element features; plotted flanks are not excluded. "
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
-                    f"+/-{ABS_RADIUS} bp boundary windows.")
+                    f"+/-{ABS_RADIUS} bp boundary windows. abs-exon-logo aligns sequences to each scale's "
+                    "individual CWT power maximum (leftmost on ties), searching start -50..-10 bp and "
+                    f"end +30..+90 bp, with +/-{EXON_LOGO_RADIUS} bp logos.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
     draw.add_argument("--rows", type=positive, default=1500)
