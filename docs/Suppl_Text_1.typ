@@ -32,4 +32,20 @@ Genomic sequence analysis using continuous wavelet transform
 Complex numbers are represented as $z = p + i q$, while $i^2 = - 1$. $p$ is called as the real part, while $q$ is the imaginary part.
 This represents a point $\( p \, q \)$ on the complex plane.
 The size and conjugates of complex numbers are defined as follows
+$
+    overline(z) & = p - i q, \
+        \| z \| & = sqrt(p^2 + q^2), \
+  z overline(z) & = \| z \|^2 .
+$ <complex-defs>
+The integral of a complex function is obtained by integrating the real part and the imaginary part seperately.
+$
+  integral \( p \( t \) + i q \( t \) \) thin d t = integral p \( t \) thin d t + i integral q \( t \) thin d t .
+$ <complex-integral-def>
+
+=== Rotation and complex numbers
+From Euler's equation (@euler-equation),
+$
+  e^(i theta) = cos theta + i sin theta .
+$ <euler-equation>
+$e^(i omega t)$ is a signal in which a point of size 1 rotates at angular velocity $omega$.
 
