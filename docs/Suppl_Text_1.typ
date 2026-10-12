@@ -29,5 +29,7 @@ Genomic sequence analysis using continuous wavelet transform
 
 == Signal transform of genomic sequences using complex numbers
 === Complex numbers
-Complex numbers are represented as $z = p + i q$, while $i^2 = - 1$. $p$ is called as real part, while $q$ is imaginary part.
+Complex numbers are represented as $z = p + i q$, while $i^2 = - 1$. $p$ is called as the real part, while $q$ is the imaginary part.
+This represents a point $\( p \, q \)$ on the complex plane.
+The size and conjugates of complex numbers are defined as follows
 
