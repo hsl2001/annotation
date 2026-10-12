@@ -36,6 +36,8 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 #include <stdlib.h>
 #include <string.h>
 
+#define CRF_WINDOW_SIZE 65536
+
 typedef struct {
   uint16_t k4[2];
   float cwt_power[WAVE_COUNT];
@@ -258,7 +260,6 @@ static void add_transition(double *gradient, const Site *site, int previous, int
   }
 }
 
-enum { CRF_WINDOW_SIZE = 1000000 };
 typedef struct { double *checkpoint, *alpha, *scale; int block_size; } Work;
 
 static double log_add(double left, double right) {
@@ -640,8 +641,6 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   CrfObjective objective = {
     .train = {.windows = windows, .count = window_count, .threads = threads}
   };
-  if (window_count < (size_t)objective.train.threads)
-    objective.train.threads = (int)window_count;
   atomic_init(&objective.train.next_instance, 0);
   fprintf(stderr, "Using %d worker threads for %zu training windows\n",
           objective.train.threads, objective.train.count);

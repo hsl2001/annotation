@@ -15,9 +15,6 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#endif
 #include <unistd.h>
 #include <zlib.h>
 
@@ -334,20 +331,6 @@ static int usage(const char *program, int status, int cwt_only) {
   return status;
 }
 
-static int default_threads(void) {
-#ifdef __APPLE__
-  int count;
-  size_t count_size = sizeof(count);
-  if (sysctlbyname("hw.logicalcpu", &count, &count_size, NULL, 0) != 0 || count < 1)
-    anno_fail("Cannot determine online CPU count");
-  return count;
-#else
-  long count = sysconf(_SC_NPROCESSORS_ONLN);
-  if (count < 1 || count > INT_MAX) anno_fail("Cannot determine online CPU count");
-  return (int)count;
-#endif
-}
-
 static int parse_threads(const char *value) {
   char *end;
   errno = 0;
@@ -361,7 +344,7 @@ int main(int argc, char **argv) {
   int cwt_only = cwt_program(argv[0]);
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int iterations = DEFAULT_ITERATIONS, threads = 0, option;
+  int iterations = DEFAULT_ITERATIONS, threads = 1, option;
   ketopt_t options = KETOPT_INIT;
   while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
     if (option == 'h') return usage(argv[0], 0, cwt_only);
@@ -372,7 +355,6 @@ int main(int argc, char **argv) {
     else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
     else return usage(argv[0], 1, cwt_only);
   }
-  if (!threads) threads = default_threads();
   int rest = argc - options.ind;
   char **args = argv + options.ind;
   int export = cwt_only ? rest == 2 : rest == 3 && !strcmp(args[0], "cwt");
