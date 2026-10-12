@@ -1,12 +1,8 @@
-#ifdef __APPLE__
-#define _DARWIN_C_SOURCE
-#endif
 #define _POSIX_C_SOURCE 200809L
 #include "anno.h"
 #include "kseq.h"
 #include "ketopt.h"
 #include <errno.h>
-#include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
@@ -15,24 +11,15 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#endif
-#include <unistd.h>
 #include <zlib.h>
 
 #define RFFT_IMPLEMENTATION
 #include "rfft.h"
-#define LBFGS_IMPLEMENTATION
-#include "lbfgs.h"
 #define CRF_IMPLEMENTATION
 #include "crf.h"
+#include "cwt.h"
 
 KSEQ_INIT(gzFile, gzread)
-
-const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
-
-#include "cwt.h"
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -78,11 +65,6 @@ int base_index(char base) {
   }
 }
 
-static void cwt_powers(const Wavelets *wavelets, const char *sequence, int length,
-                       int threads, float *powers) {
-  cwt_transform(wavelets, sequence, length, threads, NULL, NULL, powers);
-}
-
 typedef struct { float *data; size_t size; } CwtStore;
 
 static CwtStore cwt_store(Contig *contigs, int count) {
@@ -107,7 +89,7 @@ static CwtStore cwt_store(Contig *contigs, int count) {
   return (CwtStore){data, mapping_size};
 }
 
-Contig *read_fasta(const char *path, int *count) {
+static Contig *read_fasta(const char *path, int *count) {
   gzFile input = gzopen(!strcmp(path, "-") ? "/dev/stdin" : path, "rb");
   if (!input) anno_fail("Cannot open FASTA: %s", path);
   kseq_t *record = kseq_init(input);
@@ -150,7 +132,7 @@ static int by_parent(const void *x, const void *y) {
 static int by_total(const void *x, const void *y) { return ((const Group *)y)->total - ((const Group *)x)->total; }
 
 /* Label CDS and introns from GFF3, one transcript per locus (longest CDS wins). */
-int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
+static int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
   gzFile input = gzopen(path, "rb");
   if (!input) anno_fail("Cannot open GFF: %s", path);
   kstream_t *stream = ks_init(input);
@@ -224,7 +206,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
 
 static int is_cds(int state) { return (state >= 1 && state <= 3) || (state >= 7 && state <= 9); }
 
-void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
+static void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
   for (int i = 0; i < c->length;) {
     if (!path[i]) { i++; continue; }
     int minus = path[i] >= 7, start = i, coding = 0;
@@ -250,7 +232,7 @@ static void save_model(const char *path, const double *w) {
   float *values = anno_alloc(WEIGHTS, sizeof(*values));
   for (int i = 0; i < WEIGHTS; i++) values[i] = (float)w[i];
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRFE", 1, 8, file) != 8 ||
+  if (!file || fwrite(MODEL_MAGIC, 1, 8, file) != 8 ||
       fwrite(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
   free(values);
@@ -261,7 +243,7 @@ static void load_model(const char *path, double *w) {
   FILE *file = fopen(path, "rb");
   char magic[8];
   if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (memcmp(magic, "ANNOCRFE", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
+  if (memcmp(magic, MODEL_MAGIC, 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
   if (fread(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
@@ -282,8 +264,7 @@ static FILE *create_in(const char *directory, const char *name) {
 }
 
 /* Raw complex64 CWT export for plot_cwt.py: plus strand rows then reverse-complement rows. */
-static void export_cwt(const Wavelets *wavelets, const char *fasta,
-                       const char *directory, int threads) {
+static void export_cwt(const Wavelets *wavelets, const char *fasta, const char *directory) {
   int count;
   Contig *contigs = read_fasta(fasta, &count);
   if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
@@ -308,7 +289,7 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta,
       size_t mapping_size;
       off_t file_position;
       float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
-      cwt_transform(wavelets, bases, g->length, threads, NULL, values, NULL);
+      cwt_transform(wavelets, bases, g->length, values, NULL);
       cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
     }
     free(reverse);
@@ -327,64 +308,37 @@ static int cwt_program(const char *program) {
 
 static int usage(const char *program, int status, int cwt_only) {
   if (cwt_only)
-    fprintf(stderr, "Usage: %s [-p threads] <genome.fa[.gz]> <new_directory>\n", program);
+    fprintf(stderr, "Usage: %s <genome.fa[.gz]> <new_directory>\n", program);
   else
-    fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                    "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
+    fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e epochs] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+                    "       %s cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
-}
-
-static int default_threads(void) {
-#ifdef __APPLE__
-  int count;
-  size_t count_size = sizeof(count);
-  if (sysctlbyname("hw.logicalcpu", &count, &count_size, NULL, 0) != 0 || count < 1)
-    anno_fail("Cannot determine online CPU count");
-  return count;
-#else
-  long count = sysconf(_SC_NPROCESSORS_ONLN);
-  if (count < 1 || count > INT_MAX) anno_fail("Cannot determine online CPU count");
-  return (int)count;
-#endif
-}
-
-static int parse_threads(const char *value) {
-  char *end;
-  errno = 0;
-  long count = strtol(value, &end, 10);
-  if (errno || end == value || *end || count < 1 || count > INT_MAX)
-    anno_fail("Invalid thread count: %s", value);
-  return (int)count;
 }
 
 int main(int argc, char **argv) {
   int cwt_only = cwt_program(argv[0]);
-  const char *model = "anno.model";
+  const char *model = DEFAULT_MODEL;
   const char *initial_model = NULL;
-  int iterations = DEFAULT_ITERATIONS, threads = 0, option;
+  int epochs = DEFAULT_EPOCHS, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:h", NULL)) >= 0) {
     if (option == 'h') return usage(argv[0], 0, cwt_only);
-    if (option == 'p') threads = parse_threads(options.arg);
-    else if (cwt_only) return usage(argv[0], 1, cwt_only);
-    else if (option == 'm') model = options.arg;
-    else if (option == 'i') initial_model = options.arg;
-    else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
+    if (!cwt_only && option == 'm') model = options.arg;
+    else if (!cwt_only && option == 'i') initial_model = options.arg;
+    else if (!cwt_only && option == 'e' && atoi(options.arg) > 0) epochs = atoi(options.arg);
     else return usage(argv[0], 1, cwt_only);
   }
-  if (!threads) threads = default_threads();
   int rest = argc - options.ind;
   char **args = argv + options.ind;
   int export = cwt_only ? rest == 2 : rest == 3 && !strcmp(args[0], "cwt");
   if (cwt_only ? !export : (!export && (rest < 1 || rest > 2)))
     return usage(argv[0], 1, cwt_only);
-  if (initial_model && (cwt_only || rest != 2))
+  if (initial_model && rest != 2)
     anno_fail("Initial model is only supported for training");
   Wavelets wavelets;
   wavelets_init(&wavelets);
   if (export) {
-    export_cwt(&wavelets, cwt_only ? args[0] : args[1],
-               cwt_only ? args[1] : args[2], threads);
+    export_cwt(&wavelets, cwt_only ? args[0] : args[1], cwt_only ? args[1] : args[2]);
     wavelets_free(&wavelets);
     return 0;
   }
@@ -398,14 +352,13 @@ int main(int argc, char **argv) {
   int count;
   Contig *contigs = read_fasta(args[0], &count);
   CwtStore cwt = cwt_store(contigs, count);
-  for (int c = 0; c < count; c++) {
-    cwt_powers(&wavelets, contigs[c].seq, contigs[c].length, threads, contigs[c].cwt_power);
-  }
+  for (int c = 0; c < count; c++)
+    cwt_transform(&wavelets, contigs[c].seq, contigs[c].length, NULL, contigs[c].cwt_power);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, iterations, threads);
+    crf_train(contigs, count, weights, epochs);
     save_model(model, weights);
   }
   puts("##gff-version 3");

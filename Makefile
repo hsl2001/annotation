@@ -1,9 +1,9 @@
 CC = cc
-CFLAGS = -O3 -std=c11 -Wall -Wextra -pthread
+CFLAGS = -O3 -std=c11 -Wall -Wextra
 LIBS = -lz -lm
 
 PROGRAMS = anno anno_cwt
-HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
+HEADERS = adam.h anno.h crf.h cwt.h kseq.h ketopt.h rfft.h
 
 .PHONY: all clean
 

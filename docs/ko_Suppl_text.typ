@@ -102,6 +102,65 @@ $ <example-dna-signal>
 이 때, 서열 밖은 0으로 정의된다.
 이 방식을 통하여 계산할 신호를 정확히 정의할 수 있다.
 
+두 염기서열 `ACGT`와 `ATGC`를 예로 들면, 앞서 정의한 인코딩에 따라 각각 $\[ 1 \, i \, - i \, - 1 \]$과 $\[ 1 \, - 1 \, - i \, i \]$가 된다.
+아래 그림은 각 복소값의 실수부와 허수부를 따로 나타낸 것이다.
+염기 번호 $n$의 값은 $n - 1 / 2 lt.eq t < n + 1 / 2$ 구간에서 유지되며, 서열 바깥의 신호는 0이다.
+#figure(
+  cetz.canvas(length: 1cm, {
+    import cetz.draw: *
+    set-style(stroke: (thickness: 0.7pt, cap: "round"))
+    let amplitude = 0.55
+    let draw-component(x, y, values, color) = {
+      line((x, y), (x + 4, y), stroke: rgb("CBD5E1") + 0.55pt)
+      for i in range(0, 4) {
+        let level = values.at(i)
+        let segment-y = y + amplitude * level
+        line((x + i, segment-y), (x + i + 1, segment-y), stroke: color + 1.5pt)
+        if i == 0 {
+          line((x, y), (x, segment-y), stroke: color + 1.5pt)
+        } else {
+          let previous-y = y + amplitude * values.at(i - 1)
+          line((x + i, previous-y), (x + i, segment-y), stroke: color + 1.5pt)
+        }
+      }
+      line(
+        (x + 4, y + amplitude * values.at(3)),
+        (x + 4, y),
+        stroke: color + 1.5pt,
+      )
+      content((x - 0.18, y + amplitude), [$1$], anchor: "east")
+      content((x - 0.18, y), [$0$], anchor: "east")
+      content((x - 0.18, y - amplitude), [$-1$], anchor: "east")
+    }
+    let draw-example(x, title, bases, real, imaginary) = {
+      content((x + 2, 7.45), title, anchor: "center")
+      line((x, 6.05), (x + 4, 6.05), stroke: rgb("64748B") + 0.7pt)
+      line((x, 6.85), (x + 4, 6.85), stroke: rgb("64748B") + 0.7pt)
+      for i in range(0, 5) {
+        line((x + i, 6.05), (x + i, 6.85), stroke: rgb("64748B") + 0.7pt)
+      }
+      for i in range(0, 4) {
+        content((x + i + 0.5, 6.45), bases.at(i), anchor: "center")
+      }
+      content((x - 0.72, 4.8), [Re], anchor: "east")
+      content((x - 0.72, 2.4), [Im], anchor: "east")
+      draw-component(x, 4.8, real, rgb("2563EB"))
+      draw-component(x, 2.4, imaginary, rgb("EA580C"))
+      line((x, 0.85), (x + 4.1, 0.85), stroke: rgb("64748B") + 0.7pt, mark: (end: "stealth"))
+      let indices = ([0], [1], [2], [3])
+      for i in range(0, 4) {
+        let center = x + i + 0.5
+        line((center, 0.75), (center, 0.95), stroke: rgb("64748B") + 0.7pt)
+        content((center, 0.62), indices.at(i), anchor: "north")
+      }
+      content((x + 2, 0.1), [시간 위치 $t$ (bp)], anchor: "north")
+    }
+    draw-example(1.4, [서열 1: ACGT], ([A], [C], [G], [T]), (1, 0, 0, -1), (0, 1, -1, 0))
+    draw-example(8.4, [서열 2: ATGC], ([A], [T], [G], [C]), (1, -1, 0, 0), (0, 0, -1, 1))
+  }),
+  caption: [두 DNA 서열을 복소 신호로 인코딩한 예. 가로축은 염기 위치이고, 파란색과 주황색 계단은 각각 신호의 실수부와 허수부이다. 각 칸은 $n - 1 / 2$부터 $n + 1 / 2$ 직전까지의 값을 나타내며, 경계점의 열린·닫힌 표시는 그림에서 생략했다.],
+)
+
 == 3. DNA 신호를 분석하기 위한 Wavelet
 === 3.1. 위치별 서열 신호 패턴의 분석
 푸리에 분석은 신호 전체에 $e^(i omega t)$가 얼마나 포함되어 있는지를 정량할 수 있다.
@@ -118,11 +177,12 @@ $ <gauss-window-omega-6>
 형태가 된다.
 이 wavelet은 실수부는 중심값이 큰 코사인 진동, 허수부는 중심값이 큰 사인 진동이다.
 임의로 정한 Mother wavelet의 중심 각속도 $omega_0 &= 6$는 반드시 6일 필요는 없다.
+(6.0은 다양한 CWT 문헌에서 경험적으로 사용하는 값이다.)
 같은 스케일에서 $omega_0$만 바꾸면 가우스 창의 폭은 그대로이고 그 촘촘함이 변한다.
 #cf[$omega_0$가 크면 Morlet wavelet 코일이 더 촘촘해진다고 보면 된다.]
 많은 신호분석 문헌에서 6이 경험적으로 좋은 시간-주파수 해상도를 보이는 것이 알려져 있다.
-#cf[시간-주파수 해상도와 하이젠버그의 불확정성 원리: \
-  #t[to be written...]
+#cf[시간-주파수 해상도와 하이젠버그의 불확정성 원리:
+  시간 폭 $Delta t$와 각주파수 폭 $Delta omega$를 각각 에너지 분포의 표준편차로 정의하면, 그 곱은 $Delta t thin Delta omega gt.eq 1 \/ 2$를 만족한다. 즉, 신호를 시간상 더 좁은 구간에 국소화할수록 주파수 성분은 더 넓게 퍼지고, 반대도 마찬가지다. 가우스 창을 복소 진동으로 변조한 함수는 이 하한을 달성하며, 변조 주파수 $omega_0$는 창의 중심 주파수를 옮긴다. $omega_0$가 커지면 창 안의 진동 횟수가 늘어 주파수를 더 세밀하게 구분할 수 있지만, 짧은 위치 패턴을 포착하는 데에는 불리해진다. 따라서 $omega_0 = 6$은 시간상 위치를 찾는 능력과 주파수를 구분하는 능력 사이의 실용적인 절충값으로 널리 사용된다.
 ]
 여기서 Mother wavelet이란, wavelet을 sliding하고 scaling하는 기준이 되는, 스케일 1·위치 0의 wavelet이다.
 === 3.2. 웨이블릿의 조건 1 - 영평균 조건
@@ -176,8 +236,8 @@ $ <gauss-integral-2-proof-1>
 가우스 함수는 $\| u \|$를 곱해도 적분 가능할 정도로 빠르게 감소하는 것이 알려져 있다.
 따라서, $s$에 대한 미분을 적분 안으로 옮길 수 있다.
 $e^(i s u)$를 $s$로 미분하면 $i u e^(i s u)$이다.
-#cf[이러한 교환이 가능한 이유:\
-  #t[to be written...]
+#cf[이러한 교환이 가능한 이유:
+  $s$가 실수일 때 피적분함수를 $s$로 미분하면 $i u e^(- u^2 \/ 2) e^(i s u)$가 된다. 이 미분항의 절댓값은 $|e^(i s u)| = 1$이므로 모든 $s$에서 $|u| e^(- u^2 \/ 2)$ 이하이고, 이 상계는 실수 전체에서 적분 가능하다. 따라서 지배수렴정리를 적용하여 미분과 적분의 순서를 바꿀 수 있다.
 ]
 $
   F' \( s \) = i integral_(bb(R)) u e^(- u^2 \/ 2) e^(i s u) thin d u .
