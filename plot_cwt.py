@@ -5,8 +5,8 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
-from itertools import chain
+from collections import Counter, defaultdict
+from itertools import chain, product
 
 import matplotlib
 matplotlib.use("Agg")
@@ -18,7 +18,7 @@ from matplotlib.transforms import Affine2D
 plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 
-PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-logo", "abs-control", "abs-control-aggt",
+PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-logo", "abs-exon-kmer", "abs-control", "abs-control-aggt",
               "abs-control-aggt-p1", "abs-first-exons", "abs-last-exons",
               "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat",
               "abs-control-aggt-no-repeat-logo")
@@ -29,6 +29,10 @@ CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
 EXON_LOGO_RADIUS = 100
 EXON_LOGO_CWT_MAXIMA = {"start": -26, "end": 60}
+EXON_KMER_SIZES = (3, 5)
+EXON_KMER_FLANK = 100
+EXON_KMER_CWT_SCALES = (4, 5, 6)
+EXON_KMER_TOP_N = 20
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
 
 def open_text(path):
@@ -354,6 +358,98 @@ def render_exon_logo(intervals, sequences, out, feature="exon", show_cwt_maxima=
     plt.close(figure)
 
 
+def oriented_kmer(sequence, center, strand, size=EXON_KMER_SIZES[-1]):
+    if size < 1 or size % 2 == 0:
+        raise ValueError("Exon k-mer size must be a positive odd integer")
+    half = size // 2
+    if strand == "+":
+        start, end = center - half, center + half + 1
+        if start < 0 or end > len(sequence):
+            return None
+        kmer = sequence[start:end]
+    else:
+        start, end = len(sequence) - center - half - 1, len(sequence) - center + half
+        if start < 0 or end > len(sequence):
+            return None
+        kmer = sequence[start:end].translate(DNA_COMPLEMENT)[::-1]
+    return kmer if all(base in "ACGT" for base in kmer) else None
+
+
+def canonical_kmer(kmer):
+    reverse_complement = kmer.translate(DNA_COMPLEMENT)[::-1]
+    return min(kmer, reverse_complement)
+
+
+def exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size):
+    parameter = next(iter(contigs.values())).get("parameter", "Scale")
+    if parameter == "Scale":
+        scale_indices = [widths.index(scale) for scale in EXON_KMER_CWT_SCALES if scale in widths]
+    else:
+        scale_indices = list(range(min(len(widths), len(EXON_KMER_CWT_SCALES))))
+    if not scale_indices:
+        raise ValueError("CWT matrix has no scales available for exon k-mer maxima")
+
+    peaks = {boundary: [] for boundary in ("start", "end")}
+    for name, start, end, strand in intervals:
+        contig = contigs[name]
+        first, last = oriented_bounds(contig, start, end, strand)
+        flank_bounds = {
+            "start": (max(0, first - EXON_KMER_FLANK), first),
+            "end": (last, min(contig["length"], last + EXON_KMER_FLANK)),
+        }
+        for boundary, (left, right) in flank_bounds.items():
+            if left >= right:
+                continue
+            values = power(matrix[contig[strand] + left:contig[strand] + right])
+            mean_power = np.mean(values[:, scale_indices], axis=1)
+            maximum = left + int(np.nanargmax(mean_power))
+            kmer = oriented_kmer(sequences[name], maximum, strand, size)
+            if kmer is not None:
+                peaks[boundary].append(canonical_kmer(kmer))
+    return peaks
+
+
+def displayed_kmer_counts(kmers, size):
+    counts = Counter(canonical_kmer(kmer) for kmer in kmers)
+    if size == 3:
+        displayed = {canonical_kmer("".join(bases))
+                     for bases in product("ACGT", repeat=size)}
+    else:
+        displayed = set(counts)
+    ranked = sorted(displayed, key=lambda kmer: (-counts[kmer], kmer))
+    if size != 3:
+        ranked = ranked[:EXON_KMER_TOP_N]
+    return ranked, [counts[kmer] for kmer in ranked]
+
+
+def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out):
+    peaks = {size: exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size)
+             for size in EXON_KMER_SIZES}
+    figure, axes = plt.subplots(len(EXON_KMER_SIZES), 2, figsize=(15, 5.5 * len(EXON_KMER_SIZES)),
+                                layout="constrained", squeeze=False)
+    colors = {"start": "#25827b", "end": "#d97941"}
+    labels = {"start": f"Upstream flank (-{EXON_KMER_FLANK} to -1 bp)",
+              "end": f"Downstream flank (+1 to +{EXON_KMER_FLANK} bp)"}
+    for row, size in enumerate(EXON_KMER_SIZES):
+        for column, boundary in enumerate(("start", "end")):
+            axis = axes[row, column]
+            kmers, counts = displayed_kmer_counts(peaks[size][boundary], size)
+            bars = axis.barh(kmers, counts, color=colors[boundary])
+            axis.invert_yaxis()
+            axis.bar_label(bars, padding=2, fontsize=7)
+            axis.set_xlabel("Exon count")
+            axis.set_ylabel("Canonical k-mer")
+            detail = "all 32" if size == 3 else f"top {EXON_KMER_TOP_N} of {len(set(peaks[size][boundary]))}"
+            axis.set_title(f"{size}-mer, {labels[boundary]} "
+                           f"(n={len(peaks[size][boundary]):,}; showing {detail})")
+            axis.tick_params(axis="y", labelsize=8)
+            if counts:
+                axis.set_xlim(0, max(counts) * 1.15)
+    figure.suptitle("Canonical k-mer counts around exon CWT maxima (mean power, scales 4-6)")
+    figure.savefig(out / "counts.png", dpi=180)
+    plt.close(figure)
+
+
 def splice_positions(path, contigs):
     transcripts = defaultdict(list)
     for row in gff_records(path):
@@ -595,7 +691,8 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             output_dirs[name].rmdir()
         names = [name for name in names if name not in repeat_names]
     prepared = {}
-    needs_sequences = "abs-exon-logo" in names or any("control-aggt" in name for name in names)
+    needs_sequences = ("abs-exon-logo" in names or "abs-exon-kmer" in names
+                       or any("control-aggt" in name for name in names))
     if needs_sequences:
         sequences = read_sequences(fasta, contigs)
     if any("control-aggt" in name for name in names):
@@ -607,6 +704,9 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
     for name in names:
         if name == "abs-exon-logo":
             render_exon_logo(intervals["exons"], sequences, output_dirs[name])
+            continue
+        if name == "abs-exon-kmer":
+            render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences, output_dirs[name])
             continue
         if name == AGGT_CONTROL_LOGO:
             render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
@@ -762,7 +862,9 @@ def main():
                     "repeat_region or mobile_element features; plotted flanks are not excluded. "
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
                     f"+/-{ABS_RADIUS} bp boundary windows. abs-exon-logo shows base frequencies in the "
-                    f"{EXON_LOGO_RADIUS} bp upstream of exon starts and downstream of exon ends.")
+                    f"{EXON_LOGO_RADIUS} bp upstream of exon starts and downstream of exon ends. "
+                    f"abs-exon-kmer plots canonical 3-mer and 5-mer counts around CWT maxima "
+                    f"within {EXON_KMER_FLANK} bp exon flanks.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
     draw.add_argument("--rows", type=positive, default=1500)
