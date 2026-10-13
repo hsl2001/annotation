@@ -5,8 +5,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
-from collections import Counter, defaultdict
-from itertools import chain, product
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+from itertools import chain
 
 import matplotlib
 matplotlib.use("Agg")
@@ -29,10 +30,13 @@ CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
 EXON_LOGO_RADIUS = 100
 EXON_LOGO_CWT_MAXIMA = {"start": -26, "end": 60}
-EXON_KMER_SIZES = (3, 5)
 EXON_KMER_FLANK = 100
 EXON_KMER_CWT_SCALES = (4, 5, 6)
-EXON_KMER_TOP_N = 20
+EXON_KMER_CONTEXT_RADIUS = 10
+MEME_TIME_SECONDS = 14400
+MEME_MOTIF_COUNT = 3
+MEME_MIN_WIDTH = 6
+MEME_MAX_WIDTH = 50
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
 
 def open_text(path):
@@ -298,11 +302,7 @@ def exon_logo_counts(intervals, sequences, radius=EXON_LOGO_RADIUS):
     return counts
 
 
-def render_logo_panel(axis, counts, positions):
-    totals = counts.sum(axis=1, keepdims=True)
-    probabilities = np.divide(counts, totals, out=np.zeros_like(counts, dtype=np.float64),
-                              where=totals > 0)
-    heights = probabilities
+def draw_logo_heights(axis, heights, positions, ylabel, ymax, yticks):
     colors = ("#2ca25f", "#3182bd", "#f28e2b", "#d73027")
     font = FontProperties(weight="bold")
     glyphs = {base: TextPath((0, 0), base, size=1, prop=font) for base in "ACGT"}
@@ -320,13 +320,42 @@ def render_logo_panel(axis, counts, positions):
                          .translate(position - 0.41, bottom) + axis.transData)
             axis.add_patch(PathPatch(glyphs[base], transform=transform, color=colors[index]))
             bottom += height
-    axis.set_ylabel("Base frequency")
-    axis.set_ylim(0, 1.02)
-    axis.set_yticks((0, 0.5, 1))
+    axis.set_ylabel(ylabel)
+    axis.set_ylim(0, ymax)
+    axis.set_yticks(yticks)
     axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
     axis.set_axisbelow(True)
     axis.set_xticks(np.linspace(positions[0], positions[-1], 5, dtype=int))
     axis.set_xlabel("Position from exon boundary (bp)")
+
+
+def render_logo_panel(axis, counts, positions):
+    totals = counts.sum(axis=1, keepdims=True)
+    probabilities = np.divide(counts, totals, out=np.zeros_like(counts, dtype=np.float64),
+                              where=totals > 0)
+    draw_logo_heights(axis, probabilities, positions, "Base frequency", 1.02, (0, 0.5, 1))
+
+
+def render_meme_logo(axis, motif, title=None):
+    probabilities = motif["probabilities"]
+    terms = np.zeros_like(probabilities)
+    nonzero = probabilities > 0
+    terms[nonzero] = probabilities[nonzero] * np.log2(probabilities[nonzero])
+    information = np.maximum(2.0 + terms.sum(axis=1), 0.0)
+    heights = probabilities * information[:, None]
+    positions = np.arange(1, len(probabilities) + 1)
+    draw_logo_heights(axis, heights, positions, "Information (bits)", 2.05, (0, 1, 2))
+    tick_step = max(1, len(positions) // 8)
+    ticks = positions[::tick_step]
+    if ticks[-1] != positions[-1]:
+        ticks = np.append(ticks, positions[-1])
+    axis.set_xticks(ticks)
+    axis.set_xlim(0.5, len(positions) + 0.5)
+    axis.set_xlabel("Motif position")
+    if title is None:
+        title = (f"{motif['label']}: {motif['name']}\nwidth={motif['width']}, "
+                 f"sites={motif['sites']:,}, E={motif['e_value']}")
+    axis.set_title(title, fontsize=9)
 
 
 def render_exon_logo(intervals, sequences, out, feature="exon", show_cwt_maxima=True):
@@ -358,29 +387,7 @@ def render_exon_logo(intervals, sequences, out, feature="exon", show_cwt_maxima=
     plt.close(figure)
 
 
-def oriented_kmer(sequence, center, strand, size=EXON_KMER_SIZES[-1]):
-    if size < 1 or size % 2 == 0:
-        raise ValueError("Exon k-mer size must be a positive odd integer")
-    half = size // 2
-    if strand == "+":
-        start, end = center - half, center + half + 1
-        if start < 0 or end > len(sequence):
-            return None
-        kmer = sequence[start:end]
-    else:
-        start, end = len(sequence) - center - half - 1, len(sequence) - center + half
-        if start < 0 or end > len(sequence):
-            return None
-        kmer = sequence[start:end].translate(DNA_COMPLEMENT)[::-1]
-    return kmer if all(base in "ACGT" for base in kmer) else None
-
-
-def canonical_kmer(kmer):
-    reverse_complement = kmer.translate(DNA_COMPLEMENT)[::-1]
-    return min(kmer, reverse_complement)
-
-
-def exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size):
+def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
     parameter = next(iter(contigs.values())).get("parameter", "Scale")
     if parameter == "Scale":
         scale_indices = [widths.index(scale) for scale in EXON_KMER_CWT_SCALES if scale in widths]
@@ -389,7 +396,8 @@ def exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size):
     if not scale_indices:
         raise ValueError("CWT matrix has no scales available for exon k-mer maxima")
 
-    peaks = {boundary: [] for boundary in ("start", "end")}
+    windows = {boundary: [] for boundary in ("start", "end")}
+    skipped = 0
     for name, start, end, strand in intervals:
         contig = contigs[name]
         first, last = oriented_bounds(contig, start, end, strand)
@@ -403,51 +411,155 @@ def exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size):
             values = power(matrix[contig[strand] + left:contig[strand] + right])
             mean_power = np.mean(values[:, scale_indices], axis=1)
             maximum = left + int(np.nanargmax(mean_power))
-            kmer = oriented_kmer(sequences[name], maximum, strand, size)
-            if kmer is not None:
-                peaks[boundary].append(canonical_kmer(kmer))
-    return peaks
+            if strand == "+":
+                window_start = maximum - EXON_KMER_CONTEXT_RADIUS
+                window_end = maximum + EXON_KMER_CONTEXT_RADIUS + 1
+                genomic_peak = maximum + 1
+                if window_start < 0 or window_end > contig["length"]:
+                    skipped += 1
+                    continue
+                window = sequences[name][window_start:window_end]
+            else:
+                window_start = contig["length"] - maximum - EXON_KMER_CONTEXT_RADIUS - 1
+                window_end = contig["length"] - maximum + EXON_KMER_CONTEXT_RADIUS
+                genomic_peak = contig["length"] - maximum
+                if window_start < 0 or window_end > contig["length"]:
+                    skipped += 1
+                    continue
+                window = sequences[name][window_start:window_end].translate(DNA_COMPLEMENT)[::-1]
+            if len(window) != 2 * EXON_KMER_CONTEXT_RADIUS + 1 or any(base not in "ACGT" for base in window):
+                skipped += 1
+                continue
+            flank_code = "U" if boundary == "start" else "D"
+            distance = maxima_offset(boundary, start, end, strand, genomic_peak)
+            identifier = f"{name}:{start}-{end}:{strand}:{flank_code}:{genomic_peak}:dist={distance:+d}bp"
+            windows[boundary].append((identifier, window, distance))
+    return windows, skipped
 
 
-def displayed_kmer_counts(kmers, size):
-    counts = Counter(canonical_kmer(kmer) for kmer in kmers)
-    if size == 3:
-        displayed = {canonical_kmer("".join(bases))
-                     for bases in product("ACGT", repeat=size)}
-    else:
-        displayed = set(counts)
-    ranked = sorted(displayed, key=lambda kmer: (-counts[kmer], kmer))
-    if size != 3:
-        ranked = ranked[:EXON_KMER_TOP_N]
-    return ranked, [counts[kmer] for kmer in ranked]
+def load_meme_motifs(path):
+    root = ET.parse(path).getroot()
+    alphabet = [letter.get("symbol") for letter in root.findall("./training_set/alphabet/letter")
+                if letter.get("symbol") in "ACGT"]
+    motifs = []
+    for motif in root.findall("./motifs/motif"):
+        matrix = motif.find("./probabilities/alphabet_matrix")
+        if matrix is None:
+            continue
+        probabilities = []
+        for row in matrix.findall("./alphabet_array"):
+            values = {value.get("letter_id"): float(value.text) for value in row.findall("./value")}
+            probabilities.append([values[letter] for letter in alphabet])
+        motifs.append({
+            "label": motif.get("alt", motif.get("id", "Motif")),
+            "name": motif.get("name", ""),
+            "width": int(motif.get("width", len(probabilities))),
+            "sites": int(motif.get("sites", 0)),
+            "e_value": motif.get("e_value", "n/a"),
+            "probabilities": np.asarray(probabilities, dtype=np.float64),
+        })
+    return motifs
 
 
-def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out):
-    peaks = {size: exon_kmer_peaks(intervals, matrix, contigs, widths, sequences, size)
-             for size in EXON_KMER_SIZES}
-    figure, axes = plt.subplots(len(EXON_KMER_SIZES), 2, figsize=(15, 5.5 * len(EXON_KMER_SIZES)),
+def run_meme(fasta, output, environment):
+    command = [
+        "micromamba", "run", "-n", environment, "meme", str(fasta.resolve()),
+        "-dna", "-oc", str(output.resolve()), "-nostatus", "-time", str(MEME_TIME_SECONDS),
+        "-mod", "zoops", "-nmotifs", str(MEME_MOTIF_COUNT), "-minw", str(MEME_MIN_WIDTH),
+        "-maxw", str(MEME_MAX_WIDTH), "-objfun", "classic", "-revcomp", "-markov_order", "0",
+    ]
+    subprocess.run(command, check=True)
+
+
+def maxima_offset(boundary, start, end, strand, peak):
+    if boundary == "start":
+        return peak - start if strand == "+" else end - peak
+    return peak - end if strand == "+" else start - peak
+
+
+def fasta_peak_offsets(path, boundary):
+    expected_flank = "U" if boundary == "start" else "D"
+    offsets = []
+    with path.open() as stream:
+        for line in stream:
+            if not line.startswith(">"):
+                continue
+            fields = line[1:].strip().split(":")
+            if len(fields) < 5 or fields[3] != expected_flank:
+                raise ValueError(f"Invalid maxima FASTA identifier: {line.strip()}")
+            start, end = (int(value) for value in fields[1].split("-", 1))
+            offsets.append(maxima_offset(boundary, start, end, fields[2], int(fields[4])))
+    return offsets
+
+
+def render_meme_results(results, offsets, out):
+    figure, axes = plt.subplots(MEME_MOTIF_COUNT + 1, 2, figsize=(17, 15),
                                 layout="constrained", squeeze=False)
+    boundaries = ("start", "end")
+    titles = {"start": "Exon start upstream (-100 to -1 bp)",
+              "end": "Exon end downstream (+1 to +100 bp)"}
     colors = {"start": "#25827b", "end": "#d97941"}
-    labels = {"start": f"Upstream flank (-{EXON_KMER_FLANK} to -1 bp)",
-              "end": f"Downstream flank (+1 to +{EXON_KMER_FLANK} bp)"}
-    for row, size in enumerate(EXON_KMER_SIZES):
-        for column, boundary in enumerate(("start", "end")):
-            axis = axes[row, column]
-            kmers, counts = displayed_kmer_counts(peaks[size][boundary], size)
-            bars = axis.barh(kmers, counts, color=colors[boundary])
-            axis.invert_yaxis()
-            axis.bar_label(bars, padding=2, fontsize=7)
-            axis.set_xlabel("Exon count")
-            axis.set_ylabel("Canonical k-mer")
-            detail = "all 32" if size == 3 else f"top {EXON_KMER_TOP_N} of {len(set(peaks[size][boundary]))}"
-            axis.set_title(f"{size}-mer, {labels[boundary]} "
-                           f"(n={len(peaks[size][boundary]):,}; showing {detail})")
-            axis.tick_params(axis="y", labelsize=8)
-            if counts:
-                axis.set_xlim(0, max(counts) * 1.15)
-    figure.suptitle("Canonical k-mer counts around exon CWT maxima (mean power, scales 4-6)")
-    figure.savefig(out / "counts.png", dpi=180)
+    for column, boundary in enumerate(boundaries):
+        distance_axis = axes[0, column]
+        distances = np.asarray(offsets[boundary], dtype=np.int64)
+        if boundary == "start":
+            bins = np.arange(-EXON_KMER_FLANK - 0.5, 0.5, 1)
+            ticks = (-100, -80, -60, -40, -20, -1)
+        else:
+            bins = np.arange(0.5, EXON_KMER_FLANK + 1.5, 1)
+            ticks = (1, 20, 40, 60, 80, 100)
+        distance_axis.hist(distances, bins=bins, color=colors[boundary])
+        median = float(np.median(distances))
+        distance_axis.axvline(median, color="#303030", linestyle="--", linewidth=1.1)
+        distance_axis.text(0.98, 0.92, f"median {median:+.1f} bp", ha="right", va="top",
+                           transform=distance_axis.transAxes)
+        distance_axis.set_title(f"{titles[boundary]} maxima (n={len(distances):,})")
+        distance_axis.set_xlabel("Peak offset from exon boundary (bp)")
+        distance_axis.set_ylabel("Maxima count")
+        distance_axis.set_xticks(ticks)
+        for row in range(MEME_MOTIF_COUNT):
+            axis = axes[row + 1, column]
+            if row < len(results[boundary]):
+                motif = results[boundary][row]
+                title = (f"{titles[boundary]}\n{motif['label']}: {motif['name']}\n"
+                         f"width={motif['width']}, sites={motif['sites']:,}, E={motif['e_value']}")
+                render_meme_logo(axis, motif, title)
+            else:
+                axis.axis("off")
+                axis.text(0.5, 0.5, f"{titles[boundary]}\nNo additional motif",
+                          ha="center", va="center", transform=axis.transAxes)
+    figure.suptitle("MEME motifs at exon CWT maxima (21-mer context; mean power, scales 4-6)",
+                    fontsize=14)
+    figure.savefig(out / "motifs.png", dpi=180)
     plt.close(figure)
+
+
+def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_environment):
+    windows, skipped = exon_maxima_windows(intervals, matrix, contigs, widths, sequences)
+    results = {}
+    for boundary in ("start", "end"):
+        fasta = out / f"{boundary}-maxima-21mer.fasta"
+        with fasta.open("w") as stream:
+            for identifier, sequence, _ in windows[boundary]:
+                stream.write(f">{identifier}\n{sequence}\n")
+        if not windows[boundary]:
+            raise ValueError(f"No valid 21-mer CWT maxima for exon {boundary}")
+        meme_output = out / f"meme-{boundary}"
+        print(f"Running MEME on {len(windows[boundary]):,} exon {boundary} maxima", file=sys.stderr,
+              flush=True)
+        run_meme(fasta, meme_output, meme_environment)
+        results[boundary] = load_meme_motifs(meme_output / "meme.xml")
+    offsets = {boundary: [distance for _, _, distance in windows[boundary]]
+               for boundary in ("start", "end")}
+
+    if skipped:
+        print(f"Skipped {skipped:,} maxima with incomplete or ambiguous 21-mers", file=sys.stderr, flush=True)
+    with (out / "maxima-distances.tsv").open("w") as stream:
+        stream.write("flank\tsequence_id\tdistance_bp\n")
+        for boundary in ("start", "end"):
+            for identifier, _, distance in windows[boundary]:
+                stream.write(f"{boundary}\t{identifier}\t{distance}\n")
+    render_meme_results(results, offsets, out)
 
 
 def splice_positions(path, contigs):
@@ -706,7 +818,8 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             render_exon_logo(intervals["exons"], sequences, output_dirs[name])
             continue
         if name == "abs-exon-kmer":
-            render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences, output_dirs[name])
+            render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences,
+                             output_dirs[name], args.meme_env)
             continue
         if name == AGGT_CONTROL_LOGO:
             render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
@@ -863,12 +976,13 @@ def main():
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
                     f"+/-{ABS_RADIUS} bp boundary windows. abs-exon-logo shows base frequencies in the "
                     f"{EXON_LOGO_RADIUS} bp upstream of exon starts and downstream of exon ends. "
-                    f"abs-exon-kmer plots canonical 3-mer and 5-mer counts around CWT maxima "
-                    f"within {EXON_KMER_FLANK} bp exon flanks.")
+                    f"abs-exon-kmer runs separate MEME analyses on 21-mers around upstream and downstream "
+                    f"CWT maxima within {EXON_KMER_FLANK} bp exon flanks.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
+    draw.add_argument("--meme-env", default="anno", help="micromamba environment containing MEME")
     for name in PLOT_NAMES:
         draw.add_argument(f"--no-{name}", action="store_true")
     draw.set_defaults(handler=draw_plot)
@@ -894,7 +1008,8 @@ def main():
             with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out) as temporary:
                 args.matrix = run_anno_cwt(args.anno_cwt, args.fasta, pathlib.Path(temporary))
                 args.handler(args)
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, ET.ParseError,
+            subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
 
 if __name__ == "__main__":
