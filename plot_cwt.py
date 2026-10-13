@@ -20,7 +20,10 @@ import numpy as np
 
 PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-logo", "abs-control", "abs-control-aggt",
               "abs-control-aggt-p1", "abs-first-exons", "abs-last-exons",
-              "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat")
+              "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat",
+              "abs-control-aggt-no-repeat-logo")
+LOGO_PLOT_NAMES = frozenset(("abs-exon-logo", "abs-control-aggt-no-repeat-logo"))
+AGGT_CONTROL_LOGO = "abs-control-aggt-no-repeat-logo"
 REPEAT_FEATURE_TYPES = frozenset(("repeat_region", "mobile_element"))
 CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
@@ -322,21 +325,31 @@ def render_logo_panel(axis, counts, positions):
     axis.set_xlabel("Position from exon boundary (bp)")
 
 
-def render_exon_logo(intervals, sequences, out):
+def render_exon_logo(intervals, sequences, out, feature="exon", show_cwt_maxima=True):
     counts = exon_logo_counts(intervals, sequences)
     positions = np.arange(-EXON_LOGO_RADIUS, 0)
     downstream_positions = np.arange(1, EXON_LOGO_RADIUS + 1)
     figure, axes = plt.subplots(2, 1, figsize=(15, 6), sharey=True, layout="constrained")
     render_logo_panel(axes[0], counts[0], positions)
     axes[0].set_xlim(-EXON_LOGO_RADIUS - 0.5, -0.5)
-    axes[0].set_xticks((-100, -75, -50, EXON_LOGO_CWT_MAXIMA["start"]))
-    axes[0].axvline(EXON_LOGO_CWT_MAXIMA["start"], color="#303030", linestyle="--", linewidth=1.1)
-    axes[0].set_xlabel("Position before exon start (bp); mean CWT-power peak, scales 4-6: -26 bp")
+    start_ticks = [-100, -75, -50, -25]
+    start_label = f"Position before {feature} start (bp)"
+    if show_cwt_maxima:
+        start_ticks[-1] = EXON_LOGO_CWT_MAXIMA["start"]
+        axes[0].axvline(EXON_LOGO_CWT_MAXIMA["start"], color="#303030", linestyle="--", linewidth=1.1)
+        start_label += "; mean CWT-power peak, scales 4-6: -26 bp"
+    axes[0].set_xticks(start_ticks)
+    axes[0].set_xlabel(start_label)
     render_logo_panel(axes[1], counts[1], downstream_positions)
     axes[1].set_xlim(0.5, EXON_LOGO_RADIUS + 0.5)
-    axes[1].set_xticks((1, 25, 50, EXON_LOGO_CWT_MAXIMA["end"], 75, 100))
-    axes[1].axvline(EXON_LOGO_CWT_MAXIMA["end"], color="#303030", linestyle="--", linewidth=1.1)
-    axes[1].set_xlabel("Position after exon end (bp); mean CWT-power peak, scales 4-6: +60 bp")
+    end_ticks = [1, 25, 50, 75, 100]
+    end_label = f"Position after {feature} end (bp)"
+    if show_cwt_maxima:
+        end_ticks.insert(3, EXON_LOGO_CWT_MAXIMA["end"])
+        axes[1].axvline(EXON_LOGO_CWT_MAXIMA["end"], color="#303030", linestyle="--", linewidth=1.1)
+        end_label += "; mean CWT-power peak, scales 4-6: +60 bp"
+    axes[1].set_xticks(end_ticks)
+    axes[1].set_xlabel(end_label)
     figure.savefig(out / "logo.png", dpi=180)
     plt.close(figure)
 
@@ -527,24 +540,53 @@ def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attem
     return controls
 
 
+def render_aggt_control_logo(contigs, exons, sequences, seed, prepared, out):
+    for replicate in range(1, CONTROL_REPLICATES + 1):
+        selected = sample_aggt_controls(contigs, exons, sequences, seed + replicate - 1,
+                                        prepared=prepared)
+        replicate_out = out / f"replicate-{replicate}"
+        replicate_out.mkdir()
+        render_exon_logo(selected, sequences, replicate_out, feature="control", show_cwt_maxima=False)
+
+
+def render_logo_only_group(names, fasta, args, output_dirs):
+    sequences = {}
+    for name, sequence in fasta_records(fasta):
+        if name in sequences:
+            raise ValueError(f"Duplicate FASTA contig: {name}")
+        sequences[name] = sequence.upper()
+    if not sequences:
+        raise ValueError("No sequences found in assembly FASTA")
+    contigs = {name: {"length": len(sequence)} for name, sequence in sequences.items()}
+    intervals = read_exon_sets(args.gff, contigs)
+    repeat_names = [name for name in names if "no-repeat" in name]
+    repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_names else None
+    if repeat_names and repeat_masks is None:
+        print("Skipping repeat-free plots: no repeat annotations on selected contigs",
+              file=sys.stderr, flush=True)
+        for name in repeat_names:
+            output_dirs[name].rmdir()
+        names = [name for name in names if name not in repeat_names]
+    prepared = None
+    if AGGT_CONTROL_LOGO in names:
+        prepared = prepare_aggt_controls(contigs, intervals["exons"], sequences, repeat_masks)
+    for name in names:
+        if name == "abs-exon-logo":
+            render_exon_logo(intervals["exons"], sequences, output_dirs[name])
+        elif name == AGGT_CONTROL_LOGO:
+            render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
+                                     prepared, output_dirs[name])
+
+
 def render_group(names, matrix_dir, fasta, args, output_dirs):
     if matrix_dir is None:
-        if names != ["abs-exon-logo"]:
-            raise ValueError("CWT matrix is required for all plots except abs-exon-logo")
-        sequences = {}
-        for name, sequence in fasta_records(fasta):
-            if name in sequences:
-                raise ValueError(f"Duplicate FASTA contig: {name}")
-            sequences[name] = sequence.upper()
-        if not sequences:
-            raise ValueError("No sequences found in assembly FASTA")
-        contigs = {name: {"length": len(sequence)} for name, sequence in sequences.items()}
-        intervals = read_exon_sets(args.gff, contigs)
-        render_exon_logo(intervals["exons"], sequences, output_dirs["abs-exon-logo"])
+        if not all(name in LOGO_PLOT_NAMES for name in names):
+            raise ValueError("CWT matrix is required for all non-logo plots")
+        render_logo_only_group(names, fasta, args, output_dirs)
         return
     matrix, contigs, widths = load_matrix(matrix_dir)
     intervals = read_exon_sets(args.gff, contigs)
-    repeat_names = [name for name in names if name.endswith("-no-repeat")]
+    repeat_names = [name for name in names if "no-repeat" in name]
     repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_names else None
     if repeat_names and repeat_masks is None:
         print("Skipping repeat-free plots: no repeat annotations on selected contigs",
@@ -565,6 +607,10 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
     for name in names:
         if name == "abs-exon-logo":
             render_exon_logo(intervals["exons"], sequences, output_dirs[name])
+            continue
+        if name == AGGT_CONTROL_LOGO:
+            render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
+                                     prepared[True], output_dirs[name])
             continue
         group = name.removeprefix("abs-").removesuffix("-mutated")
         base_group = group.removesuffix("-no-repeat")
@@ -612,7 +658,7 @@ def draw_plot(args):
             if fasta is None:
                 fasta = make_mutated_fasta(args.fasta, args.gff, args.seed, work / "mutated.fa")
             matrix_dir = (run_anno_cwt(args.anno_cwt, fasta, group_work)
-                          if any(name != "abs-exon-logo" for name in group_names) else None)
+                          if any(name not in LOGO_PLOT_NAMES for name in group_names) else None)
             print(f"Plotting {', '.join(group_names)}", file=sys.stderr, flush=True)
             render_group(group_names, matrix_dir, fasta, args, output_dirs)
 
