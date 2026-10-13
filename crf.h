@@ -5,7 +5,7 @@
 #include "lbfgs.h"
 #include <stdint.h>
 
-#define CRF_L2_C2 1.0
+#define CRF_L2_C2 2.0
 
 /* Linear-chain CRF decoded jointly for both strands.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
