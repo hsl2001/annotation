@@ -1,7 +1,9 @@
 import argparse
 import csv
 import gzip
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,22 +21,23 @@ from matplotlib.transforms import Affine2D
 plt.rcParams["svg.fonttype"] = "none"
 import numpy as np
 
-PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-logo", "abs-exon-kmer", "abs-control", "abs-control-aggt",
-              "abs-control-aggt-p1", "abs-first-exons", "abs-last-exons",
-              "abs-control-no-repeat", "abs-control-aggt-no-repeat", "abs-control-aggt-p1-no-repeat",
-              "abs-control-aggt-no-repeat-logo")
-LOGO_PLOT_NAMES = frozenset(("abs-exon-logo", "abs-control-aggt-no-repeat-logo"))
-AGGT_CONTROL_LOGO = "abs-control-aggt-no-repeat-logo"
+PLOT_NAMES = ("abs-exons", "abs-exons-mutated", "abs-exon-kmer", "abs-exon-kmer-plus",
+              "abs-control", "abs-control-aggt", "abs-control-aggt-p1", "abs-first-exons",
+              "abs-last-exons", "abs-control-no-repeat", "abs-control-aggt-no-repeat",
+              "abs-control-aggt-p1-no-repeat")
 REPEAT_FEATURE_TYPES = frozenset(("repeat_region", "mobile_element"))
 CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
-EXON_LOGO_RADIUS = 100
-EXON_LOGO_CWT_MAXIMA = {"start": -26, "end": 60}
 EXON_KMER_FLANK = 100
 EXON_KMER_CWT_SCALES = (4, 5, 6)
-EXON_KMER_CONTEXT_RADIUS = 10
+EXON_KMER_CONTEXT_RADIUS = 20
+EXON_KMER_WIDTH = 2 * EXON_KMER_CONTEXT_RADIUS + 1
+EXON_KMER_PLUS_ANCHORS = {
+    "start": (17, "A"),
+    "end": (15, "T"),
+}
 MEME_TIME_SECONDS = 14400
-MEME_MOTIF_COUNT = 3
+MEME_MOTIF_COUNT = 1
 MEME_MIN_WIDTH = 6
 MEME_MAX_WIDTH = 50
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
@@ -106,10 +109,11 @@ def load_matrix(directory):
     return matrix, contigs, widths
 
 
-def run_anno_cwt(binary, fasta, output):
+def run_anno_cwt(binary, fasta, output, threads=None):
     executable = str(binary.resolve()) if binary.exists() else str(binary)
     matrix_dir = output / "cwt"
-    subprocess.run([executable, "cwt", str(fasta), str(matrix_dir)], check=True)
+    thread_count = max(1, threads if threads is not None else (os.cpu_count() or 1))
+    subprocess.run([executable, "-p", str(thread_count), "cwt", str(fasta), str(matrix_dir)], check=True)
     return matrix_dir
 
 
@@ -246,7 +250,8 @@ def boundary_power(matrix, contig, interval, boundary, radius=ABS_RADIUS):
     return window
 
 
-def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, stem):
+def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, stem,
+                              trajectories=None):
     display, profiles = aggregate_intervals(
         intervals, rows,
         lambda interval: np.stack([boundary_power(matrix, contigs[interval[0]], interval, boundary).T
@@ -258,6 +263,7 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
     positions = np.arange(-ABS_RADIUS, ABS_RADIUS + 1)
     extent = (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, len(intervals))
     for boundary_index, boundary in enumerate(("start", "end")):
+        trajectory = None if trajectories is None else trajectories.get(boundary)
         figure, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6),
                                     gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
         for scale, width in enumerate(widths):
@@ -266,40 +272,29 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
                                 interpolation="nearest", extent=extent, cmap="viridis", vmin=0, vmax=maximum)
             axis.set_title(f"{parameter} {width} bp")
             axis.set_ylabel("Interval rank" if scale == 0 else "")
+            if trajectory is not None:
+                valid_bins = np.isfinite(trajectory["bin_x"])
+                axis.plot(trajectory["bin_x"][valid_bins], trajectory["bin_y"][valid_bins],
+                          color="#ffffff", linewidth=1.2, alpha=0.95)
             profile.plot(positions, profiles[boundary_index, scale], color="#256c87", linewidth=1.3)
+            if trajectory is not None and trajectory.get("mode") is not None:
+                profile.axvline(trajectory["mode"], color="#d73027", linestyle="--", linewidth=1.1)
+                if scale == 0 and trajectory.get("label"):
+                    profile.text(0.03, 0.92, trajectory["label"], color="#d73027", fontsize=8,
+                                 ha="left", va="top", transform=profile.transAxes)
             profile.set_ylabel("Mean power" if scale == 0 else "")
             profile.set_ylim(0.6, 1.2)
             for panel in (axis, profile):
                 panel.set_xticks((-ABS_RADIUS, 0, ABS_RADIUS),
                                 (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"), fontsize=8)
                 panel.set_xlim(extent[:2])
+                if panel is axis:
+                    panel.set_ylim(extent[2], extent[3])
             profile.set_xlabel(f"Position from {boundary} boundary (bp)")
         figure.colorbar(image, ax=list(axes[0]), label="log(1 + power), common scale; top 0.5% clipped",
                         shrink=0.65, pad=0.01)
         figure.savefig(out / f"{boundary}.png", dpi=160)
         plt.close(figure)
-
-
-def exon_logo_counts(intervals, sequences, radius=EXON_LOGO_RADIUS):
-    counts = np.zeros((2, 2 * radius, 4), dtype=np.int64)
-    base_indices = {base: index for index, base in enumerate("ACGT")}
-    for name, start, end, strand in intervals:
-        sequence = sequences[name]
-        if strand == "+":
-            upstream = sequence[max(0, start - 1 - radius):start - 1]
-            downstream = sequence[end:min(len(sequence), end + radius)]
-        else:
-            upstream = sequence[end:min(len(sequence), end + radius)].translate(DNA_COMPLEMENT)[::-1]
-            downstream = sequence[max(0, start - 1 - radius):start - 1].translate(DNA_COMPLEMENT)[::-1]
-        for position, base in enumerate(upstream, radius - len(upstream)):
-            index = base_indices.get(base)
-            if index is not None:
-                counts[0, position, index] += 1
-        for position, base in enumerate(downstream):
-            index = base_indices.get(base)
-            if index is not None:
-                counts[1, position, index] += 1
-    return counts
 
 
 def draw_logo_heights(axis, heights, positions, ylabel, ymax, yticks):
@@ -329,22 +324,10 @@ def draw_logo_heights(axis, heights, positions, ylabel, ymax, yticks):
     axis.set_xlabel("Position from exon boundary (bp)")
 
 
-def render_logo_panel(axis, counts, positions):
-    totals = counts.sum(axis=1, keepdims=True)
-    probabilities = np.divide(counts, totals, out=np.zeros_like(counts, dtype=np.float64),
-                              where=totals > 0)
-    draw_logo_heights(axis, probabilities, positions, "Base frequency", 1.02, (0, 0.5, 1))
-
-
 def render_meme_logo(axis, motif, title=None):
     probabilities = motif["probabilities"]
-    terms = np.zeros_like(probabilities)
-    nonzero = probabilities > 0
-    terms[nonzero] = probabilities[nonzero] * np.log2(probabilities[nonzero])
-    information = np.maximum(2.0 + terms.sum(axis=1), 0.0)
-    heights = probabilities * information[:, None]
     positions = np.arange(1, len(probabilities) + 1)
-    draw_logo_heights(axis, heights, positions, "Information (bits)", 2.05, (0, 1, 2))
+    draw_logo_heights(axis, probabilities, positions, "Base frequency", 1.02, (0, 0.5, 1))
     tick_step = max(1, len(positions) // 8)
     ticks = positions[::tick_step]
     if ticks[-1] != positions[-1]:
@@ -356,35 +339,6 @@ def render_meme_logo(axis, motif, title=None):
         title = (f"{motif['label']}: {motif['name']}\nwidth={motif['width']}, "
                  f"sites={motif['sites']:,}, E={motif['e_value']}")
     axis.set_title(title, fontsize=9)
-
-
-def render_exon_logo(intervals, sequences, out, feature="exon", show_cwt_maxima=True):
-    counts = exon_logo_counts(intervals, sequences)
-    positions = np.arange(-EXON_LOGO_RADIUS, 0)
-    downstream_positions = np.arange(1, EXON_LOGO_RADIUS + 1)
-    figure, axes = plt.subplots(2, 1, figsize=(15, 6), sharey=True, layout="constrained")
-    render_logo_panel(axes[0], counts[0], positions)
-    axes[0].set_xlim(-EXON_LOGO_RADIUS - 0.5, -0.5)
-    start_ticks = [-100, -75, -50, -25]
-    start_label = f"Position before {feature} start (bp)"
-    if show_cwt_maxima:
-        start_ticks[-1] = EXON_LOGO_CWT_MAXIMA["start"]
-        axes[0].axvline(EXON_LOGO_CWT_MAXIMA["start"], color="#303030", linestyle="--", linewidth=1.1)
-        start_label += "; mean CWT-power peak, scales 4-6: -26 bp"
-    axes[0].set_xticks(start_ticks)
-    axes[0].set_xlabel(start_label)
-    render_logo_panel(axes[1], counts[1], downstream_positions)
-    axes[1].set_xlim(0.5, EXON_LOGO_RADIUS + 0.5)
-    end_ticks = [1, 25, 50, 75, 100]
-    end_label = f"Position after {feature} end (bp)"
-    if show_cwt_maxima:
-        end_ticks.insert(3, EXON_LOGO_CWT_MAXIMA["end"])
-        axes[1].axvline(EXON_LOGO_CWT_MAXIMA["end"], color="#303030", linestyle="--", linewidth=1.1)
-        end_label += "; mean CWT-power peak, scales 4-6: +60 bp"
-    axes[1].set_xticks(end_ticks)
-    axes[1].set_xlabel(end_label)
-    figure.savefig(out / "logo.png", dpi=180)
-    plt.close(figure)
 
 
 def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
@@ -400,34 +354,41 @@ def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
     skipped = 0
     for name, start, end, strand in intervals:
         contig = contigs[name]
+        length = contig["length"]
         first, last = oriented_bounds(contig, start, end, strand)
         flank_bounds = {
             "start": (max(0, first - EXON_KMER_FLANK), first),
-            "end": (last, min(contig["length"], last + EXON_KMER_FLANK)),
+            "end": (last, min(length, last + EXON_KMER_FLANK)),
         }
         for boundary, (left, right) in flank_bounds.items():
-            if left >= right:
+            if left <= 0 or right >= length or left >= right:
+                skipped += 1
                 continue
-            values = power(matrix[contig[strand] + left:contig[strand] + right])
+            values = power(matrix[contig[strand] + left - 1:contig[strand] + right + 1])
             mean_power = np.mean(values[:, scale_indices], axis=1)
-            maximum = left + int(np.nanargmax(mean_power))
+            interior = mean_power[1:-1]
+            local_peaks = (interior > mean_power[:-2]) & (interior >= mean_power[2:])
+            if not np.any(local_peaks):
+                skipped += 1
+                continue
+            maximum = left + int(np.argmax(np.where(local_peaks, interior, -np.inf)))
             if strand == "+":
                 window_start = maximum - EXON_KMER_CONTEXT_RADIUS
                 window_end = maximum + EXON_KMER_CONTEXT_RADIUS + 1
                 genomic_peak = maximum + 1
-                if window_start < 0 or window_end > contig["length"]:
+                if window_start < 0 or window_end > length:
                     skipped += 1
                     continue
                 window = sequences[name][window_start:window_end]
             else:
-                window_start = contig["length"] - maximum - EXON_KMER_CONTEXT_RADIUS - 1
-                window_end = contig["length"] - maximum + EXON_KMER_CONTEXT_RADIUS
-                genomic_peak = contig["length"] - maximum
-                if window_start < 0 or window_end > contig["length"]:
+                window_start = length - maximum - EXON_KMER_CONTEXT_RADIUS - 1
+                window_end = length - maximum + EXON_KMER_CONTEXT_RADIUS
+                genomic_peak = length - maximum
+                if window_start < 0 or window_end > length:
                     skipped += 1
                     continue
                 window = sequences[name][window_start:window_end].translate(DNA_COMPLEMENT)[::-1]
-            if len(window) != 2 * EXON_KMER_CONTEXT_RADIUS + 1 or any(base not in "ACGT" for base in window):
+            if len(window) != EXON_KMER_WIDTH or any(base not in "ACGT" for base in window):
                 skipped += 1
                 continue
             flank_code = "U" if boundary == "start" else "D"
@@ -439,8 +400,8 @@ def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
 
 def load_meme_motifs(path):
     root = ET.parse(path).getroot()
-    alphabet = [letter.get("symbol") for letter in root.findall("./training_set/alphabet/letter")
-                if letter.get("symbol") in "ACGT"]
+    alphabet = [letter.get("symbol", "") for letter in root.findall("./training_set/alphabet/letter")
+                if letter.get("symbol", "") in "ACGT"]
     motifs = []
     for motif in root.findall("./motifs/motif"):
         matrix = motif.find("./probabilities/alphabet_matrix")
@@ -448,8 +409,14 @@ def load_meme_motifs(path):
             continue
         probabilities = []
         for row in matrix.findall("./alphabet_array"):
-            values = {value.get("letter_id"): float(value.text) for value in row.findall("./value")}
+            values = {value.get("letter_id"): float(value.text or 0.0) for value in row.findall("./value")}
             probabilities.append([values[letter] for letter in alphabet])
+        score_matrix = motif.find("./scores/alphabet_matrix")
+        scores = []
+        if score_matrix is not None:
+            for row in score_matrix.findall("./alphabet_array"):
+                values = {value.get("letter_id"): float(value.text or 0.0) for value in row.findall("./value")}
+                scores.append([values[letter] for letter in alphabet])
         motifs.append({
             "label": motif.get("alt", motif.get("id", "Motif")),
             "name": motif.get("name", ""),
@@ -457,18 +424,41 @@ def load_meme_motifs(path):
             "sites": int(motif.get("sites", 0)),
             "e_value": motif.get("e_value", "n/a"),
             "probabilities": np.asarray(probabilities, dtype=np.float64),
+            "scores": np.asarray(scores, dtype=np.float64) if scores else None,
         })
     return motifs
 
 
+def resolve_meme_command(environment):
+    for root in (pathlib.Path.home() / "micromamba", pathlib.Path.home() / "mambaforge",
+                 pathlib.Path.home() / "miniconda3"):
+        candidate = root / "envs" / environment / "bin" / "meme"
+        if candidate.is_file():
+            return [str(candidate)], candidate.parent
+    sibling = pathlib.Path(sys.executable).resolve().parent / "meme"
+    if sibling.is_file():
+        return [str(sibling)], sibling.parent
+    found = shutil.which("meme")
+    if found:
+        resolved = pathlib.Path(found).resolve()
+        return [str(resolved)], resolved.parent
+    return ["micromamba", "run", "-n", environment, "meme"], None
+
+
 def run_meme(fasta, output, environment):
+    meme_command, bin_dir = resolve_meme_command(environment)
+    env = os.environ.copy()
+    if bin_dir is not None:
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    output.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(output.resolve())
     command = [
-        "micromamba", "run", "-n", environment, "meme", str(fasta.resolve()),
+        *meme_command, str(fasta.resolve()),
         "-dna", "-oc", str(output.resolve()), "-nostatus", "-time", str(MEME_TIME_SECONDS),
         "-mod", "zoops", "-nmotifs", str(MEME_MOTIF_COUNT), "-minw", str(MEME_MIN_WIDTH),
-        "-maxw", str(MEME_MAX_WIDTH), "-objfun", "classic", "-revcomp", "-markov_order", "0",
+        "-maxw", str(MEME_MAX_WIDTH), "-objfun", "classic", "-markov_order", "0",
     ]
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, env=env)
 
 
 def maxima_offset(boundary, start, end, strand, peak):
@@ -493,7 +483,7 @@ def fasta_peak_offsets(path, boundary):
 
 
 def render_meme_results(results, offsets, out):
-    figure, axes = plt.subplots(MEME_MOTIF_COUNT + 1, 2, figsize=(17, 15),
+    figure, axes = plt.subplots(MEME_MOTIF_COUNT + 1, 2, figsize=(17, 4.2 * (MEME_MOTIF_COUNT + 1)),
                                 layout="constrained", squeeze=False)
     boundaries = ("start", "end")
     titles = {"start": "Exon start upstream (-100 to -1 bp)",
@@ -509,10 +499,13 @@ def render_meme_results(results, offsets, out):
             bins = np.arange(0.5, EXON_KMER_FLANK + 1.5, 1)
             ticks = (1, 20, 40, 60, 80, 100)
         distance_axis.hist(distances, bins=bins, color=colors[boundary])
-        median = float(np.median(distances))
-        distance_axis.axvline(median, color="#303030", linestyle="--", linewidth=1.1)
-        distance_axis.text(0.98, 0.92, f"median {median:+.1f} bp", ha="right", va="top",
-                           transform=distance_axis.transAxes)
+        values, counts = np.unique(distances, return_counts=True)
+        mode_index = int(np.argmax(counts))
+        mode = int(values[mode_index])
+        mode_count = int(counts[mode_index])
+        distance_axis.axvline(mode, color="#303030", linestyle="--", linewidth=1.1)
+        distance_axis.text(0.98, 0.92, f"mode {mode:+d} bp (n={mode_count:,})",
+                           ha="right", va="top", transform=distance_axis.transAxes)
         distance_axis.set_title(f"{titles[boundary]} maxima (n={len(distances):,})")
         distance_axis.set_xlabel("Peak offset from exon boundary (bp)")
         distance_axis.set_ylabel("Maxima count")
@@ -528,8 +521,6 @@ def render_meme_results(results, offsets, out):
                 axis.axis("off")
                 axis.text(0.5, 0.5, f"{titles[boundary]}\nNo additional motif",
                           ha="center", va="center", transform=axis.transAxes)
-    figure.suptitle("MEME motifs at exon CWT maxima (21-mer context; mean power, scales 4-6)",
-                    fontsize=14)
     figure.savefig(out / "motifs.png", dpi=180)
     plt.close(figure)
 
@@ -538,12 +529,12 @@ def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_en
     windows, skipped = exon_maxima_windows(intervals, matrix, contigs, widths, sequences)
     results = {}
     for boundary in ("start", "end"):
-        fasta = out / f"{boundary}-maxima-21mer.fasta"
+        fasta = out / f"{boundary}-maxima-{EXON_KMER_WIDTH}mer.fasta"
         with fasta.open("w") as stream:
             for identifier, sequence, _ in windows[boundary]:
                 stream.write(f">{identifier}\n{sequence}\n")
         if not windows[boundary]:
-            raise ValueError(f"No valid 21-mer CWT maxima for exon {boundary}")
+            raise ValueError(f"No valid {EXON_KMER_WIDTH}-mer CWT maxima for exon {boundary}")
         meme_output = out / f"meme-{boundary}"
         print(f"Running MEME on {len(windows[boundary]):,} exon {boundary} maxima", file=sys.stderr,
               flush=True)
@@ -553,13 +544,108 @@ def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_en
                for boundary in ("start", "end")}
 
     if skipped:
-        print(f"Skipped {skipped:,} maxima with incomplete or ambiguous 21-mers", file=sys.stderr, flush=True)
+        print(f"Skipped {skipped:,} maxima with incomplete or ambiguous {EXON_KMER_WIDTH}-mers",
+              file=sys.stderr, flush=True)
     with (out / "maxima-distances.tsv").open("w") as stream:
         stream.write("flank\tsequence_id\tdistance_bp\n")
         for boundary in ("start", "end"):
             for identifier, _, distance in windows[boundary]:
                 stream.write(f"{boundary}\t{identifier}\t{distance}\n")
     render_meme_results(results, offsets, out)
+    return windows, results
+
+
+def compute_kmer_trajectories(intervals, windows, results, rows):
+    intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
+    exon_ranks = {f"{name}:{start}-{end}:{strand}": rank
+                  for rank, (name, start, end, strand) in enumerate(intervals)}
+    display_rows = min(rows, len(intervals))
+    edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
+    bin_centers = 0.5 * (edges[:-1] + edges[1:])
+    lookup = np.zeros(256, dtype=np.int64)
+    for index, base in enumerate(b"ACGT"):
+        lookup[base] = index
+
+    trajectories = {}
+    for boundary, (anchor_position, anchor_base) in EXON_KMER_PLUS_ANCHORS.items():
+        if not results.get(boundary) or not windows.get(boundary):
+            continue
+        motif = results[boundary][0]
+        pssm = motif.get("scores")
+        if pssm is None or len(pssm) == 0:
+            probabilities = np.clip(motif["probabilities"], 1e-6, 1.0)
+            pssm = np.log2(probabilities / 0.25)
+        motif_width = len(pssm)
+        anchor_column = min(max(anchor_position - 1, 0), motif_width - 1)
+        entries = windows[boundary]
+        ranks = np.asarray([exon_ranks[":".join(identifier.split(":", 3)[:3])]
+                            for identifier, _, _ in entries], dtype=np.int64)
+        peak_distances = np.asarray([distance for _, _, distance in entries], dtype=np.int64)
+        sequences = [sequence for _, sequence, _ in entries]
+        encoded = lookup[np.frombuffer("".join(sequences).encode("ascii"), dtype=np.uint8)
+                         .reshape(len(sequences), -1)]
+        window_width = encoded.shape[1]
+        offset_count = window_width - motif_width + 1
+        if offset_count < 1:
+            raise ValueError(f"MEME motif width ({motif_width}) exceeds k-mer width ({window_width})")
+        scores = np.zeros((len(sequences), offset_count), dtype=np.float64)
+        for column in range(motif_width):
+            scores += pssm[column, encoded[:, column:column + offset_count]]
+        best_offsets = np.argmax(scores, axis=1)
+        best_scores = np.max(scores, axis=1)
+        anchor_offsets = peak_distances + (best_offsets + anchor_column - EXON_KMER_CONTEXT_RADIUS)
+
+        site_count = min(max(int(motif.get("sites", len(sequences))), 1), len(sequences))
+        selected = np.argsort(best_scores)[::-1][:site_count]
+        selected_ranks = ranks[selected]
+        selected_offsets = anchor_offsets[selected]
+        order = np.argsort(selected_ranks)
+        selected_ranks = selected_ranks[order]
+        selected_offsets = selected_offsets[order]
+
+        bin_x = np.full(display_rows, np.nan, dtype=np.float64)
+        for row_index in range(display_rows):
+            mask = (selected_ranks >= edges[row_index]) & (selected_ranks < edges[row_index + 1])
+            if np.any(mask):
+                bin_x[row_index] = float(np.mean(selected_offsets[mask]))
+        values, counts = np.unique(selected_offsets, return_counts=True)
+        mode = int(values[int(np.argmax(counts))])
+        trajectories[boundary] = {
+            "x": selected_offsets,
+            "y": selected_ranks + 0.5,
+            "bin_x": bin_x,
+            "bin_y": bin_centers,
+            "mode": mode,
+            "label": f"motif pos {anchor_column + 1} ({anchor_base}) mode {mode:+d} bp",
+            "entries": list(zip([entries[index][0] for index in range(len(entries))],
+                                anchor_offsets.tolist(), best_scores.tolist())),
+        }
+    return trajectories
+
+
+def render_exon_kmer_plus(intervals, matrix, contigs, widths, sequences, out, rows,
+                          meme_environment, kmer_cache=None, existing_kmer_dir=None):
+    if kmer_cache is not None:
+        windows, results = kmer_cache
+    elif (existing_kmer_dir is not None
+          and (existing_kmer_dir / "meme-start" / "meme.xml").is_file()
+          and (existing_kmer_dir / "meme-end" / "meme.xml").is_file()):
+        windows, _ = exon_maxima_windows(intervals, matrix, contigs, widths, sequences)
+        results = {boundary: load_meme_motifs(existing_kmer_dir / f"meme-{boundary}" / "meme.xml")
+                   for boundary in ("start", "end")}
+    else:
+        windows, results = render_exon_kmer(intervals, matrix, contigs, widths, sequences,
+                                            out, meme_environment)
+    trajectories = compute_kmer_trajectories(intervals, windows, results, rows)
+    with (out / "motif-anchor-positions.tsv").open("w") as stream:
+        stream.write("flank\tsequence_id\tanchor_offset_bp\tpssm_score\n")
+        for boundary in ("start", "end"):
+            if boundary not in trajectories:
+                continue
+            for identifier, offset, score in trajectories[boundary]["entries"]:
+                stream.write(f"{boundary}\t{identifier}\t{offset}\t{score:.4f}\n")
+    render_absolute_intervals(intervals, matrix, contigs, widths, out, rows,
+                              "abs-exon-kmer-plus", trajectories=trajectories)
 
 
 def splice_positions(path, contigs):
@@ -748,50 +834,7 @@ def sample_aggt_controls(contigs, exons, sequences, seed, length_offset=0, attem
     return controls
 
 
-def render_aggt_control_logo(contigs, exons, sequences, seed, prepared, out):
-    for replicate in range(1, CONTROL_REPLICATES + 1):
-        selected = sample_aggt_controls(contigs, exons, sequences, seed + replicate - 1,
-                                        prepared=prepared)
-        replicate_out = out / f"replicate-{replicate}"
-        replicate_out.mkdir()
-        render_exon_logo(selected, sequences, replicate_out, feature="control", show_cwt_maxima=False)
-
-
-def render_logo_only_group(names, fasta, args, output_dirs):
-    sequences = {}
-    for name, sequence in fasta_records(fasta):
-        if name in sequences:
-            raise ValueError(f"Duplicate FASTA contig: {name}")
-        sequences[name] = sequence.upper()
-    if not sequences:
-        raise ValueError("No sequences found in assembly FASTA")
-    contigs = {name: {"length": len(sequence)} for name, sequence in sequences.items()}
-    intervals = read_exon_sets(args.gff, contigs)
-    repeat_names = [name for name in names if "no-repeat" in name]
-    repeat_masks = read_repeat_masks(args.gff, contigs) if repeat_names else None
-    if repeat_names and repeat_masks is None:
-        print("Skipping repeat-free plots: no repeat annotations on selected contigs",
-              file=sys.stderr, flush=True)
-        for name in repeat_names:
-            output_dirs[name].rmdir()
-        names = [name for name in names if name not in repeat_names]
-    prepared = None
-    if AGGT_CONTROL_LOGO in names:
-        prepared = prepare_aggt_controls(contigs, intervals["exons"], sequences, repeat_masks)
-    for name in names:
-        if name == "abs-exon-logo":
-            render_exon_logo(intervals["exons"], sequences, output_dirs[name])
-        elif name == AGGT_CONTROL_LOGO:
-            render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
-                                     prepared, output_dirs[name])
-
-
 def render_group(names, matrix_dir, fasta, args, output_dirs):
-    if matrix_dir is None:
-        if not all(name in LOGO_PLOT_NAMES for name in names):
-            raise ValueError("CWT matrix is required for all non-logo plots")
-        render_logo_only_group(names, fasta, args, output_dirs)
-        return
     matrix, contigs, widths = load_matrix(matrix_dir)
     intervals = read_exon_sets(args.gff, contigs)
     repeat_names = [name for name in names if "no-repeat" in name]
@@ -803,7 +846,7 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             output_dirs[name].rmdir()
         names = [name for name in names if name not in repeat_names]
     prepared = {}
-    needs_sequences = ("abs-exon-logo" in names or "abs-exon-kmer" in names
+    needs_sequences = ("abs-exon-kmer" in names or "abs-exon-kmer-plus" in names
                        or any("control-aggt" in name for name in names))
     if needs_sequences:
         sequences = read_sequences(fasta, contigs)
@@ -813,17 +856,17 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             masks, candidates, end_masks = prepared[False]
             prepared[True] = ({name: mask | repeat_masks[name] for name, mask in masks.items()},
                               candidates, end_masks)
+    kmer_cache = None
+    existing_kmer_dir = args.out / "abs-exon-kmer"
     for name in names:
-        if name == "abs-exon-logo":
-            render_exon_logo(intervals["exons"], sequences, output_dirs[name])
-            continue
         if name == "abs-exon-kmer":
-            render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences,
-                             output_dirs[name], args.meme_env)
+            kmer_cache = render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences,
+                                          output_dirs[name], args.meme_env)
             continue
-        if name == AGGT_CONTROL_LOGO:
-            render_aggt_control_logo(contigs, intervals["exons"], sequences, args.seed,
-                                     prepared[True], output_dirs[name])
+        if name == "abs-exon-kmer-plus":
+            render_exon_kmer_plus(intervals["exons"], matrix, contigs, widths, sequences,
+                                  output_dirs[name], args.rows, args.meme_env,
+                                  kmer_cache=kmer_cache, existing_kmer_dir=existing_kmer_dir)
             continue
         group = name.removeprefix("abs-").removesuffix("-mutated")
         base_group = group.removesuffix("-no-repeat")
@@ -851,7 +894,11 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
 
 
 def draw_plot(args):
-    selected = [name for name in PLOT_NAMES if not getattr(args, f"no_{name.replace('-', '_')}")]
+    requested = {name for name in PLOT_NAMES
+                 if getattr(args, f"use_{name.replace('-', '_')}")}
+    selected = [name for name in PLOT_NAMES
+                if (not requested or name in requested)
+                and not getattr(args, f"no_{name.replace('-', '_')}")]
     if not selected:
         raise ValueError("At least one plot must be selected")
     args.out.mkdir(parents=True, exist_ok=False)
@@ -870,8 +917,7 @@ def draw_plot(args):
             group_work.mkdir()
             if fasta is None:
                 fasta = make_mutated_fasta(args.fasta, args.gff, args.seed, work / "mutated.fa")
-            matrix_dir = (run_anno_cwt(args.anno_cwt, fasta, group_work)
-                          if any(name not in LOGO_PLOT_NAMES for name in group_names) else None)
+            matrix_dir = run_anno_cwt(args.anno_cwt, fasta, group_work, args.threads)
             print(f"Plotting {', '.join(group_names)}", file=sys.stderr, flush=True)
             render_group(group_names, matrix_dir, fasta, args, output_dirs)
 
@@ -964,27 +1010,33 @@ def add_pipeline_arguments(command, output_name):
     command.add_argument("fasta", type=pathlib.Path)
     command.add_argument("--out", type=pathlib.Path, default=pathlib.Path(output_name))
     command.add_argument("--anno-cwt", type=pathlib.Path, default=pathlib.Path("./anno"))
+    command.add_argument("-p", "--threads", type=positive, default=max(1, os.cpu_count() or 1))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate CWT with anno cwt, then plot and normalize genomic intervals")
     commands = parser.add_subparsers(dest="command", required=True)
     draw = commands.add_parser(
-        "draw", help="run absolute exon/control plots; --no-* skips a plot",
-        description="draw generates abs-* patterns only. Repeat-free controls exclude bodies overlapping GFF "
+        "draw", help="run selected absolute exon/control plots",
+        description="draw generates abs-* patterns only. Use --use-<plot> to select only specific plots; "
+                    "--no-<plot> excludes a plot. Repeat-free controls exclude bodies overlapping GFF "
                     "repeat_region or mobile_element features; plotted flanks are not excluded. "
                     f"AG/GT variants use {CONTROL_REPLICATES} replicates; abs plots use "
-                    f"+/-{ABS_RADIUS} bp boundary windows. abs-exon-logo shows base frequencies in the "
-                    f"{EXON_LOGO_RADIUS} bp upstream of exon starts and downstream of exon ends. "
-                    f"abs-exon-kmer runs separate MEME analyses on 21-mers around upstream and downstream "
-                    f"CWT maxima within {EXON_KMER_FLANK} bp exon flanks.")
+                    f"+/-{ABS_RADIUS} bp boundary windows. "
+                    f"abs-exon-kmer runs separate MEME analyses on {EXON_KMER_WIDTH}-mers around upstream "
+                    f"and downstream CWT maxima within {EXON_KMER_FLANK} bp exon flanks.")
     add_pipeline_arguments(draw, "plots-draw")
     draw.add_argument("--gff", type=pathlib.Path, required=True)
     draw.add_argument("--rows", type=positive, default=1500)
     draw.add_argument("--seed", type=int, default=42)
     draw.add_argument("--meme-env", default="anno", help="micromamba environment containing MEME")
     for name in PLOT_NAMES:
-        draw.add_argument(f"--no-{name}", action="store_true")
+        option = name.replace("-", "_")
+        selection = draw.add_mutually_exclusive_group()
+        selection.add_argument(f"--use-{name}", dest=f"use_{option}", action="store_true",
+                               help="select this plot; if used, only --use-* plots run")
+        selection.add_argument(f"--no-{name}", dest=f"no_{option}", action="store_true",
+                               help="skip this plot")
     draw.set_defaults(handler=draw_plot)
     for name in ("region", "regions"):
         command = commands.add_parser(name)
@@ -1006,7 +1058,7 @@ def main():
         else:
             args.out.mkdir(parents=True, exist_ok=False)
             with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out) as temporary:
-                args.matrix = run_anno_cwt(args.anno_cwt, args.fasta, pathlib.Path(temporary))
+                args.matrix = run_anno_cwt(args.anno_cwt, args.fasta, pathlib.Path(temporary), args.threads)
                 args.handler(args)
     except (OSError, ValueError, KeyError, TypeError, ET.ParseError,
             subprocess.CalledProcessError) as error:
