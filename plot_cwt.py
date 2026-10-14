@@ -254,7 +254,6 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
                                    for boundary in ("start", "end")]),
         stem, "Aligned")
     image_values = np.log1p(display)
-    maximum = max(float(np.quantile(image_values[np.isfinite(image_values)], 0.995)), 1e-6)
     parameter = next(iter(contigs.values())).get("parameter", "Kernel width")
     positions = np.arange(-ABS_RADIUS, ABS_RADIUS + 1)
     extent = (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, len(intervals))
@@ -264,8 +263,11 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
                                     gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
         for scale, width in enumerate(widths):
             axis, profile = axes[:, scale]
+            panel_values = image_values[:, boundary_index, scale]
+            maximum = max(float(np.quantile(panel_values[np.isfinite(panel_values)], 0.995)), 1e-6)
             image = axis.imshow(image_values[:, boundary_index, scale], aspect="auto", origin="lower",
                                 interpolation="nearest", extent=extent, cmap="viridis", vmin=0, vmax=maximum)
+            figure.colorbar(image, ax=axis, pad=0.01)
             axis.set_title(f"{parameter} {width} bp")
             axis.set_ylabel("Interval rank" if scale == 0 else "")
             if trajectory is not None:
@@ -288,8 +290,6 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
                 if panel is axis:
                     panel.set_ylim(extent[2], extent[3])
             profile.set_xlabel(f"Position from {boundary} boundary (bp)")
-        figure.colorbar(image, ax=list(axes[0]), label="log(1 + power), common scale; top 0.5% clipped",
-                        shrink=0.65, pad=0.01)
         figure.savefig(out / f"{boundary}.png", dpi=160)
         plt.close(figure)
 
