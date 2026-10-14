@@ -30,12 +30,8 @@ CONTROL_REPLICATES = 2
 ABS_RADIUS = 300
 EXON_KMER_FLANK = 100
 EXON_KMER_CWT_SCALES = (4, 5, 6)
-EXON_KMER_CONTEXT_RADIUS = 20
+EXON_KMER_CONTEXT_RADIUS = 10
 EXON_KMER_WIDTH = 2 * EXON_KMER_CONTEXT_RADIUS + 1
-EXON_KMER_PLUS_ANCHORS = {
-    "start": (17, "A"),
-    "end": (15, "T"),
-}
 MEME_TIME_SECONDS = 14400
 MEME_MOTIF_COUNT = 1
 MEME_MIN_WIDTH = 6
@@ -237,7 +233,7 @@ def aggregate_intervals(intervals, rows, sample_power, stem, action):
 
 
 def boundary_power(matrix, contig, interval, boundary, radius=ABS_RADIUS):
-    name, start, end, strand = interval
+    _, start, end, strand = interval
     first, last = oriented_bounds(contig, start, end, strand)
     center = first if boundary == "start" else last - 1
     left, right = center - radius, center + radius + 1
@@ -273,13 +269,14 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
             axis.set_title(f"{parameter} {width} bp")
             axis.set_ylabel("Interval rank" if scale == 0 else "")
             if trajectory is not None:
-                valid_bins = np.isfinite(trajectory["bin_x"])
-                axis.plot(trajectory["bin_x"][valid_bins], trajectory["bin_y"][valid_bins],
-                          color="#ffffff", linewidth=1.2, alpha=0.95)
+                axis.hlines(trajectory["y"], trajectory["x_left"], trajectory["x_right"],
+                            colors="#ffffff", linewidths=0.25, alpha=0.04, rasterized=True)
+                axis.scatter(trajectory["x"], trajectory["y"], s=0.35, c="#ffffff", alpha=0.15,
+                             edgecolors="none", rasterized=True)
             profile.plot(positions, profiles[boundary_index, scale], color="#256c87", linewidth=1.3)
-            if trajectory is not None and trajectory.get("mode") is not None:
+            if trajectory is not None:
                 profile.axvline(trajectory["mode"], color="#d73027", linestyle="--", linewidth=1.1)
-                if scale == 0 and trajectory.get("label"):
+                if scale == 0:
                     profile.text(0.03, 0.92, trajectory["label"], color="#d73027", fontsize=8,
                                  ha="left", va="top", transform=profile.transAxes)
             profile.set_ylabel("Mean power" if scale == 0 else "")
@@ -297,15 +294,17 @@ def render_absolute_intervals(intervals, matrix, contigs, widths, out, rows, ste
         plt.close(figure)
 
 
-def draw_logo_heights(axis, heights, positions, ylabel, ymax, yticks):
+def render_meme_logo(axis, motif, title):
+    probabilities = motif["probabilities"]
+    positions = np.arange(1, len(probabilities) + 1)
     colors = ("#2ca25f", "#3182bd", "#f28e2b", "#d73027")
     font = FontProperties(weight="bold")
     glyphs = {base: TextPath((0, 0), base, size=1, prop=font) for base in "ACGT"}
     bounds = {base: glyph.get_extents() for base, glyph in glyphs.items()}
     for column, position in enumerate(positions):
         bottom = 0.0
-        for index in np.argsort(heights[column]):
-            height = float(heights[column, index])
+        for index in np.argsort(probabilities[column]):
+            height = float(probabilities[column, index])
             if height <= 0:
                 continue
             base = "ACGT"[index]
@@ -315,19 +314,11 @@ def draw_logo_heights(axis, heights, positions, ylabel, ymax, yticks):
                          .translate(position - 0.41, bottom) + axis.transData)
             axis.add_patch(PathPatch(glyphs[base], transform=transform, color=colors[index]))
             bottom += height
-    axis.set_ylabel(ylabel)
-    axis.set_ylim(0, ymax)
-    axis.set_yticks(yticks)
+    axis.set_ylabel("Base frequency")
+    axis.set_ylim(0, 1.02)
+    axis.set_yticks((0, 0.5, 1))
     axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
     axis.set_axisbelow(True)
-    axis.set_xticks(np.linspace(positions[0], positions[-1], 5, dtype=int))
-    axis.set_xlabel("Position from exon boundary (bp)")
-
-
-def render_meme_logo(axis, motif, title=None):
-    probabilities = motif["probabilities"]
-    positions = np.arange(1, len(probabilities) + 1)
-    draw_logo_heights(axis, probabilities, positions, "Base frequency", 1.02, (0, 0.5, 1))
     tick_step = max(1, len(positions) // 8)
     ticks = positions[::tick_step]
     if ticks[-1] != positions[-1]:
@@ -335,9 +326,6 @@ def render_meme_logo(axis, motif, title=None):
     axis.set_xticks(ticks)
     axis.set_xlim(0.5, len(positions) + 0.5)
     axis.set_xlabel("Motif position")
-    if title is None:
-        title = (f"{motif['label']}: {motif['name']}\nwidth={motif['width']}, "
-                 f"sites={motif['sites']:,}, E={motif['e_value']}")
     axis.set_title(title, fontsize=9)
 
 
@@ -352,7 +340,7 @@ def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
 
     windows = {boundary: [] for boundary in ("start", "end")}
     skipped = 0
-    for name, start, end, strand in intervals:
+    for rank, (name, start, end, strand) in enumerate(intervals):
         contig = contigs[name]
         length = contig["length"]
         first, last = oriented_bounds(contig, start, end, strand)
@@ -392,9 +380,10 @@ def exon_maxima_windows(intervals, matrix, contigs, widths, sequences):
                 skipped += 1
                 continue
             flank_code = "U" if boundary == "start" else "D"
-            distance = maxima_offset(boundary, start, end, strand, genomic_peak)
+            distance = (genomic_peak - start if strand == "+" else end - genomic_peak) if boundary == "start" else (
+                genomic_peak - end if strand == "+" else start - genomic_peak)
             identifier = f"{name}:{start}-{end}:{strand}:{flank_code}:{genomic_peak}:dist={distance:+d}bp"
-            windows[boundary].append((identifier, window, distance))
+            windows[boundary].append((identifier, window, distance, rank))
     return windows, skipped
 
 
@@ -411,12 +400,6 @@ def load_meme_motifs(path):
         for row in matrix.findall("./alphabet_array"):
             values = {value.get("letter_id"): float(value.text or 0.0) for value in row.findall("./value")}
             probabilities.append([values[letter] for letter in alphabet])
-        score_matrix = motif.find("./scores/alphabet_matrix")
-        scores = []
-        if score_matrix is not None:
-            for row in score_matrix.findall("./alphabet_array"):
-                values = {value.get("letter_id"): float(value.text or 0.0) for value in row.findall("./value")}
-                scores.append([values[letter] for letter in alphabet])
         motifs.append({
             "label": motif.get("alt", motif.get("id", "Motif")),
             "name": motif.get("name", ""),
@@ -424,7 +407,6 @@ def load_meme_motifs(path):
             "sites": int(motif.get("sites", 0)),
             "e_value": motif.get("e_value", "n/a"),
             "probabilities": np.asarray(probabilities, dtype=np.float64),
-            "scores": np.asarray(scores, dtype=np.float64) if scores else None,
         })
     return motifs
 
@@ -459,27 +441,6 @@ def run_meme(fasta, output, environment):
         "-maxw", str(MEME_MAX_WIDTH), "-objfun", "classic", "-markov_order", "0",
     ]
     subprocess.run(command, check=True, env=env)
-
-
-def maxima_offset(boundary, start, end, strand, peak):
-    if boundary == "start":
-        return peak - start if strand == "+" else end - peak
-    return peak - end if strand == "+" else start - peak
-
-
-def fasta_peak_offsets(path, boundary):
-    expected_flank = "U" if boundary == "start" else "D"
-    offsets = []
-    with path.open() as stream:
-        for line in stream:
-            if not line.startswith(">"):
-                continue
-            fields = line[1:].strip().split(":")
-            if len(fields) < 5 or fields[3] != expected_flank:
-                raise ValueError(f"Invalid maxima FASTA identifier: {line.strip()}")
-            start, end = (int(value) for value in fields[1].split("-", 1))
-            offsets.append(maxima_offset(boundary, start, end, fields[2], int(fields[4])))
-    return offsets
 
 
 def render_meme_results(results, offsets, out):
@@ -531,7 +492,7 @@ def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_en
     for boundary in ("start", "end"):
         fasta = out / f"{boundary}-maxima-{EXON_KMER_WIDTH}mer.fasta"
         with fasta.open("w") as stream:
-            for identifier, sequence, _ in windows[boundary]:
+            for identifier, sequence, _, _ in windows[boundary]:
                 stream.write(f">{identifier}\n{sequence}\n")
         if not windows[boundary]:
             raise ValueError(f"No valid {EXON_KMER_WIDTH}-mer CWT maxima for exon {boundary}")
@@ -540,7 +501,7 @@ def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_en
               flush=True)
         run_meme(fasta, meme_output, meme_environment)
         results[boundary] = load_meme_motifs(meme_output / "meme.xml")
-    offsets = {boundary: [distance for _, _, distance in windows[boundary]]
+    offsets = {boundary: [distance for _, _, distance, _ in windows[boundary]]
                for boundary in ("start", "end")}
 
     if skipped:
@@ -549,101 +510,44 @@ def render_exon_kmer(intervals, matrix, contigs, widths, sequences, out, meme_en
     with (out / "maxima-distances.tsv").open("w") as stream:
         stream.write("flank\tsequence_id\tdistance_bp\n")
         for boundary in ("start", "end"):
-            for identifier, _, distance in windows[boundary]:
+            for identifier, _, distance, _ in windows[boundary]:
                 stream.write(f"{boundary}\t{identifier}\t{distance}\n")
     render_meme_results(results, offsets, out)
-    return windows, results
+    return windows
 
 
-def compute_kmer_trajectories(intervals, windows, results, rows):
-    intervals = sorted(intervals, key=lambda item: (item[2] - item[1] + 1, item))
-    exon_ranks = {f"{name}:{start}-{end}:{strand}": rank
-                  for rank, (name, start, end, strand) in enumerate(intervals)}
-    display_rows = min(rows, len(intervals))
-    edges = np.linspace(0, len(intervals), display_rows + 1).astype(np.int64)
-    bin_centers = 0.5 * (edges[:-1] + edges[1:])
-    lookup = np.zeros(256, dtype=np.int64)
-    for index, base in enumerate(b"ACGT"):
-        lookup[base] = index
-
+def compute_kmer_trajectories(windows):
     trajectories = {}
-    for boundary, (anchor_position, anchor_base) in EXON_KMER_PLUS_ANCHORS.items():
-        if not results.get(boundary) or not windows.get(boundary):
+    for boundary, entries in windows.items():
+        if not entries:
             continue
-        motif = results[boundary][0]
-        pssm = motif.get("scores")
-        if pssm is None or len(pssm) == 0:
-            probabilities = np.clip(motif["probabilities"], 1e-6, 1.0)
-            pssm = np.log2(probabilities / 0.25)
-        motif_width = len(pssm)
-        anchor_column = min(max(anchor_position - 1, 0), motif_width - 1)
-        entries = windows[boundary]
-        ranks = np.asarray([exon_ranks[":".join(identifier.split(":", 3)[:3])]
-                            for identifier, _, _ in entries], dtype=np.int64)
-        peak_distances = np.asarray([distance for _, _, distance in entries], dtype=np.int64)
-        sequences = [sequence for _, sequence, _ in entries]
-        encoded = lookup[np.frombuffer("".join(sequences).encode("ascii"), dtype=np.uint8)
-                         .reshape(len(sequences), -1)]
-        window_width = encoded.shape[1]
-        offset_count = window_width - motif_width + 1
-        if offset_count < 1:
-            raise ValueError(f"MEME motif width ({motif_width}) exceeds k-mer width ({window_width})")
-        scores = np.zeros((len(sequences), offset_count), dtype=np.float64)
-        for column in range(motif_width):
-            scores += pssm[column, encoded[:, column:column + offset_count]]
-        best_offsets = np.argmax(scores, axis=1)
-        best_scores = np.max(scores, axis=1)
-        anchor_offsets = peak_distances + (best_offsets + anchor_column - EXON_KMER_CONTEXT_RADIUS)
-
-        site_count = min(max(int(motif.get("sites", len(sequences))), 1), len(sequences))
-        selected = np.argsort(best_scores)[::-1][:site_count]
-        selected_ranks = ranks[selected]
-        selected_offsets = anchor_offsets[selected]
-        order = np.argsort(selected_ranks)
-        selected_ranks = selected_ranks[order]
-        selected_offsets = selected_offsets[order]
-
-        bin_x = np.full(display_rows, np.nan, dtype=np.float64)
-        for row_index in range(display_rows):
-            mask = (selected_ranks >= edges[row_index]) & (selected_ranks < edges[row_index + 1])
-            if np.any(mask):
-                bin_x[row_index] = float(np.mean(selected_offsets[mask]))
-        values, counts = np.unique(selected_offsets, return_counts=True)
+        ranks = np.asarray([rank for _, _, _, rank in entries], dtype=np.int64)
+        peak_distances = np.asarray([distance for _, _, distance, _ in entries], dtype=np.int64)
+        values, counts = np.unique(peak_distances, return_counts=True)
         mode = int(values[int(np.argmax(counts))])
         trajectories[boundary] = {
-            "x": selected_offsets,
-            "y": selected_ranks + 0.5,
-            "bin_x": bin_x,
-            "bin_y": bin_centers,
+            "x": peak_distances,
+            "x_left": peak_distances - EXON_KMER_CONTEXT_RADIUS,
+            "x_right": peak_distances + EXON_KMER_CONTEXT_RADIUS,
+            "y": ranks + 0.5,
             "mode": mode,
-            "label": f"motif pos {anchor_column + 1} ({anchor_base}) mode {mode:+d} bp",
-            "entries": list(zip([entries[index][0] for index in range(len(entries))],
-                                anchor_offsets.tolist(), best_scores.tolist())),
+            "label": f"{EXON_KMER_WIDTH}-mer maxima mode {mode:+d} bp",
         }
     return trajectories
 
 
 def render_exon_kmer_plus(intervals, matrix, contigs, widths, sequences, out, rows,
-                          meme_environment, kmer_cache=None, existing_kmer_dir=None):
-    if kmer_cache is not None:
-        windows, results = kmer_cache
-    elif (existing_kmer_dir is not None
-          and (existing_kmer_dir / "meme-start" / "meme.xml").is_file()
-          and (existing_kmer_dir / "meme-end" / "meme.xml").is_file()):
+                          windows=None):
+    if windows is None:
         windows, _ = exon_maxima_windows(intervals, matrix, contigs, widths, sequences)
-        results = {boundary: load_meme_motifs(existing_kmer_dir / f"meme-{boundary}" / "meme.xml")
-                   for boundary in ("start", "end")}
-    else:
-        windows, results = render_exon_kmer(intervals, matrix, contigs, widths, sequences,
-                                            out, meme_environment)
-    trajectories = compute_kmer_trajectories(intervals, windows, results, rows)
-    with (out / "motif-anchor-positions.tsv").open("w") as stream:
-        stream.write("flank\tsequence_id\tanchor_offset_bp\tpssm_score\n")
+    trajectories = compute_kmer_trajectories(windows)
+    with (out / "maxima-kmer-positions.tsv").open("w") as stream:
+        stream.write("flank\tsequence_id\tpeak_offset_bp\tkmer_start_bp\tkmer_end_bp\n")
         for boundary in ("start", "end"):
-            if boundary not in trajectories:
-                continue
-            for identifier, offset, score in trajectories[boundary]["entries"]:
-                stream.write(f"{boundary}\t{identifier}\t{offset}\t{score:.4f}\n")
+            for identifier, _, distance, _ in windows.get(boundary, ()):
+                stream.write(f"{boundary}\t{identifier}\t{distance}\t"
+                             f"{distance - EXON_KMER_CONTEXT_RADIUS}\t"
+                             f"{distance + EXON_KMER_CONTEXT_RADIUS}\n")
     render_absolute_intervals(intervals, matrix, contigs, widths, out, rows,
                               "abs-exon-kmer-plus", trajectories=trajectories)
 
@@ -856,17 +760,15 @@ def render_group(names, matrix_dir, fasta, args, output_dirs):
             masks, candidates, end_masks = prepared[False]
             prepared[True] = ({name: mask | repeat_masks[name] for name, mask in masks.items()},
                               candidates, end_masks)
-    kmer_cache = None
-    existing_kmer_dir = args.out / "abs-exon-kmer"
+    kmer_windows = None
     for name in names:
         if name == "abs-exon-kmer":
-            kmer_cache = render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences,
-                                          output_dirs[name], args.meme_env)
+            kmer_windows = render_exon_kmer(intervals["exons"], matrix, contigs, widths, sequences,
+                                            output_dirs[name], args.meme_env)
             continue
         if name == "abs-exon-kmer-plus":
             render_exon_kmer_plus(intervals["exons"], matrix, contigs, widths, sequences,
-                                  output_dirs[name], args.rows, args.meme_env,
-                                  kmer_cache=kmer_cache, existing_kmer_dir=existing_kmer_dir)
+                                  output_dirs[name], args.rows, windows=kmer_windows)
             continue
         group = name.removeprefix("abs-").removesuffix("-mutated")
         base_group = group.removesuffix("-no-repeat")
