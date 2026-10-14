@@ -28,7 +28,7 @@
 KSEQ_INIT(gzFile, gzread)
 
 const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
-
+#define CWT_IMPLEMENTATION
 #include "cwt.h"
 
 void anno_fail(const char *format, ...) {
@@ -146,6 +146,24 @@ static int by_parent(const void *x, const void *y) {
 
 static int by_total(const void *x, const void *y) { return ((const Group *)y)->total - ((const Group *)x)->total; }
 
+static int valid_cds(const char *seq, const Cds *s, int m, int total, int minus) {
+  if (total < 6 || total % 3) return 0;
+  for (int jj = 0, index = 0, codon = 0; jj < m; jj++) {
+    int j = minus ? m - 1 - jj : jj, len = s[j].end - s[j].start + 1;
+    for (int t = 0; t < len; t++, index++) {
+      int base = base_index(seq[minus ? s[j].end - 1 - t : s[j].start - 1 + t]);
+      if (base < 0) return 0;
+      codon = (codon * 4 + (minus ? 3 - base : base)) & 63;
+      if (index % 3 == 2) {
+        int stop = codon == 48 || codon == 50 || codon == 56;
+        if (index == 2 && codon != 14) return 0;
+        if (index + 1 < total ? stop : !stop) return 0;
+      }
+    }
+  }
+  return 1;
+}
+
 /* Label CDS and introns from GFF3, one transcript per locus (longest CDS wins). */
 int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
   gzFile input = gzopen(path, "rb");
@@ -192,7 +210,8 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     Cds *s = cds + groups[k].first;
     Contig *c = contigs + s->contig;
     int m = groups[k].count, minus = s->strand == '-', ok = s->strand == '+' || minus;
-    for (int j = 1; j < m; j++) ok &= s[j].contig == s->contig && s[j].strand == s->strand && s[j].start > s[j - 1].end;
+    for (int j = 1; j < m; j++) ok &= s[j].contig == s->contig && s[j].strand == s->strand && s[j].start > s[j - 1].end + 2;
+    if (ok) ok = valid_cds(c->seq, s, m, groups[k].total, minus);
     for (int p = s->start - 1; ok && p < s[m - 1].end; p++) ok &= !c->label[p];
     if (!ok) continue;
     used++;

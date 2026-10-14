@@ -39,7 +39,7 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 #define CRF_WINDOW_SIZE 65536
 
 typedef struct {
-  uint16_t k4[2];
+  uint16_t k4_emit[2], k4_trans[2];
   float cwt_power[WAVE_COUNT];
   int16_t derivative[WAVE_COUNT];
   uint8_t nuc, flank[2][FLANKS];
@@ -68,8 +68,13 @@ static int kmer(const char *seq, int length, int from, int size, int reverse) {
 static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
-  Site s = {.k4 = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
-                   kmer(c->seq, c->genome_length, position - 2, 4, 1)}, .nuc = base < 0 ? 4 : base};
+  Site s = {
+    .k4_emit = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
+                kmer(c->seq, c->genome_length, position - 1, 4, 1)},
+    .k4_trans = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
+                 kmer(c->seq, c->genome_length, position - 2, 4, 1)},
+    .nuc = base < 0 ? 4 : base
+  };
   for (int offset = 0; offset < FLANKS; offset++) {
     int displacement = -SPLICE_RADIUS + 2 * offset;
     s.flank[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
@@ -188,14 +193,14 @@ void crf_init(void) {
 
 static void emission_indices(const Site *site, int state, int *indices) {
   indices[0] = OFF_ENUC + state * KNUC + site->nuc;
-  indices[1] = OFF_E4 + state * K4 + site->k4[state >= 7];
+  indices[1] = OFF_E4 + state * K4 + site->k4_emit[state >= 7];
 }
 
 static int transition_indices(const Site *site, int previous, int current, int *indices) {
   int pair = previous * STATES + current, count = 2;
   int reverse = previous >= 7 || current >= 7, kind = boundary_kind(previous, current);
   indices[0] = OFF_TNUC + pair * KNUC + site->nuc;
-  indices[1] = OFF_T4 + pair * K4 + site->k4[reverse];
+  indices[1] = OFF_T4 + pair * K4 + site->k4_trans[reverse];
   if (kind >= 0)
     for (int offset = 0; offset < FLANKS; offset++)
       indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * K2 + site->flank[reverse][offset];
@@ -208,8 +213,9 @@ static double feature_score(const double *weights, const int *indices, int count
   return score;
 }
 
-static float derivative_value(const Site *site, int scale) {
-  return site->derivative[scale] / (float)INT16_MAX;
+static float derivative_value(const Site *site, int scale, int reverse) {
+  float value = site->derivative[scale] / (float)INT16_MAX;
+  return reverse ? -value : value;
 }
 
 static void add_features(double *gradient, const int *indices, int count, double value) {
@@ -217,46 +223,46 @@ static void add_features(double *gradient, const int *indices, int count, double
 }
 
 static double emission(const double *weights, const Site *site, int state) {
-  int indices[EMISSION_FEATURES];
+  int indices[EMISSION_FEATURES], reverse = state >= 7;
   emission_indices(site, state, indices);
   double score = feature_score(weights, indices, EMISSION_FEATURES);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale);
+    score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
   }
   return score;
 }
 
 static double transition(const double *weights, const Site *site, int previous, int current) {
-  int indices[TRANSITION_FEATURES];
+  int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
   int pair = previous * STATES + current;
   double score = feature_score(weights, indices, count);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale);
+    score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
   }
   return score;
 }
 
 static void add_emission(double *gradient, const Site *site, int state, double value) {
-  int indices[EMISSION_FEATURES];
+  int indices[EMISSION_FEATURES], reverse = state >= 7;
   emission_indices(site, state, indices);
   add_features(gradient, indices, EMISSION_FEATURES, value);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_EP + state * WAVE_COUNT + scale] += value * site->cwt_power[scale];
-    gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale);
+    gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
   }
 }
 
 static void add_transition(double *gradient, const Site *site, int previous, int current, double value) {
-  int indices[TRANSITION_FEATURES];
+  int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
   add_features(gradient, indices, count, value);
   int pair = previous * STATES + current;
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
-    gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale);
+    gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
   }
 }
 
@@ -610,20 +616,20 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
   for (int c = 0; c < count; c++)
     for (int i = 0; i < contigs[c].length; i++) {
       Site site = site_at(contigs + c, i);
-      int state = contigs[c].label[i], indices[TRANSITION_FEATURES];
+      int state = contigs[c].label[contigs[c].offset + i], indices[TRANSITION_FEATURES];
       emission_indices(&site, state, indices);
       for (int j = 0; j < EMISSION_FEATURES; j++) scale[indices[j]] += 1;
       for (int k = 0; k < WAVE_COUNT; k++) {
-        double derivative = derivative_value(&site, k);
+        double derivative = derivative_value(&site, k, state >= 7);
         scale[OFF_EP + state * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_ED + state * WAVE_COUNT + k] += derivative * derivative;
       }
       if (!i) continue;
-      int previous = contigs[c].label[i - 1], pair = previous * STATES + state;
+      int previous = contigs[c].label[contigs[c].offset + i - 1], pair = previous * STATES + state;
       int n = transition_indices(&site, previous, state, indices);
       for (int j = 0; j < n; j++) scale[indices[j]] += 1;
       for (int k = 0; k < WAVE_COUNT; k++) {
-        double derivative = derivative_value(&site, k);
+        double derivative = derivative_value(&site, k, previous >= 7 || state >= 7);
         scale[OFF_TP + pair * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_TD + pair * WAVE_COUNT + k] += derivative * derivative;
       }

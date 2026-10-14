@@ -3,6 +3,10 @@
 
 #include "anno.h"
 
+#endif
+
+#ifdef CWT_IMPLEMENTATION
+
 #include <errno.h>
 #include <complex.h>
 #include <float.h>

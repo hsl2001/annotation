@@ -9,15 +9,15 @@
 
 // Perform the FFT in place for an array of size 2^k.
 // No normalization is done.
-void fft_transform_radix2(double complex* vec, size_t n, bool inverse);
+void fft_transform_radix2(double _Complex* vec, size_t n, bool inverse);
 
 // Perform the FFT for an arbitrary array using the Bluestein's algorithm.
 // The code needs to allocate two supplementary buffers (of size < 4 * n - 3).
 // No normalization is done.
-void fft_transform_bluestein(double complex* vec, size_t n, bool inverse);
+void fft_transform_bluestein(double _Complex* vec, size_t n, bool inverse);
 
 // Perform the FFT, choosing the suitable algorithm from the two above.
-void fft_transform(double complex* vec,	size_t n, bool inverse);
+void fft_transform(double _Complex* vec,	size_t n, bool inverse);
 
 #endif // RFFT_H
 
