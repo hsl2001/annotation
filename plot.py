@@ -15,13 +15,13 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import csv
 from dataclasses import dataclass
 import gzip
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 from typing import Any, Callable, Iterator, Sequence, TextIO
-import xml.etree.ElementTree as ET
 
 import matplotlib
 matplotlib.use("Agg")
@@ -48,9 +48,17 @@ PLOT_CHOICES: tuple[str, ...] = ("all", *PLOT_NAMES)
 REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
 BOUNDARIES: tuple[str, str] = ("start", "end")
 CONTROL_REPLICATES, ABS_RADIUS = 2, 300
-KMER_FLANK, KMER_SCALES, KMER_RADIUS = 100, (4, 5, 6), 50
+KMER_FLANK, KMER_SCALES, KMER_RADIUS = 100, (4, 5, 6), 10
 KMER_WIDTH = 2 * KMER_RADIUS + 1
-MEME_TIME, MEME_MOTIFS, MEME_MINW, MEME_MAXW = 14400, 1, 6, 50
+MEME_TIME, MEME_MOTIFS, MEME_MINW, MEME_MAXW, MEME_ORDER = 14400, 1, 6, 15, 2
+SINGLE_STRAND_DNA_ALPH = (
+    'ALPHABET "DNA"\n'
+    'A "Adenine" CC0000\n'
+    'C "Cytosine" 0000CC\n'
+    'G "Guanine" FFB300\n'
+    'T "Thymine" 008000\n'
+    'N "Any base" = ACGT\n'
+)
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
 
 
@@ -478,23 +486,37 @@ def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> N
 
 class CwtPlotter:
     @classmethod
-    def run_meme(cls, fasta: Path, output: Path) -> list[dict[str, Any]]:
+    def run_meme(cls, fasta: Path, output: Path, threads: int = 1) -> list[dict[str, Any]]:
         output.mkdir(parents=True, exist_ok=True)
+        alph_file = output.parent / "dna-single.alph"
+        if not alph_file.is_file():
+            alph_file.write_text(SINGLE_STRAND_DNA_ALPH)
         env = {**os.environ, "TMPDIR": str(output.resolve())}
         subprocess.run(
-            ["meme", str(fasta.resolve()), "-dna", "-oc", str(output.resolve()), "-nostatus", "-time", str(MEME_TIME),
-             "-mod", "zoops", "-nmotifs", str(MEME_MOTIFS), "-minw", str(MEME_MINW), "-maxw", str(MEME_MAXW),
-             "-objfun", "classic", "-markov_order", "0"],
+            ["meme-chip", "-oc", str(output.resolve()), "-alph", str(alph_file.resolve()), "-no-pgc",
+             "-time", str(max(1, MEME_TIME // 60)), "-order", str(MEME_ORDER),
+             "-minw", str(MEME_MINW), "-maxw", str(MEME_MAXW),
+             "-meme-mod", "zoops", "-meme-nmotifs", str(MEME_MOTIFS), "-meme-p", str(max(1, threads)),
+             "-streme-nmotifs", str(MEME_MOTIFS), "-spamo-skip", "-fimo-skip", str(fasta.resolve())],
             check=True, env=env,
         )
-        root = ET.parse(output / "meme.xml").getroot()
-        alphabet = [el.get("symbol", "") for el in root.findall("./training_set/alphabet/letter") if el.get("symbol", "") in "ACGT"]
         motifs: list[dict[str, Any]] = []
-        for m in root.findall("./motifs/motif"):
-            if (mat := m.find("./probabilities/alphabet_matrix")) is not None:
-                probs = [[{v.get("letter_id"): float(v.text or 0.0) for v in r.findall("./value")}[c] for c in alphabet] for r in mat.findall("./alphabet_array")]
-                motifs.append({"label": m.get("alt", m.get("id", "Motif")), "name": m.get("name", ""), "width": int(m.get("width", len(probs))),
-                               "sites": int(m.get("sites", 0)), "e_value": m.get("e_value", "n/a"), "probabilities": np.asarray(probs, dtype=np.float64)})
+        if (html_path := output / "meme-chip.html").is_file():
+            html = html_path.read_text()
+            if "// @JSON_VAR data" in html:
+                start = html.index("// @JSON_VAR data")
+                js = html[html.index("=", start) + 1 : html.index(";\n    </script>", start)].strip()
+                data = json.loads(js)
+                letters = [el.get("symbol", "") for el in data.get("alphabet", {}).get("symbols", []) if not el.get("ambig")]
+                idx = [letters.index(b) for b in "ACGT"] if set("ACGT").issubset(letters) else [0, 1, 2, 3]
+                for m in data.get("motifs", []):
+                    pwm = np.asarray(m["pwm"], dtype=np.float64)[:, idx]
+                    motifs.append({"label": m.get("alt") or m.get("prog", "Motif").upper(),
+                                   "name": m.get("consensus") or m.get("id", ""),
+                                   "width": int(m.get("len", len(pwm))),
+                                   "sites": int(m.get("sites", 0)),
+                                   "e_value": m.get("sig") or m.get("evalue", "n/a"),
+                                   "probabilities": pwm})
         return motifs
 
     @staticmethod
@@ -522,7 +544,7 @@ class CwtPlotter:
         axis.set_title(title, fontsize=9)
 
     @classmethod
-    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path) -> None:
+    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path, threads: int = 1) -> None:
         out.mkdir(parents=True, exist_ok=True)
         fastas: dict[str, Path] = {}
         for b in BOUNDARIES:
@@ -531,9 +553,10 @@ class CwtPlotter:
             with (fa := out / f"{b}-maxima-{KMER_WIDTH}mer.fasta").open("w") as stream:
                 stream.writelines(f">{w[0]}\n{w[1]}\n" for w in windows[b])
             fastas[b] = fa
-            print(f"Running MEME on {len(windows[b]):,} exon {b} maxima at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
+            print(f"Running MEME-ChIP on {len(windows[b]):,} exon {b} maxima at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
+        meme_threads = max(1, threads // len(BOUNDARIES))
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}") for b in BOUNDARIES}
+            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}", meme_threads) for b in BOUNDARIES}
             results = {b: futs[b].result() for b in BOUNDARIES}
         if skipped:
             print(f"Skipped {skipped:,} maxima with incomplete or ambiguous {KMER_WIDTH}-mers", file=sys.stderr, flush=True)
@@ -631,7 +654,7 @@ class CwtPlotter:
             out_dir = args.out / name
             if name == "exon-kmer":
                 assert kmer_cache is not None
-                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
+                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir, args.threads)
             else:
                 group = name.removesuffix("-mutated")
                 base_group, repeat_free, aggt = group.removesuffix("-no-repeat"), group.endswith("-no-repeat"), name.startswith("control-aggt")
@@ -741,7 +764,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         CwtPlotter.run(args)
-    except (OSError, ValueError, KeyError, TypeError, ET.ParseError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Error: {error}\n")
 
 
