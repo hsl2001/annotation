@@ -1,4 +1,3 @@
-overfit_100k/
 *.gff*
 *.model
 gffcmp*
@@ -10,13 +9,11 @@ control*
 *exons*
 *.bed
 __pycache__/
-AGIS/
 regions*
 anno
-anno_cwt
 annevo/
 tmp*
-*plots-draw*
+*plots-*
 !truth*
 *bam
 *truth.combined.slm.nip*
