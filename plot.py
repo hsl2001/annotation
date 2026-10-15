@@ -17,7 +17,6 @@ from dataclasses import dataclass
 import gzip
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -478,27 +477,12 @@ def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> N
 
 
 class CwtPlotter:
-    @staticmethod
-    def resolve_meme(env_name: str) -> tuple[list[str], Path | None]:
-        for root in (Path.home() / "micromamba", Path.home() / "mambaforge", Path.home() / "miniconda3"):
-            if (cand := root / "envs" / env_name / "bin" / "meme").is_file():
-                return [str(cand)], cand.parent
-        if (sibling := Path(sys.executable).resolve().parent / "meme").is_file():
-            return [str(sibling)], sibling.parent
-        if found := shutil.which("meme"):
-            return [str(resolved := Path(found).resolve())], resolved.parent
-        return ["micromamba", "run", "-n", env_name, "meme"], None
-
     @classmethod
-    def run_meme(cls, fasta: Path, output: Path, env_name: str) -> list[dict[str, Any]]:
-        cmd, bin_dir = cls.resolve_meme(env_name)
-        env = os.environ.copy()
-        if bin_dir is not None:
-            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+    def run_meme(cls, fasta: Path, output: Path) -> list[dict[str, Any]]:
         output.mkdir(parents=True, exist_ok=True)
-        env["TMPDIR"] = str(output.resolve())
+        env = {**os.environ, "TMPDIR": str(output.resolve())}
         subprocess.run(
-            [*cmd, str(fasta.resolve()), "-dna", "-oc", str(output.resolve()), "-nostatus", "-time", str(MEME_TIME),
+            ["meme", str(fasta.resolve()), "-dna", "-oc", str(output.resolve()), "-nostatus", "-time", str(MEME_TIME),
              "-mod", "zoops", "-nmotifs", str(MEME_MOTIFS), "-minw", str(MEME_MINW), "-maxw", str(MEME_MAXW),
              "-objfun", "classic", "-markov_order", "0"],
             check=True, env=env,
@@ -538,7 +522,7 @@ class CwtPlotter:
         axis.set_title(title, fontsize=9)
 
     @classmethod
-    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path, meme_env: str) -> None:
+    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path) -> None:
         out.mkdir(parents=True, exist_ok=True)
         fastas: dict[str, Path] = {}
         for b in BOUNDARIES:
@@ -549,7 +533,7 @@ class CwtPlotter:
             fastas[b] = fa
             print(f"Running MEME on {len(windows[b]):,} exon {b} maxima at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}", meme_env) for b in BOUNDARIES}
+            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}") for b in BOUNDARIES}
             results = {b: futs[b].result() for b in BOUNDARIES}
         if skipped:
             print(f"Skipped {skipped:,} maxima with incomplete or ambiguous {KMER_WIDTH}-mers", file=sys.stderr, flush=True)
@@ -647,7 +631,7 @@ class CwtPlotter:
             out_dir = args.out / name
             if name == "exon-kmer":
                 assert kmer_cache is not None
-                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir, args.meme_env)
+                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
             else:
                 group = name.removesuffix("-mutated")
                 base_group, repeat_free, aggt = group.removesuffix("-no-repeat"), group.endswith("-no-repeat"), name.startswith("control-aggt")
@@ -747,7 +731,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--threads", type=pos_int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("-n", "--rows", type=pos_int, default=1500)
     parser.add_argument("-s", "--seed", type=int, default=42)
-    parser.add_argument("--meme-env", default="anno")
     parser.add_argument("-f", "--flank", type=nonneg_int, default=10)
     parser.add_argument("--pixels", type=pos_int, default=1600)
     return parser
