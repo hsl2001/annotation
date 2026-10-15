@@ -49,7 +49,7 @@ PLOT_CHOICES: tuple[str, ...] = ("all", *PLOT_NAMES)
 REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
 BOUNDARIES: tuple[str, str] = ("start", "end")
 CONTROL_REPLICATES, ABS_RADIUS = 2, 300
-KMER_FLANK, KMER_SCALES, KMER_RADIUS = 100, (4, 5, 6), 20
+KMER_FLANK, KMER_SCALES, KMER_RADIUS = 100, (4, 5, 6), 30
 KMER_WIDTH = 2 * KMER_RADIUS + 1
 MEME_TIME, MEME_MOTIFS, MEME_MINW, MEME_MAXW = 14400, 1, 6, 50
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
@@ -516,19 +516,22 @@ class CwtPlotter:
     @staticmethod
     def render_meme_logo(axis: Any, motif: dict[str, Any], title: str) -> None:
         probs, pos = motif["probabilities"], np.arange(1, len(motif["probabilities"]) + 1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            entropy = -np.sum(np.where(probs > 0, probs * np.log2(probs), 0.0), axis=1, keepdims=True)
+        heights = probs * np.clip(2.0 - entropy, 0.0, 2.0)
         colors, font = ("#2ca25f", "#3182bd", "#f28e2b", "#d73027"), FontProperties(weight="bold")
         glyphs = {b: TextPath((0, 0), b, size=1, prop=font) for b in "ACGT"}
         bounds = {b: g.get_extents() for b, g in glyphs.items()}
         for col, x in enumerate(pos):
             bottom = 0.0
-            for idx in np.argsort(probs[col]):
-                if (h := float(probs[col, idx])) > 0:
+            for idx in np.argsort(heights[col]):
+                if (h := float(heights[col, idx])) > 0:
                     box = bounds[base := "ACGT"[idx]]
                     tr = Affine2D().translate(-box.x0, -box.y0).scale(0.82 / box.width, h / box.height).translate(x - 0.41, bottom) + axis.transData
                     axis.add_patch(PathPatch(glyphs[base], transform=tr, color=colors[idx]))
                     bottom += h
         ticks = pos[::max(1, len(pos) // 8)]
-        axis.set(ylabel="Base frequency", ylim=(0, 1.02), yticks=(0, 0.5, 1), xlim=(0.5, len(pos) + 0.5), xlabel="Motif position")
+        axis.set(ylabel="Information (bits)", ylim=(0, 2.04), yticks=(0, 1, 2), xlim=(0.5, len(pos) + 0.5), xlabel="Motif position")
         axis.set_xticks(ticks if ticks[-1] == pos[-1] else np.append(ticks, pos[-1]))
         axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
         axis.set_axisbelow(True)
