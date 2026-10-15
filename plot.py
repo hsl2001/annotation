@@ -36,7 +36,7 @@ from numpy.typing import NDArray
 plt.rcParams["svg.fonttype"] = "none"
 
 Interval = tuple[str, int, int, str]
-KmerHit = tuple[str, str, int]
+KmerHit = tuple[str, str]
 Arr = NDArray[Any]
 
 PLOT_NAMES: tuple[str, ...] = (
@@ -217,7 +217,10 @@ class CwtMatrix:
         d_tot_t[ np.broadcast_to(d_cnt_t == 0, d_tot_t.shape) ] = np.nan
         return d_tot_t.astype(np.float32), mean
 
-    def kmer_maxima(self, intervals: Sequence[Interval], sequences: dict[str, str]) -> tuple[dict[str, list[KmerHit]], int]:
+    def kmer_maxima(
+        self, intervals: Sequence[Interval], sequences: dict[str, str], mean_profile: Arr,
+        bounds: dict[Interval, tuple[int, int]] | None = None,
+    ) -> tuple[dict[str, list[KmerHit]], dict[str, int], int]:
         scale_idx = (
             [self.widths.index(s) for s in KMER_SCALES if s in self.widths]
             if self.parameter == "Scale"
@@ -225,32 +228,40 @@ class CwtMatrix:
         )
         if not scale_idx:
             raise ValueError("CWT matrix has no scales available for exon k-mer maxima")
+        peaks: dict[str, int] = {}
+        for b_idx, (boundary, sl_range, base_off) in enumerate((
+            ("start", slice(ABS_RADIUS - KMER_FLANK, ABS_RADIUS), -KMER_FLANK),
+            ("end", slice(ABS_RADIUS + 1, ABS_RADIUS + KMER_FLANK + 1), 1),
+        )):
+            curve = np.nanmean(mean_profile[b_idx, scale_idx, sl_range], axis=0)
+            inner = curve[1:-1]
+            local = (inner > curve[:-2]) & (inner >= curve[2:])
+            rel = 1 + int(np.argmax(np.where(local, inner, -np.inf))) if np.any(local) else int(np.nanargmax(curve))
+            peaks[boundary] = base_off + rel
+            print(f"{boundary}\t{peaks[boundary]:+d}")
         windows: dict[str, list[KmerHit]] = {"start": [], "end": []}
         skipped = 0
-        for name, start, end, strand in intervals:
+        for iv in intervals:
+            name, start, end, strand = iv
             c = self.contigs[name]
-            off, length, (first, last) = c.offset(strand), c.length, c.bounds(start, end, strand)
+            length, (first, last) = c.length, c.bounds(start, end, strand)
+            lo, hi = bounds.get(iv, (0, length)) if bounds is not None else (0, length)
             seq = sequences[name]
-            for boundary, f_start, f_end, anchor, code in (
-                ("start", first - KMER_FLANK, first, first, "U"),
-                ("end", last, last + KMER_FLANK, last - 1, "D"),
+            for boundary, m, code, w_min, w_max in (
+                ("start", first + peaks["start"], "U", lo, length),
+                ("end", last - 1 + peaks["end"], "D", 0, hi),
             ):
-                if f_start < 0 or f_end > length:
-                    skipped += 1
-                    continue
-                curve = self.power_at(off + f_start, off + f_end)[:, scale_idx].mean(axis=1)
-                m = f_start + int(np.argmax(curve))
-                dist = m - anchor
                 ws, we, gp = (m - KMER_RADIUS, m + KMER_RADIUS + 1, m + 1) if strand == "+" else (length - m - KMER_RADIUS - 1, length - m + KMER_RADIUS, length - m)
-                if ws < 0 or we > length:
+                if m - KMER_RADIUS < w_min or m + KMER_RADIUS + 1 > w_max or ws < 0 or we > length:
                     skipped += 1
                     continue
                 win = seq[ws:we] if strand == "+" else seq[ws:we].translate(DNA_COMPLEMENT)[::-1]
                 if len(win) != KMER_WIDTH or any(ch not in "ACGT" for ch in win):
                     skipped += 1
                     continue
-                windows[boundary].append((f"{name}:{start}-{end}:{strand}:{code}:{gp}:dist={dist:+d}bp", win, dist))
-        return windows, skipped
+                dist = peaks[boundary]
+                windows[boundary].append((f"{name}:{start}-{end}:{strand}:{code}:{gp}:dist={dist:+d}bp", win))
+        return windows, peaks, skipped
 
 
 class GenomeData:
@@ -260,11 +271,11 @@ class GenomeData:
         self.name_to_id = {n: i for i, n in enumerate(self.names)}
         self.c_lens = np.array([self.contigs[n].length for n in self.names], dtype=np.int64)
         self.c_offs = np.concatenate(([0], np.cumsum(self.c_lens[:-1])))
-        self.exon_sets, self.has_repeats, self._excl_spans, self.splice_sites = self._parse_gff()
+        self.exon_sets, self.kmer_bounds, self.has_repeats, self._excl_spans, self.splice_sites = self._parse_gff()
         self.sequences: dict[str, str] = sequences or {}
         self._aggt_cache: tuple[list[tuple[Arr, Arr]], list[Arr]] | None = None
 
-    def _parse_gff(self) -> tuple[dict[str, list[Interval]], bool, dict[bool, tuple[Arr, Arr]], dict[str, list[int]]]:
+    def _parse_gff(self) -> tuple[dict[str, list[Interval]], dict[Interval, tuple[int, int]], bool, dict[bool, tuple[Arr, Arr]], dict[str, list[int]]]:
         intervals, gene_ids, rrna_ids = set(), set(), set()
         parents_by_id: dict[str, list[str]] = {}
         exon_rows: list[tuple[list[str], list[str]]] = []
@@ -348,7 +359,8 @@ class GenomeData:
                 if (hi := s1 - 1) >= (lo := e0 + 1):
                     sites[name].update(s - 1 for s in (lo, lo + 1, hi - 1, hi) if lo <= s <= hi and 1 <= s <= ln)
 
-        first_exons, last_exons = set(), set()
+        first_exons, last_exons, multi_exons = set(), set(), set()
+        kmer_bounds: dict[Interval, tuple[int, int]] = {}
         for transcripts in tx_exons.values():
             for exons in transcripts.values():
                 plus = next(iter(exons))[3] == "+"
@@ -356,12 +368,29 @@ class GenomeData:
                 l_pos = max(x[2] for x in exons) if plus else min(x[1] for x in exons)
                 first_exons.update(x for x in exons if (x[1] if plus else x[2]) == f_pos)
                 last_exons.update(x for x in exons if (x[2] if plus else x[1]) == l_pos)
+                if len(exons) < 2:
+                    continue
+                multi_exons.update(exons)
+                ordered_tx = sorted(exons, key=lambda x: self.contigs[x[0]].bounds(x[1], x[2], x[3])[0])
+                bounds_tx = [self.contigs[x[0]].bounds(x[1], x[2], x[3]) for x in ordered_tx]
+                ln = self.contigs[ordered_tx[0][0]].length
+                for i, iv in enumerate(ordered_tx):
+                    lo = max((bounds_tx[j][1] for j in range(i) if bounds_tx[j][1] <= bounds_tx[i][0]), default=0)
+                    hi = min((bounds_tx[j][0] for j in range(i + 1, len(ordered_tx)) if bounds_tx[j][0] >= bounds_tx[i][1]), default=ln)
+                    prev_lo, prev_hi = kmer_bounds.get(iv, (0, ln))
+                    kmer_bounds[iv] = (max(prev_lo, lo), min(prev_hi, hi))
         exon_spans = [(int(self.c_offs[self.name_to_id[n]]) + s, int(self.c_offs[self.name_to_id[n]]) + e) for n, s, e, _ in intervals]
         excl = {False: merge_spans(list(exon_spans))}
         if rep_spans:
             excl[True] = merge_spans(exon_spans + rep_spans)
         return (
-            {"exons": sort_intervals(intervals), "first-exons": sort_intervals(first_exons), "last-exons": sort_intervals(last_exons)},
+            {
+                "exons": sort_intervals(intervals),
+                "multi-exons": sort_intervals(multi_exons),
+                "first-exons": sort_intervals(first_exons),
+                "last-exons": sort_intervals(last_exons),
+            },
+            kmer_bounds,
             bool(rep_spans),
             excl,
             {name: sorted(pos) for name, pos in sites.items()},
@@ -541,18 +570,16 @@ class CwtPlotter:
         axis.set_title(title, fontsize=9)
 
     @classmethod
-    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], skipped: int, out: Path, threads: int = 1) -> None:
+    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path, threads: int = 1) -> None:
         out.mkdir(parents=True, exist_ok=True)
         fastas: dict[str, Path] = {}
-        med_dist: dict[str, float] = {}
         for b in BOUNDARIES:
             if not windows[b]:
                 raise ValueError(f"No valid {KMER_WIDTH}-mer CWT maxima for exon {b}")
             with (fa := out / f"{b}-maxima-{KMER_WIDTH}mer.fasta").open("w") as stream:
                 stream.writelines(f">{w[0]}\n{w[1]}\n" for w in windows[b])
             fastas[b] = fa
-            med_dist[b] = float(np.median([w[2] for w in windows[b]]))
-            print(f"Running MEME-ChIP on {len(windows[b]):,} exon {b} maxima (median {med_dist[b]:+.1f} bp)", file=sys.stderr, flush=True)
+            print(f"Running MEME-ChIP on {len(windows[b]):,} exon {b} maxima at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
         meme_threads = max(1, threads // len(BOUNDARIES))
         with ThreadPoolExecutor(max_workers=2) as pool:
             futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}", meme_threads) for b in BOUNDARIES}
@@ -562,11 +589,11 @@ class CwtPlotter:
         with (out / "maxima-distances.tsv").open("w") as stream:
             stream.write("flank\tsequence_id\tdistance_bp\n")
             for b in BOUNDARIES:
-                stream.writelines(f"{b}\t{w[0]}\t{w[2]}\n" for w in windows[b])
+                stream.writelines(f"{b}\t{w[0]}\t{peaks[b]}\n" for w in windows[b])
 
         fig, axes = plt.subplots(MEME_MOTIFS, 2, figsize=(17, 4.2 * MEME_MOTIFS), layout="constrained", squeeze=False)
-        titles = {"start": f"Exon start upstream (median {med_dist['start']:+.1f} bp, n={len(windows['start']):,})",
-                  "end": f"Exon end downstream (median {med_dist['end']:+.1f} bp, n={len(windows['end']):,})"}
+        titles = {"start": f"Exon start upstream (peak {peaks['start']:+d} bp, n={len(windows['start']):,})",
+                  "end": f"Exon end downstream (peak {peaks['end']:+d} bp, n={len(windows['end']):,})"}
         for col, b in enumerate(BOUNDARIES):
             for row in range(MEME_MOTIFS):
                 ax = axes[row, col]
@@ -639,7 +666,13 @@ class CwtPlotter:
 
         exons = genome.exon_sets["exons"]
         exons_agg = cwt.aggregate_boundaries(exons, args.rows) if "exons" in names else None
-        kmer_cache = cwt.kmer_maxima(exons, genome.sequences) if "exon-kmer" in names else None
+        kmer_cache: tuple[dict[str, list[KmerHit]], dict[str, int], int] | None = None
+        if "exon-kmer" in names:
+            multi_exons = genome.exon_sets["multi-exons"]
+            if not multi_exons:
+                raise ValueError("No multi-exon features found for exon-kmer")
+            multi_agg = cwt.aggregate_boundaries(multi_exons, args.rows)
+            kmer_cache = cwt.kmer_maxima(multi_exons, genome.sequences, multi_agg[1], genome.kmer_bounds)
         abs_tasks: list[Any] = []
 
         def queue_abs(agg: tuple[Arr, Arr], n_iv: int, out: Path) -> None:
@@ -653,7 +686,7 @@ class CwtPlotter:
             out_dir = args.out / name
             if name == "exon-kmer":
                 assert kmer_cache is not None
-                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], out_dir, args.threads)
+                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir, args.threads)
             else:
                 group = name.removesuffix("-mutated")
                 base_group, repeat_free, aggt = group.removesuffix("-no-repeat"), group.endswith("-no-repeat"), name.startswith("control-aggt")
