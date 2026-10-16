@@ -46,9 +46,10 @@ def fasta_sequences(path):
             if line.startswith(">"):
                 if current is not None:
                     sequences[current] = length
-                current = line[1:].split(None, 1)[0]
-                if not current:
+                fields = line[1:].split(None, 1)
+                if not fields:
                     raise ValueError(f"{path}:{line_number}: empty FASTA sequence ID")
+                current = fields[0]
                 if current in sequences:
                     raise ValueError(f"{path}:{line_number}: duplicate FASTA sequence ID {current}")
                 length = 0
