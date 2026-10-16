@@ -11,17 +11,17 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K4 = 257, KNUC = 5, SPLICE_RADIUS = 12,
-       FLANKS = SPLICE_RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
+enum { K2 = 17, K4 = 257, KNUC = 5, RADIUS = 6,
+       FLANKS = RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
 enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
-       OFF_ED2 = OFF_ED + STATES * WAVE_COUNT,
-       OFF_TNUC = OFF_ED2 + STATES * WAVE_COUNT,
+       OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
        OFF_T4 = OFF_TNUC + STATES * STATES * KNUC,
        OFF_TP = OFF_T4 + STATES * STATES * K4, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
-       OFF_TD2 = OFF_TD + STATES * STATES * WAVE_COUNT,
-       OFF_SPLICE = OFF_TD2 + STATES * STATES * WAVE_COUNT,
-       WEIGHTS = OFF_SPLICE + 4 * FLANKS * K2 };
+       OFF_SPLICE = OFF_TD + STATES * STATES * WAVE_COUNT,
+       OFF_BP = OFF_SPLICE + 4 * FLANKS * K2,
+       OFF_BD = OFF_BP + 4 * FLANKS * WAVE_COUNT,
+       WEIGHTS = OFF_BD + 4 * FLANKS * WAVE_COUNT };
 
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
@@ -43,7 +43,7 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 typedef struct {
   uint16_t k4_emit[2], k4_trans[2];
   float cwt_power[WAVE_COUNT];
-  int16_t derivative[WAVE_COUNT], second_derivative[WAVE_COUNT];
+  int16_t derivative[WAVE_COUNT];
   uint8_t nuc, flank[2][FLANKS];
 } Site;
 
@@ -78,7 +78,7 @@ static Site site_at(const Contig *c, int i) {
     .nuc = base < 0 ? 4 : base
   };
   for (int offset = 0; offset < FLANKS; offset++) {
-    int displacement = -SPLICE_RADIUS + 2 * offset;
+    int displacement = -RADIUS + 2 * offset;
     s.flank[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
     s.flank[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 2, 2, 1);
   }
@@ -88,12 +88,9 @@ static Site site_at(const Contig *c, int i) {
       base_index(c->seq[position + 1]) >= 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
       double left = c->cwt_power[(size_t)(position - 1) * WAVE_COUNT + scale];
-      double center = s.cwt_power[scale];
       double right = c->cwt_power[(size_t)(position + 1) * WAVE_COUNT + scale];
       double slope = (right - left) / (right + left + 1e-12);
-      double curvature = (right - 2 * center + left) / (right + 2 * center + left + 1e-12);
       s.derivative[scale] = (int16_t)lrint(slope * INT16_MAX);
-      s.second_derivative[scale] = (int16_t)lrint(curvature * INT16_MAX);
     }
   }
   return s;
@@ -107,6 +104,28 @@ static int boundary_kind(int previous, int current) {
   if ((previous == 0 && current == 1) || (previous == 7 && current == 0)) return 2;
   if ((previous == 3 && current == 0) || (previous == 0 && current == 9)) return 3;
   return -1;
+}
+
+static void boundary_cwt_at(const Contig *c, int position, int reverse, int offset,
+                            float *power, double *derivative) {
+  int displacement = -RADIUS + 2 * offset;
+  int g = reverse ? position - displacement - 2 : position + displacement;
+  if (g < 0 || g >= c->genome_length || base_index(c->seq[g]) < 0) {
+    for (int scale = 0; scale < WAVE_COUNT; scale++) power[scale] = 0, derivative[scale] = 0;
+    return;
+  }
+  memcpy(power, c->cwt_power + (size_t)g * WAVE_COUNT, WAVE_COUNT * sizeof(*power));
+  if (g > 0 && g + 1 < c->genome_length &&
+      base_index(c->seq[g - 1]) >= 0 && base_index(c->seq[g + 1]) >= 0) {
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      double left = c->cwt_power[(size_t)(g - 1) * WAVE_COUNT + scale];
+      double right = c->cwt_power[(size_t)(g + 1) * WAVE_COUNT + scale];
+      double slope = (right - left) / (right + left + 1e-12);
+      derivative[scale] = reverse ? -slope : slope;
+    }
+  } else {
+    for (int scale = 0; scale < WAVE_COUNT; scale++) derivative[scale] = 0;
+  }
 }
 
 static int allowed(int a, int b) {
@@ -223,10 +242,6 @@ static float derivative_value(const Site *site, int scale, int reverse) {
   return reverse ? -value : value;
 }
 
-static float second_derivative_value(const Site *site, int scale) {
-  return site->second_derivative[scale] / (float)INT16_MAX;
-}
-
 static void add_features(double *gradient, const int *indices, int count, double value) {
   for (int index = 0; index < count; index++) gradient[indices[index]] += value;
 }
@@ -238,20 +253,32 @@ static double emission(const double *weights, const Site *site, int state) {
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
-    score += weights[OFF_ED2 + state * WAVE_COUNT + scale] * second_derivative_value(site, scale);
   }
   return score;
 }
 
-static double transition(const double *weights, const Site *site, int previous, int current) {
+static double transition(const double *weights, const Contig *c, const Site *site, int position,
+                         int previous, int current) {
   int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
-  int pair = previous * STATES + current;
+  int pair = previous * STATES + current, kind = boundary_kind(previous, current);
   double score = feature_score(weights, indices, count);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
-    score += weights[OFF_TD2 + pair * WAVE_COUNT + scale] * second_derivative_value(site, scale);
+  }
+  if (kind >= 0) {
+    int genome_position = c->offset + position;
+    for (int offset = 0; offset < FLANKS; offset++) {
+      float power[WAVE_COUNT];
+      double derivative[WAVE_COUNT];
+      boundary_cwt_at(c, genome_position, reverse, offset, power, derivative);
+      int base = (kind * FLANKS + offset) * WAVE_COUNT;
+      for (int scale = 0; scale < WAVE_COUNT; scale++) {
+        score += weights[OFF_BP + base + scale] * power[scale];
+        score += weights[OFF_BD + base + scale] * derivative[scale];
+      }
+    }
   }
   return score;
 }
@@ -263,19 +290,31 @@ static void add_emission(double *gradient, const Site *site, int state, double v
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_EP + state * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
-    gradient[OFF_ED2 + state * WAVE_COUNT + scale] += value * second_derivative_value(site, scale);
   }
 }
 
-static void add_transition(double *gradient, const Site *site, int previous, int current, double value) {
+static void add_transition(double *gradient, const Contig *c, const Site *site, int position,
+                           int previous, int current, double value) {
   int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
   add_features(gradient, indices, count, value);
-  int pair = previous * STATES + current;
+  int pair = previous * STATES + current, kind = boundary_kind(previous, current);
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
-    gradient[OFF_TD2 + pair * WAVE_COUNT + scale] += value * second_derivative_value(site, scale);
+  }
+  if (kind >= 0) {
+    int genome_position = c->offset + position;
+    for (int offset = 0; offset < FLANKS; offset++) {
+      float power[WAVE_COUNT];
+      double derivative[WAVE_COUNT];
+      boundary_cwt_at(c, genome_position, reverse, offset, power, derivative);
+      int base = (kind * FLANKS + offset) * WAVE_COUNT;
+      for (int scale = 0; scale < WAVE_COUNT; scale++) {
+        gradient[OFF_BP + base + scale] += value * power[scale];
+        gradient[OFF_BD + base + scale] += value * derivative[scale];
+      }
+    }
   }
 }
 
@@ -297,7 +336,7 @@ static Site site_scores(const double *w, const Contig *c, int position,
       anno_fail("Non-finite CRF emission at position %d", position + 1);
   }
   for (int edge = 0; edge < ntrans; edge++) {
-    psi[edge] = transition(w, &site, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
+    psi[edge] = transition(w, c, &site, position, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
     if (!isfinite(psi[edge]))
       anno_fail("Non-finite CRF transition at position %d", position + 1);
   }
@@ -431,8 +470,8 @@ static double contig_gradient(const double *w, const Contig *c, Work *k, double 
         const double *previous_alpha = local
           ? alpha - HIDDEN_STATES : checkpoint;
         int previous_state = c->label[c->offset + position - 1];
-        likelihood += transition(w, &site, previous_state, state);
-        add_transition(gradient, &site, previous_state, state, 1);
+        likelihood += transition(w, c, &site, position, previous_state, state);
+        add_transition(gradient, c, &site, position, previous_state, state, 1);
 
         double edge_marginals[STATES * STATES] = {0};
         const HiddenEdge *edges = hidden_edges[site.nuc];
@@ -444,7 +483,7 @@ static double contig_gradient(const double *w, const Contig *c, Work *k, double 
         }
         for (int edge = 0; edge < ntrans; edge++)
           if (edge_marginals[edge] > 0)
-            add_transition(gradient, &site, trans_a[edge], trans_b[edge], -edge_marginals[edge]);
+            add_transition(gradient, c, &site, position, trans_a[edge], trans_b[edge], -edge_marginals[edge]);
 
         double beta_previous[HIDDEN_STATES];
         backward_step(&site, psi, beta, k->scale[local], beta_previous);
@@ -634,22 +673,31 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
       for (int j = 0; j < EMISSION_FEATURES; j++) scale[indices[j]] += 1;
       for (int k = 0; k < WAVE_COUNT; k++) {
         double derivative = derivative_value(&site, k, state >= 7);
-        double second_derivative = second_derivative_value(&site, k);
         scale[OFF_EP + state * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_ED + state * WAVE_COUNT + k] += derivative * derivative;
-        scale[OFF_ED2 + state * WAVE_COUNT + k] += second_derivative * second_derivative;
       }
       if (!i) continue;
       int previous = contigs[c].label[contigs[c].offset + i - 1], pair = previous * STATES + state;
       int n = transition_indices(&site, previous, state, indices);
       for (int j = 0; j < n; j++) scale[indices[j]] += 1;
-      int reverse = previous >= 7 || state >= 7;
+      int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
       for (int k = 0; k < WAVE_COUNT; k++) {
         double derivative = derivative_value(&site, k, reverse);
-        double second_derivative = second_derivative_value(&site, k);
         scale[OFF_TP + pair * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_TD + pair * WAVE_COUNT + k] += derivative * derivative;
-        scale[OFF_TD2 + pair * WAVE_COUNT + k] += second_derivative * second_derivative;
+      }
+      if (kind >= 0) {
+        int genome_position = contigs[c].offset + i;
+        for (int offset = 0; offset < FLANKS; offset++) {
+          float power[WAVE_COUNT];
+          double derivative[WAVE_COUNT];
+          boundary_cwt_at(contigs + c, genome_position, reverse, offset, power, derivative);
+          int base = (kind * FLANKS + offset) * WAVE_COUNT;
+          for (int k = 0; k < WAVE_COUNT; k++) {
+            scale[OFF_BP + base + k] += (double)power[k] * power[k];
+            scale[OFF_BD + base + k] += derivative[k] * derivative[k];
+          }
+        }
       }
     }
   for (int f = 0; f < WEIGHTS; f++) scale[f] = 1 / sqrt(fmax(scale[f], 1));
@@ -714,7 +762,7 @@ static void viterbi_step(const double *weights, const Contig *contig, int positi
   }
   if (position) {
     for (int edge = 0; edge < ntrans; edge++) {
-      transitions[edge] = transition(weights, &site, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
+      transitions[edge] = transition(weights, contig, &site, position, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
       if (!isfinite(transitions[edge])) anno_fail("Non-finite prediction transition");
     }
     const HiddenEdge *edges = hidden_edges[site.nuc];
