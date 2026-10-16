@@ -142,6 +142,12 @@ class CwtMatrix:
         self.parameter = next(iter(contigs.values())).parameter
         self.f32: Arr = np.ndarray(matrix.shape + (2,), dtype=np.float32, buffer=matrix)
 
+    def close(self) -> None:
+        del self.f32
+        if (mm := getattr(self.matrix, "_mmap", None)) is not None:
+            mm.close()
+        del self.matrix
+
     def power_at(self, start: int, end: int) -> Arr:
         sl = self.f32[start:end]
         return np.square(sl[..., 0]) + np.square(sl[..., 1])
@@ -212,7 +218,7 @@ class CwtMatrix:
             d_cnt[r, 1] += n_int[1]
         d_tot_t, d_cnt_t = d_tot.transpose(0, 1, 3, 2), d_cnt.transpose(0, 1, 3, 2)
         tot, cnt = d_tot_t.sum(axis=0), d_cnt_t.sum(axis=0)
-        mean = np.divide(tot, cnt, out=np.full_like(tot, np.nan), where=cnt > 0)
+        mean = np.divide(tot, cnt, out=np.full(tot.shape, np.nan, dtype=np.float64), where=cnt > 0)
         np.divide(d_tot_t, d_cnt_t, out=d_tot_t, where=d_cnt_t > 0)
         d_tot_t[ np.broadcast_to(d_cnt_t == 0, d_tot_t.shape) ] = np.nan
         return d_tot_t.astype(np.float32), mean
@@ -247,10 +253,12 @@ class CwtMatrix:
             length, (first, last) = c.length, c.bounds(start, end, strand)
             lo, hi = bounds.get(iv, (0, length)) if bounds is not None else (0, length)
             seq = sequences[name]
-            for boundary, m, code, w_min, w_max in (
-                ("start", first + peaks["start"], "U", lo, length),
-                ("end", last - 1 + peaks["end"], "D", 0, hi),
+            for boundary, anchor, code, w_min, w_max in (
+                ("start", first, "U", lo, length),
+                ("end", last - 1, "D", 0, hi),
             ):
+                dist = peaks[boundary]
+                m = anchor + dist
                 ws, we, gp = (m - KMER_RADIUS, m + KMER_RADIUS + 1, m + 1) if strand == "+" else (length - m - KMER_RADIUS - 1, length - m + KMER_RADIUS, length - m)
                 if m - KMER_RADIUS < w_min or m + KMER_RADIUS + 1 > w_max or ws < 0 or we > length:
                     skipped += 1
@@ -259,7 +267,6 @@ class CwtMatrix:
                 if len(win) != KMER_WIDTH or any(ch not in "ACGT" for ch in win):
                     skipped += 1
                     continue
-                dist = peaks[boundary]
                 windows[boundary].append((f"{name}:{start}-{end}:{strand}:{code}:{gp}:dist={dist:+d}bp", win))
         return windows, peaks, skipped
 
@@ -306,36 +313,26 @@ class GenomeData:
             if ftype == "exon" and not is_rrna:
                 exon_rows.append((row, parents))
 
-        gene_cache: dict[str, list[str]] = {}
-        rrna_cache: dict[str, bool] = {}
-
-        def resolve_genes(parent: str) -> list[str]:
-            if parent not in gene_cache:
-                seen, pending, genes = set(), [parent], []
+        def resolve_ancestors(parent: str) -> tuple[list[str], bool]:
+            if parent not in anc_cache:
+                seen, pending, genes, rrna = set(), [parent], [], False
                 while pending:
                     if (cur := pending.pop()) not in seen:
                         seen.add(cur)
-                        (genes.append(cur) if cur in gene_ids else pending.extend(parents_by_id.get(cur, ())))
-                gene_cache[parent] = genes
-            return gene_cache[parent]
+                        if cur in rrna_ids:
+                            rrna = True
+                        if cur in gene_ids:
+                            genes.append(cur)
+                        else:
+                            pending.extend(parents_by_id.get(cur, ()))
+                anc_cache[parent] = (genes, rrna)
+            return anc_cache[parent]
 
-        def has_rrna_ancestor(parent: str) -> bool:
-            if parent not in rrna_cache:
-                seen, pending, found = set(), [parent], False
-                while pending:
-                    if (cur := pending.pop()) in rrna_ids:
-                        found = True
-                        break
-                    if cur not in seen:
-                        seen.add(cur)
-                        pending.extend(parents_by_id.get(cur, ()))
-                rrna_cache[parent] = found
-            return rrna_cache[parent]
-
-        tx_exons: dict[str, dict[str, set[Interval]]] = defaultdict(lambda: defaultdict(set))
-        by_tx: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+        anc_cache: dict[str, tuple[list[str], bool]] = {}
+        tx_exons: dict[str, list[Interval]] = defaultdict(list)
         for row, parents in exon_rows:
-            if any(has_rrna_ancestor(p) for p in parents):
+            resolved = [resolve_ancestors(p) for p in parents]
+            if any(rrna for _, rrna in resolved):
                 continue
             name, start, end, strand = row[0], int(row[3]), int(row[4]), row[6]
             if name not in self.contigs:
@@ -343,42 +340,38 @@ class GenomeData:
             self.contigs[name].bounds(start, end, strand)
             iv: Interval = (name, start, end, strand)
             intervals.add(iv)
-            for p in parents:
-                by_tx[name, p].append((start, end))
-                for g in resolve_genes(p):
-                    tx_exons[g][p].add(iv)
+            for p, (genes, _) in zip(parents, resolved):
+                if genes:
+                    tx_exons[p].append(iv)
         if not intervals:
             raise ValueError("No exon features found; CDS is not silently substituted for exon")
 
         sites: dict[str, set[int]] = defaultdict(set)
-        for (name, _), ex in by_tx.items():
-            ex.sort()
-            ln = self.contigs[name].length
-            sites[name].update(s - 1 for s in (ex[0][0], ex[0][0] + 1, ex[-1][1] - 1, ex[-1][1]) if 1 <= s <= ln)
-            for (_, e0), (s1, _) in zip(ex, ex[1:]):
-                if (hi := s1 - 1) >= (lo := e0 + 1):
-                    sites[name].update(s - 1 for s in (lo, lo + 1, hi - 1, hi) if lo <= s <= hi and 1 <= s <= ln)
-
         first_exons, last_exons, multi_exons = set(), set(), set()
         kmer_bounds: dict[Interval, tuple[int, int]] = {}
-        for transcripts in tx_exons.values():
-            for exons in transcripts.values():
-                plus = next(iter(exons))[3] == "+"
-                f_pos = min(x[1] for x in exons) if plus else max(x[2] for x in exons)
-                l_pos = max(x[2] for x in exons) if plus else min(x[1] for x in exons)
-                first_exons.update(x for x in exons if (x[1] if plus else x[2]) == f_pos)
-                last_exons.update(x for x in exons if (x[2] if plus else x[1]) == l_pos)
-                if len(exons) < 2:
-                    continue
-                multi_exons.update(exons)
-                ordered_tx = sorted(exons, key=lambda x: self.contigs[x[0]].bounds(x[1], x[2], x[3])[0])
-                bounds_tx = [self.contigs[x[0]].bounds(x[1], x[2], x[3]) for x in ordered_tx]
-                ln = self.contigs[ordered_tx[0][0]].length
-                for i, iv in enumerate(ordered_tx):
-                    lo = max((bounds_tx[j][1] for j in range(i) if bounds_tx[j][1] <= bounds_tx[i][0]), default=0)
-                    hi = min((bounds_tx[j][0] for j in range(i + 1, len(ordered_tx)) if bounds_tx[j][0] >= bounds_tx[i][1]), default=ln)
-                    prev_lo, prev_hi = kmer_bounds.get(iv, (0, ln))
-                    kmer_bounds[iv] = (max(prev_lo, lo), min(prev_hi, hi))
+        for raw_exons in tx_exons.values():
+            exons = sorted(set(raw_exons), key=lambda x: (x[1], x[2]))
+            name, _, _, strand = exons[0]
+            plus, c = strand == "+", self.contigs[name]
+            ln = c.length
+            sites[name].update(s - 1 for s in (exons[0][1], exons[0][1] + 1, exons[-1][2] - 1, exons[-1][2]) if 1 <= s <= ln)
+            for (_, _, e0, _), ( _, s1, _, _) in zip(exons, exons[1:]):
+                if (hi := s1 - 1) >= (lo := e0 + 1):
+                    sites[name].update(s - 1 for s in (lo, lo + 1, hi - 1, hi) if lo <= s <= hi and 1 <= s <= ln)
+            f_pos = exons[0][1] if plus else exons[-1][2]
+            l_pos = exons[-1][2] if plus else exons[0][1]
+            first_exons.update(x for x in exons if (x[1] if plus else x[2]) == f_pos)
+            last_exons.update(x for x in exons if (x[2] if plus else x[1]) == l_pos)
+            if len(exons) < 2:
+                continue
+            multi_exons.update(exons)
+            ordered_tx = exons if plus else exons[::-1]
+            bounds_tx = [c.bounds(x[1], x[2], strand) for x in ordered_tx]
+            for i, iv in enumerate(ordered_tx):
+                lo = max((bounds_tx[j][1] for j in range(i) if bounds_tx[j][1] <= bounds_tx[i][0]), default=0)
+                hi = min((bounds_tx[j][0] for j in range(i + 1, len(ordered_tx)) if bounds_tx[j][0] >= bounds_tx[i][1]), default=ln)
+                prev_lo, prev_hi = kmer_bounds.get(iv, (0, ln))
+                kmer_bounds[iv] = (max(prev_lo, lo), min(prev_hi, hi))
         exon_spans = [(int(self.c_offs[self.name_to_id[n]]) + s, int(self.c_offs[self.name_to_id[n]]) + e) for n, s, e, _ in intervals]
         excl = {False: merge_spans(list(exon_spans))}
         if rep_spans:
@@ -538,9 +531,9 @@ class CwtPlotter:
                     pwm = np.asarray(m["pwm"], dtype=np.float64)[:, idx]
                     motifs.append({"label": m.get("alt") or "STREME",
                                    "name": m.get("id", "").split("-", 1)[-1] or m.get("seed", ""),
-                                   "width": int(m.get("width", m.get("len", len(pwm)))),
-                                   "sites": int(m.get("npassing", m.get("nsites", m.get("total_sites", 0)))),
-                                   "e_value": m.get("test_evalue") or m.get("train_pvalue") or m.get("evalue", "n/a"),
+                                   "width": int(m.get("width", len(pwm))),
+                                   "sites": int(m.get("npassing", m.get("total_sites", 0))),
+                                   "e_value": m.get("test_evalue") or m.get("train_pvalue") or "n/a",
                                    "probabilities": pwm})
         return motifs
 
@@ -704,29 +697,32 @@ class CwtPlotter:
     @classmethod
     def run(cls, args: argparse.Namespace) -> None:
         args.out.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out) as tmp:
+        with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out, ignore_cleanup_errors=True) as tmp:
             work = Path(tmp)
             if args.regions:
                 if args.gff:
                     raise ValueError("-r/--region cannot be combined with -g/--gff")
                 cwt = CwtMatrix.load_or_create(args.anno, args.fasta, args.cwt or (work / "original"), args.threads)
-                ivs: list[Interval] = []
-                for spec in args.regions:
-                    if (bed_path := Path(spec)).is_file():
-                        with open_text(bed_path) as stream:
-                            for no, line in enumerate(stream, 1):
-                                if (s := line.rstrip("\r\n")) and not s.startswith(("#", "track", "browser")):
-                                    if len(r := s.split("\t")) < 3:
-                                        raise ValueError(f"Expected at least 3 BED columns at line {no}")
-                                    ivs.append(cwt.validate(r[0], int(r[1]) + 1, int(r[2]), r[5] if len(r) > 5 and r[5] in ("+", "-") else "+", "BED contig"))
-                    else:
-                        if len(p := spec.split(":")) not in (2, 3) or "-" not in p[1]:
-                            raise ValueError(f"Invalid region spec {spec!r}; expected SEQID:START-END[:STRAND] or BED file")
-                        s0, e0 = p[1].split("-", 1)
-                        ivs.append(cwt.validate(p[0], int(s0.replace(",", "")), int(e0.replace(",", "")), p[2] if len(p) == 3 else "+"))
-                if not ivs:
-                    raise ValueError("No regions found")
-                cls.render_roi(ivs, cwt, args.out, args.flank, args.pixels)
+                try:
+                    ivs: list[Interval] = []
+                    for spec in args.regions:
+                        if (bed_path := Path(spec)).is_file():
+                            with open_text(bed_path) as stream:
+                                for no, line in enumerate(stream, 1):
+                                    if (s := line.rstrip("\r\n")) and not s.startswith(("#", "track", "browser")):
+                                        if len(r := s.split("\t")) < 3:
+                                            raise ValueError(f"Expected at least 3 BED columns at line {no}")
+                                        ivs.append(cwt.validate(r[0], int(r[1]) + 1, int(r[2]), r[5] if len(r) > 5 and r[5] in ("+", "-") else "+", "BED contig"))
+                        else:
+                            if len(p := spec.split(":")) not in (2, 3) or "-" not in p[1]:
+                                raise ValueError(f"Invalid region spec {spec!r}; expected SEQID:START-END[:STRAND] or BED file")
+                            s0, e0 = p[1].split("-", 1)
+                            ivs.append(cwt.validate(p[0], int(s0.replace(",", "")), int(e0.replace(",", "")), p[2] if len(p) == 3 else "+"))
+                    if not ivs:
+                        raise ValueError("No regions found")
+                    cls.render_roi(ivs, cwt, args.out, args.flank, args.pixels)
+                finally:
+                    cwt.close()
                 return
 
             if not args.gff:
@@ -737,9 +733,12 @@ class CwtPlotter:
             genome: GenomeData | None = None
             if orig:
                 cwt = CwtMatrix.load_or_create(args.anno, args.fasta, args.cwt or (work / "original"), args.threads)
-                genome = GenomeData(args.gff, cwt.contigs)
-                print(f"Plotting {', '.join(orig)}", file=sys.stderr, flush=True)
-                tasks.extend(cls.render_group(orig, cwt, genome, args.fasta, args))
+                try:
+                    genome = GenomeData(args.gff, cwt.contigs)
+                    print(f"Plotting {', '.join(orig)}", file=sys.stderr, flush=True)
+                    tasks.extend(cls.render_group(orig, cwt, genome, args.fasta, args))
+                finally:
+                    cwt.close()
                 del cwt
             if mut:
                 if genome is None:
@@ -750,7 +749,10 @@ class CwtPlotter:
                 mut_fa = genome.write_mutated_fasta(args.fasta, args.seed, work / "mutated.fa")
                 print(f"Plotting {', '.join(mut)}", file=sys.stderr, flush=True)
                 cwt_mut = CwtMatrix.load_or_create(args.anno, mut_fa, work / "mutated", args.threads)
-                tasks.extend(cls.render_group(mut, cwt_mut, genome, mut_fa, args))
+                try:
+                    tasks.extend(cls.render_group(mut, cwt_mut, genome, mut_fa, args))
+                finally:
+                    cwt_mut.close()
                 del cwt_mut
             del genome
         if tasks:
