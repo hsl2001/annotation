@@ -25,6 +25,9 @@
 _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
                "CWT export requires binary32 floats");
 
+#ifdef _OPENACC
+#pragma acc routine seq
+#endif
 static double complex cwt_base_signal(char base) {
   const double complex mapping[4] = {1.0, I, -I, -1.0};
   int index = base_index(base);
@@ -99,80 +102,105 @@ static size_t convolution_fft_size(size_t signal_length, size_t kernel_length) {
   return size;
 }
 
+#ifdef _OPENACC
+#pragma acc routine vector
+#endif
+static void cwt_window_scale(
+  const char *restrict sequence, size_t length, size_t window, int scale, int width,
+  size_t max_fft, const double complex *restrict kernel_table,
+  const double complex *restrict twiddle_table, double complex *restrict signal_fft,
+  double *restrict features, int has_features,
+  float *restrict complex_values, int has_complex,
+  float *restrict powers, int has_powers
+) {
+  size_t start = window * (size_t)CWT_WINDOW_SIZE;
+  size_t window_length = length - start;
+  if (window_length > CWT_WINDOW_SIZE) window_length = CWT_WINDOW_SIZE;
+  size_t end = start + window_length;
+  size_t radius = (size_t)(width / 2);
+  size_t input_start = start > radius ? start - radius : 0;
+  size_t input_end = radius > length - end ? length : end + radius;
+  size_t input_length = input_end - input_start;
+  size_t required = input_length + (size_t)width - 1, fft_size = 1;
+  int level = 0;
+  while (fft_size < required) {
+    fft_size <<= 1;
+    level++;
+  }
+
+  const double complex *twiddle = twiddle_table + (fft_size >> 1);
+  const double complex *kernel_fft =
+    kernel_table + ((size_t)level * WAVE_COUNT + (size_t)scale) * max_fft;
+
+#ifdef _OPENACC
+  #pragma acc loop vector
+#endif
+  for (size_t i = 0; i < fft_size; i++)
+    signal_fft[i] = i < input_length ? cwt_base_signal(sequence[input_start + i]) : 0.0;
+
+  fft_transform_radix2_twiddle(signal_fft, fft_size, false, twiddle);
+#ifdef _OPENACC
+  #pragma acc loop vector
+#endif
+  for (size_t i = 0; i < fft_size; i++) signal_fft[i] *= kernel_fft[i];
+  fft_transform_radix2_twiddle(signal_fft, fft_size, true, twiddle);
+
+  double inv_size = 1.0 / (double)fft_size;
+#ifdef _OPENACC
+  #pragma acc loop vector
+#endif
+  for (size_t position = start; position < end; position++) {
+    size_t index = position - input_start + (size_t)(width - 1 - width / 2);
+    double complex coefficient = signal_fft[index] * inv_size;
+    double real = creal(coefficient), imaginary = cimag(coefficient);
+    size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
+    if (has_features)
+      features[feature] = real, features[feature + 1] = imaginary;
+    if (has_complex)
+      complex_values[feature] = (float)real,
+      complex_values[feature + 1] = (float)imaginary;
+    if (has_powers)
+      powers[position * WAVE_COUNT + (size_t)scale] =
+        (float)(real * real + imaginary * imaginary);
+  }
+}
+
+#ifndef _OPENACC
 typedef struct {
   const Wavelets *wavelets;
   const char *sequence;
   size_t length;
-  size_t task_count;
+  size_t window_count;
+  size_t max_fft;
+  const double complex *kernel_table;
+  const double complex *twiddle_table;
   double *features;
   float *complex_values, *powers;
-  atomic_size_t next_task;
+  atomic_size_t next_window;
 } CwtTask;
 
 static void *cwt_worker(void *arg) {
   CwtTask *task = arg;
-  double complex *signal_fft = NULL, *kernel_fft = NULL;
-  double complex *cached_kernel[WAVE_COUNT] = {0};
-  size_t cached_size[WAVE_COUNT] = {0}, capacity = 0;
-  size_t window_count = (task->task_count + WAVE_COUNT - 1) / WAVE_COUNT;
-  size_t window = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
-  while (window < window_count) {
-    size_t start = window * (size_t)CWT_WINDOW_SIZE;
-    size_t window_length = task->length - start;
-    if (window_length > CWT_WINDOW_SIZE) window_length = CWT_WINDOW_SIZE;
-    size_t end = start + window_length;
-
+  double complex *signal_fft = anno_alloc(task->max_fft, sizeof(*signal_fft));
+  int has_features = task->features != NULL;
+  int has_complex = task->complex_values != NULL;
+  int has_powers = task->powers != NULL;
+  size_t window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
+  while (window < task->window_count) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      int width = task->wavelets->widths[scale];
-      size_t radius = (size_t)(width / 2);
-      size_t input_start = start > radius ? start - radius : 0;
-      size_t input_end = radius > task->length - end ? task->length : end + radius;
-      size_t input_length = input_end - input_start;
-      size_t fft_size = convolution_fft_size(input_length, (size_t)width);
-      if (fft_size > capacity) {
-        free(signal_fft);
-        signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
-        capacity = fft_size;
-      }
-      if (cached_size[scale] != fft_size) {
-        free(cached_kernel[scale]);
-        cached_kernel[scale] = anno_alloc(fft_size, sizeof(*kernel_fft));
-        for (int tap = 0; tap < width; tap++)
-          cached_kernel[scale][width - 1 - tap] = task->wavelets->kernel[scale][tap];
-        fft_transform(cached_kernel[scale], fft_size, false);
-        cached_size[scale] = fft_size;
-      }
-      kernel_fft = cached_kernel[scale];
-      for (size_t position = input_start; position < input_end; position++)
-        signal_fft[position - input_start] = cwt_base_signal(task->sequence[position]);
-      memset(signal_fft + input_length, 0, (fft_size - input_length) * sizeof(*signal_fft));
-      fft_transform(signal_fft, fft_size, false);
-      for (size_t index = 0; index < fft_size; index++)
-        signal_fft[index] *= kernel_fft[index];
-      fft_transform(signal_fft, fft_size, true);
-
-      double inv_size = 1.0 / (double)fft_size;
-      for (size_t position = start; position < end; position++) {
-        size_t index = position - input_start + (size_t)(width - 1 - width / 2);
-        double complex coefficient = signal_fft[index] * inv_size;
-        double real = creal(coefficient), imaginary = cimag(coefficient);
-        size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
-        if (task->features)
-          task->features[feature] = real, task->features[feature + 1] = imaginary;
-        if (task->complex_values)
-          task->complex_values[feature] = (float)real,
-          task->complex_values[feature + 1] = (float)imaginary;
-        if (task->powers)
-          task->powers[position * WAVE_COUNT + (size_t)scale] =
-            (float)(real * real + imaginary * imaginary);
-      }
+      cwt_window_scale(task->sequence, task->length, window, scale,
+                       task->wavelets->widths[scale], task->max_fft,
+                       task->kernel_table, task->twiddle_table, signal_fft,
+                       task->features, has_features,
+                       task->complex_values, has_complex,
+                       task->powers, has_powers);
     }
-    window = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
+    window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
   }
-  for (int scale = 0; scale < WAVE_COUNT; scale++) free(cached_kernel[scale]);
   free(signal_fft);
   return NULL;
 }
+#endif
 
 static void cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
                           int threads, double *features, float *complex_values, float *powers) {
@@ -189,11 +217,85 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
   size_t window_count = sequence_length / CWT_WINDOW_SIZE +
                         (sequence_length % CWT_WINDOW_SIZE != 0);
   if (window_count > SIZE_MAX / WAVE_COUNT) anno_fail("CWT task count overflow");
+
+  size_t max_input = CWT_WINDOW_SIZE + (size_t)wavelets->max_width;
+  if (max_input > sequence_length) max_input = sequence_length;
+  size_t max_fft = convolution_fft_size(max_input, (size_t)wavelets->max_width);
+  int max_level = 0;
+  for (size_t s = 1; s < max_fft; s <<= 1) max_level++;
+
+  double complex *twiddle_table = anno_alloc(max_fft, sizeof(*twiddle_table));
+  double complex *kernel_table =
+    anno_alloc((size_t)(max_level + 1) * WAVE_COUNT * max_fft, sizeof(*kernel_table));
+  for (int lvl = 1; lvl <= max_level; lvl++) {
+    size_t fft_size = (size_t)1 << lvl;
+    double complex *tw = twiddle_table + (fft_size >> 1);
+    double base_angle = -2.0 * acos(-1.0) / (double)fft_size;
+    for (size_t k = 0; k < fft_size / 2; k++) {
+      double angle = base_angle * (double)k;
+      tw[k] = cos(angle) + I * sin(angle);
+    }
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      int width = wavelets->widths[scale];
+      if ((size_t)width > fft_size) continue;
+      double complex *kf = kernel_table + ((size_t)lvl * WAVE_COUNT + (size_t)scale) * max_fft;
+      for (int tap = 0; tap < width; tap++)
+        kf[width - 1 - tap] = wavelets->kernel[scale][tap];
+      fft_transform_radix2_twiddle(kf, fft_size, false, tw);
+    }
+  }
+
+#ifdef _OPENACC
+  size_t task_count = window_count * WAVE_COUNT;
+  enum { CWT_GPU_GANGS = 256 };
+  size_t gang_count = task_count < CWT_GPU_GANGS ? task_count : CWT_GPU_GANGS;
+  double complex *work_buf = anno_alloc(gang_count * max_fft, sizeof(*work_buf));
+  int widths[WAVE_COUNT];
+  for (int s = 0; s < WAVE_COUNT; s++) widths[s] = wavelets->widths[s];
+
+  double dummy_feat[1] = {0};
+  float dummy_flt[1] = {0};
+  int has_features = features != NULL;
+  int has_complex = complex_values != NULL;
+  int has_powers = powers != NULL;
+  double *pf = has_features ? features : dummy_feat;
+  float *pc = has_complex ? complex_values : dummy_flt;
+  float *pp = has_powers ? powers : dummy_flt;
+  size_t nf = has_features ? sequence_length * CWT_CHANNELS : 1;
+  size_t nc = has_complex ? sequence_length * CWT_CHANNELS : 1;
+  size_t np = has_powers ? sequence_length * WAVE_COUNT : 1;
+  size_t kt_len = (size_t)(max_level + 1) * WAVE_COUNT * max_fft;
+  size_t wb_len = gang_count * max_fft;
+
+  #pragma acc data copyin(sequence[0:sequence_length], widths[0:WAVE_COUNT], \
+                          twiddle_table[0:max_fft], kernel_table[0:kt_len]) \
+                   create(work_buf[0:wb_len]) \
+                   copyout(pf[0:nf], pc[0:nc], pp[0:np])
+  {
+    #pragma acc parallel loop gang present(sequence[0:sequence_length], widths[0:WAVE_COUNT], \
+                                           twiddle_table[0:max_fft], kernel_table[0:kt_len], \
+                                           work_buf[0:wb_len], pf[0:nf], pc[0:nc], pp[0:np])
+    for (size_t g = 0; g < gang_count; g++) {
+      double complex *signal_fft = work_buf + g * max_fft;
+      #pragma acc loop seq
+      for (size_t task_index = g; task_index < task_count; task_index += gang_count) {
+        size_t window = task_index / WAVE_COUNT;
+        int scale = (int)(task_index % WAVE_COUNT);
+        cwt_window_scale(sequence, sequence_length, window, scale, widths[scale],
+                         max_fft, kernel_table, twiddle_table, signal_fft,
+                         pf, has_features, pc, has_complex, pp, has_powers);
+      }
+    }
+  }
+  free(work_buf);
+  (void)threads;
+#else
   CwtTask task = {.wavelets = wavelets, .sequence = sequence, .length = sequence_length,
-                  .task_count = window_count * WAVE_COUNT, .features = features,
-                  .complex_values = complex_values, .powers = powers};
-  atomic_init(&task.next_task, 0);
-  int worker_count = task.task_count < (size_t)threads ? (int)task.task_count : threads;
+                  .window_count = window_count, .max_fft = max_fft,
+                  .kernel_table = kernel_table, .twiddle_table = twiddle_table,
+                  .features = features, .complex_values = complex_values, .powers = powers};
+  atomic_init(&task.next_window, 0);
+  int worker_count = window_count < (size_t)threads ? (int)window_count : threads;
   pthread_t *workers = worker_count > 1
       ? anno_alloc((size_t)(worker_count - 1), sizeof(*workers)) : NULL;
   for (int worker = 0; worker < worker_count - 1; worker++)
@@ -203,6 +305,10 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
   for (int worker = 0; worker < worker_count - 1; worker++)
     if (pthread_join(workers[worker], NULL)) anno_fail("Cannot join CWT thread");
   free(workers);
+#endif
+
+  free(kernel_table);
+  free(twiddle_table);
 }
 
 static void *cwt_map_file(FILE *stream, size_t bytes, off_t start, void **mapping,

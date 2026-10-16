@@ -65,16 +65,6 @@ static void *anno_resize(void *memory, size_t count, size_t size) {
   return resized;
 }
 
-int base_index(char base) {
-  switch (base) {
-  case 'A': case 'a': return 0;
-  case 'C': case 'c': return 1;
-  case 'G': case 'g': return 2;
-  case 'T': case 't': return 3;
-  default: return -1;
-  }
-}
-
 static void cwt_powers(const Wavelets *wavelets, const char *sequence, int length,
                        int threads, float *powers) {
   cwt_transform(wavelets, sequence, length, threads, NULL, NULL, powers);

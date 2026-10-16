@@ -39,7 +39,20 @@ typedef struct {
 extern const int wave_sizes[WAVE_COUNT];
 void anno_fail(const char *format, ...);
 void *anno_alloc(size_t count, size_t size);
-int base_index(char base);
+
+#ifdef _OPENACC
+#pragma acc routine seq
+#endif
+static inline int base_index(char base) {
+  switch (base) {
+  case 'A': case 'a': return 0;
+  case 'C': case 'c': return 1;
+  case 'G': case 'g': return 2;
+  case 'T': case 't': return 3;
+  default: return -1;
+  }
+}
+
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
