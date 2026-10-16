@@ -254,8 +254,8 @@ class CwtMatrix:
             lo, hi = bounds.get(iv, (0, length)) if bounds is not None else (0, length)
             seq = sequences[name]
             for boundary, anchor, code, w_min, w_max in (
-                ("start", first, "U", lo, length),
-                ("end", last - 1, "D", 0, hi),
+                ("start", first, "U", lo, first),
+                ("end", last - 1, "D", last, hi),
             ):
                 dist = peaks[boundary]
                 m = anchor + dist

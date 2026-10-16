@@ -15,10 +15,12 @@ enum { K2 = 17, K4 = 257, KNUC = 5, SPLICE_RADIUS = 12,
        FLANKS = SPLICE_RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
 enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
-       OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
+       OFF_ED2 = OFF_ED + STATES * WAVE_COUNT,
+       OFF_TNUC = OFF_ED2 + STATES * WAVE_COUNT,
        OFF_T4 = OFF_TNUC + STATES * STATES * KNUC,
        OFF_TP = OFF_T4 + STATES * STATES * K4, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
-       OFF_SPLICE = OFF_TD + STATES * STATES * WAVE_COUNT,
+       OFF_TD2 = OFF_TD + STATES * STATES * WAVE_COUNT,
+       OFF_SPLICE = OFF_TD2 + STATES * STATES * WAVE_COUNT,
        WEIGHTS = OFF_SPLICE + 4 * FLANKS * K2 };
 
 void crf_init(void);
@@ -41,7 +43,7 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 typedef struct {
   uint16_t k4_emit[2], k4_trans[2];
   float cwt_power[WAVE_COUNT];
-  int16_t derivative[WAVE_COUNT];
+  int16_t derivative[WAVE_COUNT], second_derivative[WAVE_COUNT];
   uint8_t nuc, flank[2][FLANKS];
 } Site;
 
@@ -86,9 +88,12 @@ static Site site_at(const Contig *c, int i) {
       base_index(c->seq[position + 1]) >= 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
       double left = c->cwt_power[(size_t)(position - 1) * WAVE_COUNT + scale];
+      double center = s.cwt_power[scale];
       double right = c->cwt_power[(size_t)(position + 1) * WAVE_COUNT + scale];
       double slope = (right - left) / (right + left + 1e-12);
+      double curvature = (right - 2 * center + left) / (right + 2 * center + left + 1e-12);
       s.derivative[scale] = (int16_t)lrint(slope * INT16_MAX);
+      s.second_derivative[scale] = (int16_t)lrint(curvature * INT16_MAX);
     }
   }
   return s;
@@ -218,6 +223,10 @@ static float derivative_value(const Site *site, int scale, int reverse) {
   return reverse ? -value : value;
 }
 
+static float second_derivative_value(const Site *site, int scale) {
+  return site->second_derivative[scale] / (float)INT16_MAX;
+}
+
 static void add_features(double *gradient, const int *indices, int count, double value) {
   for (int index = 0; index < count; index++) gradient[indices[index]] += value;
 }
@@ -229,6 +238,7 @@ static double emission(const double *weights, const Site *site, int state) {
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
+    score += weights[OFF_ED2 + state * WAVE_COUNT + scale] * second_derivative_value(site, scale);
   }
   return score;
 }
@@ -241,6 +251,7 @@ static double transition(const double *weights, const Site *site, int previous, 
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
     score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
+    score += weights[OFF_TD2 + pair * WAVE_COUNT + scale] * second_derivative_value(site, scale);
   }
   return score;
 }
@@ -252,6 +263,7 @@ static void add_emission(double *gradient, const Site *site, int state, double v
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_EP + state * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
+    gradient[OFF_ED2 + state * WAVE_COUNT + scale] += value * second_derivative_value(site, scale);
   }
 }
 
@@ -263,6 +275,7 @@ static void add_transition(double *gradient, const Site *site, int previous, int
   for (int scale = 0; scale < WAVE_COUNT; scale++) {
     gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
     gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
+    gradient[OFF_TD2 + pair * WAVE_COUNT + scale] += value * second_derivative_value(site, scale);
   }
 }
 
@@ -621,17 +634,22 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
       for (int j = 0; j < EMISSION_FEATURES; j++) scale[indices[j]] += 1;
       for (int k = 0; k < WAVE_COUNT; k++) {
         double derivative = derivative_value(&site, k, state >= 7);
+        double second_derivative = second_derivative_value(&site, k);
         scale[OFF_EP + state * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_ED + state * WAVE_COUNT + k] += derivative * derivative;
+        scale[OFF_ED2 + state * WAVE_COUNT + k] += second_derivative * second_derivative;
       }
       if (!i) continue;
       int previous = contigs[c].label[contigs[c].offset + i - 1], pair = previous * STATES + state;
       int n = transition_indices(&site, previous, state, indices);
       for (int j = 0; j < n; j++) scale[indices[j]] += 1;
+      int reverse = previous >= 7 || state >= 7;
       for (int k = 0; k < WAVE_COUNT; k++) {
-        double derivative = derivative_value(&site, k, previous >= 7 || state >= 7);
+        double derivative = derivative_value(&site, k, reverse);
+        double second_derivative = second_derivative_value(&site, k);
         scale[OFF_TP + pair * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
         scale[OFF_TD + pair * WAVE_COUNT + k] += derivative * derivative;
+        scale[OFF_TD2 + pair * WAVE_COUNT + k] += second_derivative * second_derivative;
       }
     }
   for (int f = 0; f < WEIGHTS; f++) scale[f] = 1 / sqrt(fmax(scale[f], 1));
