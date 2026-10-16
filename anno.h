@@ -40,9 +40,6 @@ extern const int wave_sizes[WAVE_COUNT];
 void anno_fail(const char *format, ...);
 void *anno_alloc(size_t count, size_t size);
 
-#ifdef _OPENACC
-#pragma acc routine seq
-#endif
 static inline int base_index(char base) {
   switch (base) {
   case 'A': case 'a': return 0;

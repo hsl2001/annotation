@@ -10,10 +10,6 @@
 // Perform the FFT in place for an array of size 2^k.
 // No normalization is done.
 void fft_transform_radix2(double _Complex* vec, size_t n, bool inverse);
-
-#ifdef _OPENACC
-#pragma acc routine vector
-#endif
 void fft_transform_radix2_twiddle(double _Complex* restrict vec, size_t n, bool inverse,
                                   const double _Complex* restrict twiddle);
 
@@ -37,9 +33,6 @@ void fft_transform(double _Complex* vec,	size_t n, bool inverse);
 	#define M_PI 3.14159265358979323846
 #endif
 
-#ifdef _OPENACC
-#pragma acc routine vector
-#endif
 void fft_transform_radix2_twiddle(double complex* restrict vec, size_t n, bool inverse,
                                   const double complex* restrict twiddle) {
 	int levels = 0;	 // Compute levels = floor(log2(n))
@@ -47,15 +40,9 @@ void fft_transform_radix2_twiddle(double complex* restrict vec, size_t n, bool i
 		levels++;
 
 	// Permute vec by reversing the bits of addresses
-#ifdef _OPENACC
-	#pragma acc loop vector
-#endif
 	for (size_t i =	0; i < n; i++) {
 		// Reverse the bits of i
 		size_t j = 0, ii = i;
-#ifdef _OPENACC
-		#pragma acc loop seq
-#endif
 		for (int k = 0;	k < levels; k++) {
 			j = (j << 1) | (ii & 1);
 			ii >>= 1;
@@ -69,24 +56,23 @@ void fft_transform_radix2_twiddle(double complex* restrict vec, size_t n, bool i
 	}
 
 	// Cooley-Tukey	in place
-#ifdef _OPENACC
-	#pragma acc loop seq
-#endif
-	for (int level = 0; level < levels; level++) {
-		size_t half = (size_t)1 << level;
+	for (size_t half = 1; half < n;	half *=	2) {
 		size_t size = 2	* half;
 		size_t step = n	/ size;
-#ifdef _OPENACC
-		#pragma acc loop vector
-#endif
-		for (size_t idx = 0; idx < n / 2; idx++) {
-			size_t i = (idx / half) * size;
-			size_t j = idx % half;
-			size_t k = j * step;
-			double complex omega = inverse ? conj(twiddle[k]) : twiddle[k];
-			double complex tmp = vec[i + j + half] * omega;
-			vec[i + j + half] = vec[i + j] - tmp;
-			vec[i + j] += tmp;
+		for (size_t i =	0; i < n; i += size) {
+			if (!inverse) {
+				for (size_t j =	0, k = 0; j < half; j++, k += step) {
+					double complex tmp = vec[i + j + half] * twiddle[k];
+					vec[i + j + half] = vec[i + j] - tmp;
+					vec[i + j] += tmp;
+				}
+			} else {
+				for (size_t j =	0, k = 0; j < half; j++, k += step) {
+					double complex tmp = vec[i + j + half] * conj(twiddle[k]);
+					vec[i + j + half] = vec[i + j] - tmp;
+					vec[i + j] += tmp;
+				}
+			}
 		}
 	}
 }
