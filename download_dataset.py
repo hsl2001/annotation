@@ -207,11 +207,71 @@ def download(cli: str, cache: Path, records: list[dict],
     return pairs
 
 
+def gff_attributes(value: str) -> dict[str, str]:
+    attributes = {}
+    for item in value.split(";"):
+        key, separator, attribute_value = item.partition("=")
+        if separator:
+            attributes[key] = attribute_value
+    return attributes
+
+
+def circular_trans_splice_bounds(path: Path, lengths: dict[str, int]) -> tuple[set[str], dict[str, tuple[int, int]]]:
+    circular: set[str] = set()
+    wrapped: dict[str, str] = {}
+    children: dict[str, list[tuple[str, int, int]]] = {}
+    with open_text(path) as source:
+        for line in source:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            if len(fields) != 9 or fields[0] not in lengths:
+                continue
+            attributes = gff_attributes(fields[8])
+            if fields[2] == "region" and attributes.get("Is_circular", "").casefold() == "true":
+                circular.add(fields[0])
+            try:
+                start, end = int(fields[3]), int(fields[4])
+            except ValueError:
+                continue
+            if 1 <= start <= lengths[fields[0]] < end and attributes.get("ID"):
+                wrapped[attributes["ID"]] = fields[0]
+            if attributes.get("exception") == "trans-splicing":
+                for parent in attributes.get("Parent", "").split(","):
+                    if parent:
+                        children.setdefault(parent, []).append((fields[0], start, end))
+
+    adjusted = {}
+    for identifier, seqid in wrapped.items():
+        if seqid not in circular:
+            continue
+        length = lengths[seqid]
+        segments = []
+        for child_seqid, start, end in children.get(identifier, []):
+            if child_seqid != seqid:
+                continue
+            if not 1 <= start <= end <= 2 * length:
+                raise ValueError(f"{path}: invalid trans-spliced child coordinates for {identifier}")
+            if start <= length < end:
+                segments.extend(((start, length), (1, end - length)))
+            elif start > length:
+                segments.append((start - length, end - length))
+            else:
+                segments.append((start, end))
+        if segments:
+            adjusted[identifier] = (
+                min(start for start, _ in segments),
+                max(end for _, end in segments),
+            )
+    return circular, adjusted
+
+
 def write_annotation(path: Path, output: TextIO, prefix: str,
                      lengths: dict[str, int]) -> None:
     identifiers: set[str] = set()
     references: set[str] = set()
     features = 0
+    circular, wrapped_bounds = circular_trans_splice_bounds(path, lengths)
     with open_text(path) as source:
         for number, line in enumerate(source, 1):
             location = f"{path}:{number}"
@@ -235,7 +295,23 @@ def write_annotation(path: Path, output: TextIO, prefix: str,
             if seqid not in lengths:
                 raise ValueError(f"{location}: seqid {seqid!r} absent from FASTA")
             start, end = int(fields[3]), int(fields[4])
-            if not 1 <= start <= end <= lengths[seqid]:
+            sequence_length = lengths[seqid]
+            if start > sequence_length or end > sequence_length:
+                attributes_by_key = gff_attributes(fields[8])
+                if seqid not in circular or end > 2 * sequence_length:
+                    raise ValueError(f"{location}: feature outside FASTA sequence")
+                if start > sequence_length:
+                    if attributes_by_key.get("exception") != "trans-splicing":
+                        raise ValueError(f"{location}: unsupported circular feature coordinates")
+                    start -= sequence_length
+                    end -= sequence_length
+                else:
+                    identifier = attributes_by_key.get("ID")
+                    if identifier not in wrapped_bounds:
+                        raise ValueError(f"{location}: unsupported wrapped circular feature")
+                    start, end = wrapped_bounds[identifier]
+                fields[3], fields[4] = str(start), str(end)
+            if not 1 <= start <= end <= sequence_length:
                 raise ValueError(f"{location}: feature outside FASTA sequence")
             attributes = []
             for attribute in fields[8].split(";"):
