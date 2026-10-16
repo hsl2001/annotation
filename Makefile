@@ -14,19 +14,15 @@ endif
 CPU_DIR = bin/cpu
 GPU_DIR = bin/gpu
 
-PROGRAMS = anno
 HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
 
 .PHONY: all cpu gpu test clean
 
-all: $(PROGRAMS)
+all: cpu
 
 cpu: $(CPU_DIR)/anno
 
 gpu: $(GPU_DIR)/anno
-
-$(PROGRAMS): $(CPU_DIR)/anno
-	cp $< $@
 
 $(CPU_DIR)/anno: anno.c $(HEADERS)
 	@mkdir -p $(CPU_DIR)
@@ -49,4 +45,4 @@ test: $(CPU_DIR)/test_compute $(GPU_DIR)/test_compute
 	./$(GPU_DIR)/test_compute --verify $(CPU_DIR)/ref.bin
 
 clean:
-	rm -rf *.o $(PROGRAMS) bin
+	rm -rf *.o anno bin

@@ -1581,11 +1581,13 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
     .train = {.windows = windows, .count = window_count, .threads = threads}
   };
   atomic_init(&objective.train.next_instance, 0);
-  fprintf(stderr, "Using %d worker threads for %zu training windows\n",
-          objective.train.threads, objective.train.count);
 #ifdef _OPENACC
+  fprintf(stderr, "Using OpenACC GPU (%d gangs x %d vectors) for %zu training windows\n",
+          CRF_GPU_GANGS, CRF_GPU_VEC, objective.train.count);
   crf_gpu_init(&objective.gpu, contigs, count, windows, window_count);
 #else
+  fprintf(stderr, "Using %d worker threads for %zu training windows\n",
+          objective.train.threads, objective.train.count);
   objective.workers = anno_alloc((size_t)objective.train.threads, sizeof(*objective.workers));
   objective.threads = anno_alloc((size_t)objective.train.threads, sizeof(*objective.threads));
   for (int t = 0; t < objective.train.threads; t++)
