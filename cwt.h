@@ -112,58 +112,65 @@ typedef struct {
 static void *cwt_worker(void *arg) {
   CwtTask *task = arg;
   double complex *signal_fft = NULL, *kernel_fft = NULL;
-  size_t capacity = 0;
-  size_t task_index = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
-  while (task_index < task->task_count) {
-    size_t window = task_index / WAVE_COUNT;
-    int scale = (int)(task_index % WAVE_COUNT);
-    int width = task->wavelets->widths[scale];
+  double complex *cached_kernel[WAVE_COUNT] = {0};
+  size_t cached_size[WAVE_COUNT] = {0}, capacity = 0;
+  size_t window_count = (task->task_count + WAVE_COUNT - 1) / WAVE_COUNT;
+  size_t window = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
+  while (window < window_count) {
     size_t start = window * (size_t)CWT_WINDOW_SIZE;
     size_t window_length = task->length - start;
     if (window_length > CWT_WINDOW_SIZE) window_length = CWT_WINDOW_SIZE;
     size_t end = start + window_length;
-    size_t radius = (size_t)(width / 2);
-    size_t input_start = start > radius ? start - radius : 0;
-    size_t input_end = radius > task->length - end ? task->length : end + radius;
-    size_t input_length = input_end - input_start;
-    size_t fft_size = convolution_fft_size(input_length, (size_t)width);
-    if (fft_size > capacity) {
-      free(signal_fft);
-      free(kernel_fft);
-      signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
-      kernel_fft = anno_alloc(fft_size, sizeof(*kernel_fft));
-      capacity = fft_size;
-    }
-    memset(signal_fft, 0, fft_size * sizeof(*signal_fft));
-    memset(kernel_fft, 0, fft_size * sizeof(*kernel_fft));
-    for (size_t position = input_start; position < input_end; position++)
-      signal_fft[position - input_start] = cwt_base_signal(task->sequence[position]);
-    for (int tap = 0; tap < width; tap++)
-      kernel_fft[width - 1 - tap] = task->wavelets->kernel[scale][tap];
-    fft_transform(signal_fft, fft_size, false);
-    fft_transform(kernel_fft, fft_size, false);
-    for (size_t index = 0; index < fft_size; index++)
-      signal_fft[index] *= kernel_fft[index];
-    fft_transform(signal_fft, fft_size, true);
 
-    for (size_t position = start; position < end; position++) {
-      size_t index = position - input_start + (size_t)(width - 1 - width / 2);
-      double complex coefficient = signal_fft[index] / (double)fft_size;
-      double real = creal(coefficient), imaginary = cimag(coefficient);
-      size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
-      if (task->features)
-        task->features[feature] = real, task->features[feature + 1] = imaginary;
-      if (task->complex_values)
-        task->complex_values[feature] = (float)real,
-        task->complex_values[feature + 1] = (float)imaginary;
-      if (task->powers)
-        task->powers[position * WAVE_COUNT + (size_t)scale] =
-          (float)(real * real + imaginary * imaginary);
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      int width = task->wavelets->widths[scale];
+      size_t radius = (size_t)(width / 2);
+      size_t input_start = start > radius ? start - radius : 0;
+      size_t input_end = radius > task->length - end ? task->length : end + radius;
+      size_t input_length = input_end - input_start;
+      size_t fft_size = convolution_fft_size(input_length, (size_t)width);
+      if (fft_size > capacity) {
+        free(signal_fft);
+        signal_fft = anno_alloc(fft_size, sizeof(*signal_fft));
+        capacity = fft_size;
+      }
+      if (cached_size[scale] != fft_size) {
+        free(cached_kernel[scale]);
+        cached_kernel[scale] = anno_alloc(fft_size, sizeof(*kernel_fft));
+        for (int tap = 0; tap < width; tap++)
+          cached_kernel[scale][width - 1 - tap] = task->wavelets->kernel[scale][tap];
+        fft_transform(cached_kernel[scale], fft_size, false);
+        cached_size[scale] = fft_size;
+      }
+      kernel_fft = cached_kernel[scale];
+      for (size_t position = input_start; position < input_end; position++)
+        signal_fft[position - input_start] = cwt_base_signal(task->sequence[position]);
+      memset(signal_fft + input_length, 0, (fft_size - input_length) * sizeof(*signal_fft));
+      fft_transform(signal_fft, fft_size, false);
+      for (size_t index = 0; index < fft_size; index++)
+        signal_fft[index] *= kernel_fft[index];
+      fft_transform(signal_fft, fft_size, true);
+
+      double inv_size = 1.0 / (double)fft_size;
+      for (size_t position = start; position < end; position++) {
+        size_t index = position - input_start + (size_t)(width - 1 - width / 2);
+        double complex coefficient = signal_fft[index] * inv_size;
+        double real = creal(coefficient), imaginary = cimag(coefficient);
+        size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
+        if (task->features)
+          task->features[feature] = real, task->features[feature + 1] = imaginary;
+        if (task->complex_values)
+          task->complex_values[feature] = (float)real,
+          task->complex_values[feature + 1] = (float)imaginary;
+        if (task->powers)
+          task->powers[position * WAVE_COUNT + (size_t)scale] =
+            (float)(real * real + imaginary * imaginary);
+      }
     }
-    task_index = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
+    window = atomic_fetch_add_explicit(&task->next_task, 1, memory_order_relaxed);
   }
+  for (int scale = 0; scale < WAVE_COUNT; scale++) free(cached_kernel[scale]);
   free(signal_fft);
-  free(kernel_fft);
   return NULL;
 }
 

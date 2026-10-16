@@ -50,6 +50,8 @@ typedef struct {
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 28, 33, 41, 46};
 static const int hidden_counts[STATES] = {1, 3, 4, 2, 1, 3, 4, 2, 8, 5, 8, 5, 1};
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans;
+static int edge_pair[STATES * STATES], edge_rev[STATES * STATES], edge_kind[STATES * STATES];
+static int pair_to_edge[STATES][STATES];
 static uint8_t hidden_state[HIDDEN_STATES], hidden_context[HIDDEN_STATES];
 typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
 static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
@@ -192,9 +194,16 @@ static int terminal_allowed(int hidden) {
 
 void crf_init(void) {
   ntrans = 0;
+  memset(pair_to_edge, -1, sizeof(pair_to_edge));
   for (int a = 0; a < STATES; a++)
     for (int b = 0; b < STATES; b++)
-      if (allowed(a, b)) trans_a[ntrans] = a, trans_b[ntrans++] = b;
+      if (allowed(a, b)) {
+        edge_pair[ntrans] = a * STATES + b;
+        edge_rev[ntrans] = a >= 7 || b >= 7;
+        edge_kind[ntrans] = boundary_kind(a, b);
+        pair_to_edge[a][b] = ntrans;
+        trans_a[ntrans] = a, trans_b[ntrans++] = b;
+      }
   for (int state = 0; state < STATES; state++)
     for (int context = 0; context < hidden_counts[state]; context++) {
       int hidden = hidden_offsets[state] + context;
@@ -246,17 +255,6 @@ static void add_features(double *gradient, const int *indices, int count, double
   for (int index = 0; index < count; index++) gradient[indices[index]] += value;
 }
 
-static double emission(const double *weights, const Site *site, int state) {
-  int indices[EMISSION_FEATURES], reverse = state >= 7;
-  emission_indices(site, state, indices);
-  double score = feature_score(weights, indices, EMISSION_FEATURES);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    score += weights[OFF_EP + state * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_ED + state * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
-  }
-  return score;
-}
-
 static double transition(const double *weights, const Contig *c, const Site *site, int position,
                          int previous, int current) {
   int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
@@ -281,16 +279,6 @@ static double transition(const double *weights, const Contig *c, const Site *sit
     }
   }
   return score;
-}
-
-static void add_emission(double *gradient, const Site *site, int state, double value) {
-  int indices[EMISSION_FEATURES], reverse = state >= 7;
-  emission_indices(site, state, indices);
-  add_features(gradient, indices, EMISSION_FEATURES, value);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    gradient[OFF_EP + state * WAVE_COUNT + scale] += value * site->cwt_power[scale];
-    gradient[OFF_ED + state * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
-  }
 }
 
 static void add_transition(double *gradient, const Contig *c, const Site *site, int position,
@@ -318,7 +306,11 @@ static void add_transition(double *gradient, const Contig *c, const Site *site, 
   }
 }
 
-typedef struct { double *checkpoint, *alpha, *scale; int block_size; } Work;
+typedef struct {
+  Site *sites;
+  double *exp_psi, *alpha, *inv_scale;
+  int capacity;
+} Work;
 
 static double log_add(double left, double right) {
   if (left == -INFINITY) return right;
@@ -330,59 +322,69 @@ static double log_add(double left, double right) {
 static Site site_scores(const double *w, const Contig *c, int position,
                         double *emissions, double *psi) {
   Site site = site_at(c, position);
-  for (int state = 0; state < STATES; state++) {
-    emissions[state] = emission(w, &site, state);
-    if (!isfinite(emissions[state]))
-      anno_fail("Non-finite CRF emission at position %d", position + 1);
-  }
-  for (int edge = 0; edge < ntrans; edge++) {
-    psi[edge] = transition(w, c, &site, position, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
-    if (!isfinite(psi[edge]))
-      anno_fail("Non-finite CRF transition at position %d", position + 1);
-  }
-  return site;
-}
+  float deriv_pos[WAVE_COUNT];
+  for (int scale = 0; scale < WAVE_COUNT; scale++)
+    deriv_pos[scale] = site.derivative[scale] / (float)INT16_MAX;
 
-static double forward_step(const double *w, const Contig *c, int position,
-                           const double *previous, double *alpha) {
-  Site site;
-  double emissions[STATES], psi[STATES * STATES];
-  site = site_scores(w, c, position, emissions, psi);
-  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) alpha[hidden] = -INFINITY;
-  if (!position) {
-    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-      if (initial_allowed(site.nuc, hidden, c->offset == 0))
-        alpha[hidden] = emissions[hidden_state[hidden]];
-  } else {
-    const HiddenEdge *edges = hidden_edges[site.nuc];
-    for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
-      const HiddenEdge *step = edges + edge;
-      alpha[step->current] = log_add(alpha[step->current],
-                                     previous[step->previous] + psi[step->transition]);
+  for (int state = 0; state < STATES; state++) {
+    int reverse = state >= 7;
+    double score = w[OFF_ENUC + state * KNUC + site.nuc] +
+                   w[OFF_E4 + state * K4 + site.k4_emit[reverse]];
+    const double *wp = w + OFF_EP + state * WAVE_COUNT;
+    const double *wd = w + OFF_ED + state * WAVE_COUNT;
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      score += wp[scale] * site.cwt_power[scale];
+      score += wd[scale] * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
+    }
+    if (!isfinite(score))
+      anno_fail("Non-finite CRF emission at position %d", position + 1);
+    emissions[state] = score;
+  }
+
+  int genome_position = c->offset + position;
+  double b_splice[2][4], b_cwt[2][4];
+  for (int rev = 0; rev < 2; rev++) {
+    float power[FLANKS][WAVE_COUNT];
+    double derivative[FLANKS][WAVE_COUNT];
+    for (int offset = 0; offset < FLANKS; offset++)
+      boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
+    const uint8_t *fl = site.flank[rev];
+    for (int kind = 0; kind < 4; kind++) {
+      double sp = 0, cw = 0;
+      for (int offset = 0; offset < FLANKS; offset++)
+        sp += w[OFF_SPLICE + (kind * FLANKS + offset) * K2 + fl[offset]];
+      for (int offset = 0; offset < FLANKS; offset++) {
+        int base = (kind * FLANKS + offset) * WAVE_COUNT;
+        const double *wbp = w + OFF_BP + base;
+        const double *wbd = w + OFF_BD + base;
+        for (int scale = 0; scale < WAVE_COUNT; scale++) {
+          cw += wbp[scale] * power[offset][scale];
+          cw += wbd[scale] * derivative[offset][scale];
+        }
+      }
+      b_splice[rev][kind] = sp;
+      b_cwt[rev][kind] = cw;
     }
   }
-  if (position == c->length - 1 &&
-      c->offset + c->length == c->genome_length)
-    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-      if (!terminal_allowed(hidden)) alpha[hidden] = -INFINITY;
 
-  double total = -INFINITY;
-  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) total = log_add(total, alpha[hidden]);
-  if (!isfinite(total)) anno_fail("Invalid CRF partition at position %d", position + 1);
-  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) alpha[hidden] -= total;
-  return total;
-}
-
-static void backward_step(const Site *next_site, const double *next_psi,
-                          const double *next_beta, double next_scale, double *beta) {
-  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) beta[hidden] = -INFINITY;
-  const HiddenEdge *edges = hidden_edges[next_site->nuc];
-  for (int edge = 0; edge < hidden_edge_count[next_site->nuc]; edge++) {
-    const HiddenEdge *step = edges + edge;
-    beta[step->previous] = log_add(beta[step->previous],
-                                   next_psi[step->transition] + next_beta[step->current]);
+  for (int edge = 0; edge < ntrans; edge++) {
+    int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
+    double score = w[OFF_TNUC + pair * KNUC + site.nuc] +
+                   w[OFF_T4 + pair * K4 + site.k4_trans[reverse]];
+    if (kind >= 0) score += b_splice[reverse][kind];
+    const double *wp = w + OFF_TP + pair * WAVE_COUNT;
+    const double *wd = w + OFF_TD + pair * WAVE_COUNT;
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      score += wp[scale] * site.cwt_power[scale];
+      score += wd[scale] * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
+    }
+    if (kind >= 0) score += b_cwt[reverse][kind];
+    double p = score + emissions[trans_b[edge]];
+    if (!isfinite(p))
+      anno_fail("Non-finite CRF transition at position %d", position + 1);
+    psi[edge] = p;
   }
-  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) beta[hidden] -= next_scale;
+  return site;
 }
 
 static double gold_grammar_mass(const Contig *contig, int start, int end) {
@@ -413,102 +415,205 @@ static double gold_grammar_mass(const Contig *contig, int start, int end) {
   return mass;
 }
 
+static void work_ensure(Work *k, int length) {
+  if (length <= k->capacity) return;
+  free(k->sites), free(k->exp_psi), free(k->alpha), free(k->inv_scale);
+  k->sites = anno_alloc((size_t)length, sizeof(Site));
+  k->exp_psi = anno_alloc((size_t)length, (size_t)ntrans * sizeof(double));
+  k->alpha = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(double));
+  k->inv_scale = anno_alloc((size_t)length, sizeof(double));
+  k->capacity = length;
+}
+
+static void work_free(Work *k) {
+  free(k->sites), free(k->exp_psi), free(k->alpha), free(k->inv_scale);
+}
+
 /* Accumulates the exact observed-minus-expected gradient for one training window. */
 static double contig_gradient(const double *w, const Contig *c, Work *k, double *gradient) {
   double mass = gold_grammar_mass(c, 0, c->length);
   if (mass == -INFINITY) return NAN;
 
-  int block_size = k->block_size;
-  double logz = 0, alpha_a[HIDDEN_STATES], alpha_b[HIDDEN_STATES];
-  const double *alpha_previous = NULL;
-  double *alpha_current = alpha_a;
+  work_ensure(k, c->length);
+  double logz = 0, gold_score = 0;
   for (int position = 0; position < c->length; position++) {
-    logz += forward_step(w, c, position, alpha_previous, alpha_current);
-    if (position + 1 < c->length && (position + 1) % block_size == 0)
-      memcpy(k->checkpoint + (size_t)(position / block_size) * HIDDEN_STATES,
-             alpha_current, sizeof(alpha_a));
-    alpha_previous = alpha_current;
-    alpha_current = alpha_current == alpha_a ? alpha_b : alpha_a;
+    double emissions[STATES], psi[STATES * STATES];
+    Site site = site_scores(w, c, position, emissions, psi);
+    k->sites[position] = site;
+    int gold_state = c->label[c->offset + position];
+    gold_score += emissions[gold_state];
+
+    double *A = k->alpha + (size_t)position * HIDDEN_STATES;
+    if (!position) {
+      double max_e = -INFINITY;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        if (initial_allowed(site.nuc, hidden, c->offset == 0)) {
+          double e = emissions[hidden_state[hidden]];
+          if (e > max_e) max_e = e;
+        }
+      if (!isfinite(max_e)) anno_fail("Invalid CRF partition at position %d", position + 1);
+      double sum = 0;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
+        double v = initial_allowed(site.nuc, hidden, c->offset == 0)
+          ? exp(emissions[hidden_state[hidden]] - max_e) : 0.0;
+        if (c->length == 1 && c->offset + c->length == c->genome_length && !terminal_allowed(hidden))
+          v = 0.0;
+        A[hidden] = v;
+        sum += v;
+      }
+      if (!(sum > 0) || !isfinite(sum)) anno_fail("Invalid CRF partition at position %d", position + 1);
+      double inv = 1.0 / sum;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] *= inv;
+      k->inv_scale[0] = inv;
+      logz += max_e + log(sum);
+    } else {
+      double max_psi = psi[0];
+      for (int edge = 1; edge < ntrans; edge++)
+        if (psi[edge] > max_psi) max_psi = psi[edge];
+
+      int prev_gold = c->label[c->offset + position - 1];
+      int gold_edge = pair_to_edge[prev_gold][gold_state];
+      if (gold_edge >= 0)
+        gold_score += psi[gold_edge] - emissions[gold_state];
+      else
+        gold_score += transition(w, c, &site, position, prev_gold, gold_state);
+
+      double *ep = k->exp_psi + (size_t)position * ntrans;
+      for (int edge = 0; edge < ntrans; edge++) ep[edge] = exp(psi[edge] - max_psi);
+
+      const double *prev_A = A - HIDDEN_STATES;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] = 0.0;
+      const HiddenEdge *edges = hidden_edges[site.nuc];
+      int edge_count = hidden_edge_count[site.nuc];
+      for (int edge = 0; edge < edge_count; edge++) {
+        const HiddenEdge *step = edges + edge;
+        A[step->current] += prev_A[step->previous] * ep[step->transition];
+      }
+      if (position == c->length - 1 && c->offset + c->length == c->genome_length)
+        for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+          if (!terminal_allowed(hidden)) A[hidden] = 0.0;
+
+      double sum = 0;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) sum += A[hidden];
+      if (!(sum > 0) || !isfinite(sum))
+        anno_fail("Invalid CRF partition at position %d", position + 1);
+      double inv = 1.0 / sum;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] *= inv;
+      k->inv_scale[position] = inv;
+      logz += max_psi + log(sum);
+    }
   }
 
-  double likelihood = mass - logz;
-  double beta[HIDDEN_STATES];
+  double likelihood = mass - logz + gold_score;
+  double B[HIDDEN_STATES];
   int reaches_contig_end = c->offset + c->length == c->genome_length;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    beta[hidden] = !reaches_contig_end || terminal_allowed(hidden) ? 0 : -INFINITY;
+    B[hidden] = !reaches_contig_end || terminal_allowed(hidden) ? 1.0 : 0.0;
 
-  for (int block_start = ((c->length - 1) / block_size) * block_size;
-       block_start >= 0;) {
-    int block_length = c->length - block_start;
-    if (block_length > block_size) block_length = block_size;
-    int block_end = block_start + block_length;
-    const double *checkpoint = block_start
-      ? k->checkpoint + (size_t)(block_start / block_size - 1) * HIDDEN_STATES : NULL;
-    for (int position = block_start; position < block_end; position++) {
-      int local = position - block_start;
-      double *alpha = k->alpha + (size_t)local * HIDDEN_STATES;
-      const double *before = position == block_start ? checkpoint : alpha - HIDDEN_STATES;
-      k->scale[local] = forward_step(w, c, position, before, alpha);
-    }
-    for (int position = block_end - 1; position >= block_start; position--) {
-      int local = position - block_start;
-      Site site;
-      double emissions[STATES], psi[STATES * STATES];
-      site = site_scores(w, c, position, emissions, psi);
-      const double *alpha = k->alpha + (size_t)local * HIDDEN_STATES;
-      int state = c->label[c->offset + position];
-      likelihood += emissions[state];
-      add_emission(gradient, &site, state, 1);
+  for (int position = c->length - 1; position >= 0; position--) {
+    const Site *site = k->sites + position;
+    const double *A = k->alpha + (size_t)position * HIDDEN_STATES;
+    int state = c->label[c->offset + position];
 
-      double state_marginals[STATES] = {0};
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-        state_marginals[hidden_state[hidden]] += exp(alpha[hidden] + beta[hidden]);
-      for (int st = 0; st < STATES; st++)
-        add_emission(gradient, &site, st, -state_marginals[st]);
+    double state_marginals[STATES] = {0};
+    for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+      state_marginals[hidden_state[hidden]] += A[hidden] * B[hidden];
+    state_marginals[state] -= 1.0;
 
-      if (position) {
-        const double *previous_alpha = local
-          ? alpha - HIDDEN_STATES : checkpoint;
-        int previous_state = c->label[c->offset + position - 1];
-        likelihood += transition(w, c, &site, position, previous_state, state);
-        add_transition(gradient, c, &site, position, previous_state, state, 1);
+    float deriv_pos[WAVE_COUNT];
+    for (int scale = 0; scale < WAVE_COUNT; scale++)
+      deriv_pos[scale] = site->derivative[scale] / (float)INT16_MAX;
 
-        double edge_marginals[STATES * STATES] = {0};
-        const HiddenEdge *edges = hidden_edges[site.nuc];
-        for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
-          const HiddenEdge *step = edges + edge;
-          edge_marginals[step->transition] += exp(
-            previous_alpha[step->previous] + psi[step->transition] +
-            beta[step->current] - k->scale[local]);
-        }
-        for (int edge = 0; edge < ntrans; edge++)
-          if (edge_marginals[edge] > 0)
-            add_transition(gradient, c, &site, position, trans_a[edge], trans_b[edge], -edge_marginals[edge]);
-
-        double beta_previous[HIDDEN_STATES];
-        backward_step(&site, psi, beta, k->scale[local], beta_previous);
-        memcpy(beta, beta_previous, sizeof(beta));
+    for (int st = 0; st < STATES; st++) {
+      double val = -state_marginals[st];
+      int reverse = st >= 7;
+      gradient[OFF_ENUC + st * KNUC + site->nuc] += val;
+      gradient[OFF_E4 + st * K4 + site->k4_emit[reverse]] += val;
+      double *gp = gradient + OFF_EP + st * WAVE_COUNT;
+      double *gd = gradient + OFF_ED + st * WAVE_COUNT;
+      for (int scale = 0; scale < WAVE_COUNT; scale++) {
+        gp[scale] += val * site->cwt_power[scale];
+        gd[scale] += val * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
       }
     }
-    if (!block_start) break;
-    block_start -= block_size;
+
+    if (position) {
+      const double *prev_A = A - HIDDEN_STATES;
+      const double *ep = k->exp_psi + (size_t)position * ntrans;
+      double inv_c = k->inv_scale[position];
+      int previous_state = c->label[c->offset + position - 1];
+      int gold_edge = pair_to_edge[previous_state][state];
+
+      double edge_marginals[STATES * STATES] = {0};
+      double B_prev[HIDDEN_STATES] = {0};
+      const HiddenEdge *edges = hidden_edges[site->nuc];
+      int edge_count = hidden_edge_count[site->nuc];
+      for (int edge = 0; edge < edge_count; edge++) {
+        const HiddenEdge *step = edges + edge;
+        double w_bq = ep[step->transition] * B[step->current];
+        B_prev[step->previous] += w_bq;
+        edge_marginals[step->transition] += prev_A[step->previous] * w_bq;
+      }
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) B[hidden] = B_prev[hidden] * inv_c;
+
+      double b_coeff[4][2] = {{0}};
+      int has_boundary = 0;
+      for (int edge = 0; edge < ntrans; edge++) edge_marginals[edge] *= inv_c;
+      if (gold_edge >= 0) {
+        edge_marginals[gold_edge] -= 1.0;
+      } else {
+        add_transition(gradient, c, site, position, previous_state, state, 1);
+      }
+
+      for (int edge = 0; edge < ntrans; edge++) {
+        double m = edge_marginals[edge];
+        if (m != 0) {
+          double val = -m;
+          int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
+          gradient[OFF_TNUC + pair * KNUC + site->nuc] += val;
+          gradient[OFF_T4 + pair * K4 + site->k4_trans[reverse]] += val;
+          if (kind >= 0) {
+            b_coeff[kind][reverse] += val;
+            has_boundary = 1;
+          }
+          double *gp = gradient + OFF_TP + pair * WAVE_COUNT;
+          double *gd = gradient + OFF_TD + pair * WAVE_COUNT;
+          for (int scale = 0; scale < WAVE_COUNT; scale++) {
+            gp[scale] += val * site->cwt_power[scale];
+            gd[scale] += val * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
+          }
+        }
+      }
+      if (has_boundary) {
+        int genome_position = c->offset + position;
+        for (int rev = 0; rev < 2; rev++) {
+          if (b_coeff[0][rev] == 0 && b_coeff[1][rev] == 0 &&
+              b_coeff[2][rev] == 0 && b_coeff[3][rev] == 0) continue;
+          float power[FLANKS][WAVE_COUNT];
+          double derivative[FLANKS][WAVE_COUNT];
+          for (int offset = 0; offset < FLANKS; offset++)
+            boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
+          for (int kind = 0; kind < 4; kind++) {
+            double val = b_coeff[kind][rev];
+            if (val == 0) continue;
+            const uint8_t *fl = site->flank[rev];
+            for (int offset = 0; offset < FLANKS; offset++)
+              gradient[OFF_SPLICE + (kind * FLANKS + offset) * K2 + fl[offset]] += val;
+            for (int offset = 0; offset < FLANKS; offset++) {
+              int base = (kind * FLANKS + offset) * WAVE_COUNT;
+              double *gbp = gradient + OFF_BP + base;
+              double *gbd = gradient + OFF_BD + base;
+              for (int scale = 0; scale < WAVE_COUNT; scale++) {
+                gbp[scale] += val * power[offset][scale];
+                gbd[scale] += val * derivative[offset][scale];
+              }
+            }
+          }
+        }
+      }
+    }
   }
   return likelihood;
-}
-
-static Work work_alloc(int length) {
-  int block_size = (int)ceil(sqrt((double)length));
-  int checkpoint_count = (length - 1) / block_size;
-  return (Work){
-    .checkpoint = anno_alloc((size_t)checkpoint_count, HIDDEN_STATES * sizeof(double)),
-    .alpha = anno_alloc((size_t)block_size, HIDDEN_STATES * sizeof(double)),
-    .scale = anno_alloc((size_t)block_size, sizeof(double)),
-    .block_size = block_size
-  };
-}
-
-static void work_free(Work *k) {
-  free(k->checkpoint), free(k->alpha), free(k->scale);
 }
 
 typedef struct {
@@ -561,6 +666,7 @@ typedef struct {
   double likelihood;
   size_t positions, skipped;
   double *gradient;
+  Work work;
 } CrfWorker;
 
 static void *crf_worker(void *arg) {
@@ -576,9 +682,7 @@ static void *crf_worker(void *arg) {
     Contig instance = *window->contig;
     instance.offset = window->start;
     instance.length = window->length;
-    Work work = work_alloc(instance.length);
-    double score = contig_gradient(worker->w, &instance, &work, worker->gradient);
-    work_free(&work);
+    double score = contig_gradient(worker->w, &instance, &worker->work, worker->gradient);
     if (isnan(score)) {
       worker->skipped++;
     } else {
@@ -733,7 +837,10 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
                                       iterations, &completed);
   for (int f = 0; f < WEIGHTS; f++) w[f] *= objective.scale[f];
   free(objective.scale), free(objective.weights);
-  for (int t = 0; t < objective.train.threads; t++) free(objective.workers[t].gradient);
+  for (int t = 0; t < objective.train.threads; t++) {
+    work_free(&objective.workers[t].work);
+    free(objective.workers[t].gradient);
+  }
   free(objective.workers), free(objective.threads), free(windows);
   if (status == LBFGS_ALLOCATION_FAILURE) anno_fail("Out of memory in L-BFGS optimizer");
   if (status == LBFGS_NONFINITE) anno_fail("Non-finite value in L-BFGS optimizer");
@@ -750,21 +857,13 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
 
 static void viterbi_step(const double *weights, const Contig *contig, int position,
                          const double *previous, double *current, uint8_t *back) {
-  Site site = site_at(contig, position);
   double emissions[STATES], transitions[STATES * STATES];
-  for (int state = 0; state < STATES; state++) {
-    emissions[state] = emission(weights, &site, state);
-    if (!isfinite(emissions[state])) anno_fail("Non-finite prediction emission");
-  }
+  Site site = site_scores(weights, contig, position, emissions, transitions);
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
     current[hidden] = position == 0 && initial_allowed(site.nuc, hidden, 1) ? emissions[hidden_state[hidden]] : -INFINITY;
     if (back) back[hidden] = 0;
   }
   if (position) {
-    for (int edge = 0; edge < ntrans; edge++) {
-      transitions[edge] = transition(weights, contig, &site, position, trans_a[edge], trans_b[edge]) + emissions[trans_b[edge]];
-      if (!isfinite(transitions[edge])) anno_fail("Non-finite prediction transition");
-    }
     const HiddenEdge *edges = hidden_edges[site.nuc];
     for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
       const HiddenEdge *step = edges + edge;

@@ -53,19 +53,26 @@ void fft_transform_radix2(double complex* vec, size_t n, bool inverse) {
 	}
 
 	// Cooley-Tukey	in place
+	double complex twiddle_stack[4096];
+	double complex* twiddle = (n / 2 <= 4096)
+		? twiddle_stack : RFFT_CALLOC(n / 2, sizeof(double complex));
+	double base_angle = (inverse ? 2 : -2) * M_PI / n;
+	for (size_t k = 0; k < n / 2; k++) {
+		double angle = base_angle * k;
+		twiddle[k] = cos(angle) + I * sin(angle);
+	}
 	for (size_t half = 1; half < n;	half *=	2) {
 		size_t size = 2	* half;
 		size_t step = n	/ size;
-		for (size_t j =	0, k = 0; j < half; j++, k += step) {
-			double angle = (inverse	? 2 : -2) * M_PI * k / n;
-			double complex omega = cos(angle) + I *	sin(angle);
-        		for (size_t i =	0; i < n; i += size) {
-				double complex tmp = vec[i + j + half] * omega;
+		for (size_t i =	0; i < n; i += size) {
+			for (size_t j =	0, k = 0; j < half; j++, k += step) {
+				double complex tmp = vec[i + j + half] * twiddle[k];
 				vec[i + j + half] = vec[i + j] - tmp;
 				vec[i + j] += tmp;
 			}
 		}
 	}
+	if (twiddle != twiddle_stack) RFFT_FREE(twiddle);
 }
 
 void fft_transform_bluestein(double complex* vec, size_t n, bool inverse) {
