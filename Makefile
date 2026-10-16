@@ -8,7 +8,7 @@ ifneq ($(NVC),)
   GPU_CFLAGS = -O3 -std=c11 -acc=gpu -Minfo=accel -pthread
 else
   GPU_CC = $(shell command -v gcc-acc 2>/dev/null || echo "gcc -fcf-protection=none -fno-stack-protector -fopenacc -foffload=nvptx-none")
-  GPU_CFLAGS = -O3 -fcx-limited-range -foffload-options=nvptx-none="-misa=sm_80 -fcx-limited-range -fno-stack-protector" -std=c11 -Wall -Wextra -pthread
+	GPU_CFLAGS = -O3 -fcx-limited-range -foffload-options=nvptx-none="-misa=sm_80 -fcx-limited-range -fno-stack-protector -lm" -std=c11 -Wall -Wextra -pthread
 endif
 
 CPU_DIR = bin/cpu
