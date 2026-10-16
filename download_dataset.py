@@ -216,9 +216,13 @@ def gff_attributes(value: str) -> dict[str, str]:
     return attributes
 
 
-def circular_trans_splice_bounds(path: Path, lengths: dict[str, int]) -> tuple[set[str], dict[str, tuple[int, int]]]:
+def circular_trans_splice_bounds(
+    path: Path, lengths: dict[str, int]
+) -> tuple[set[str], dict[str, tuple[int, int]],
+           dict[tuple[str, int, int, str], tuple[int, int]]]:
     circular: set[str] = set()
-    wrapped: dict[str, str] = {}
+    wrapped: dict[str, tuple[str, list[str]]] = {}
+    trans_spliced: set[tuple[str, str]] = set()
     children: dict[str, list[tuple[str, int, int]]] = {}
     with open_text(path) as source:
         for line in source:
@@ -234,36 +238,57 @@ def circular_trans_splice_bounds(path: Path, lengths: dict[str, int]) -> tuple[s
                 start, end = int(fields[3]), int(fields[4])
             except ValueError:
                 continue
-            if 1 <= start <= lengths[fields[0]] < end and attributes.get("ID"):
-                wrapped[attributes["ID"]] = fields[0]
-            if attributes.get("exception") == "trans-splicing":
-                for parent in attributes.get("Parent", "").split(","):
-                    if parent:
-                        children.setdefault(parent, []).append((fields[0], start, end))
+            identifier = attributes.get("ID")
+            parents = [parent for parent in attributes.get("Parent", "").split(",") if parent]
+            if identifier and attributes.get("exception") == "trans-splicing":
+                trans_spliced.add((fields[0], identifier))
+            if identifier and 1 <= start <= lengths[fields[0]] < end:
+                wrapped[identifier] = (fields[0], parents)
+            if fields[2] in {"exon", "CDS"}:
+                for parent in parents:
+                    children.setdefault(parent, []).append((fields[0], start, end))
 
     adjusted = {}
-    for identifier, seqid in wrapped.items():
-        if seqid not in circular:
+    adjusted_children = {}
+    for identifier, (seqid, parents) in wrapped.items():
+        if seqid not in circular or not any((seqid, parent) in trans_spliced for parent in parents):
             continue
         length = lengths[seqid]
         segments = []
+        child_rows = children.get(identifier, [])
+        if len(child_rows) < 2:
+            continue
+        has_unwrapped = False
+        has_wrapped = False
         for child_seqid, start, end in children.get(identifier, []):
             if child_seqid != seqid:
-                continue
+                segments = []
+                break
             if not 1 <= start <= end <= 2 * length:
                 raise ValueError(f"{path}: invalid trans-spliced child coordinates for {identifier}")
-            if start <= length < end:
-                segments.extend(((start, length), (1, end - length)))
-            elif start > length:
-                segments.append((start - length, end - length))
+            if start > length:
+                has_wrapped = True
+                normalized = (start - length, end - length)
+            elif end <= length:
+                has_unwrapped = True
+                normalized = (start, end)
             else:
-                segments.append((start, end))
-        if segments:
+                segments = []
+                break
+            if not 1 <= normalized[0] <= normalized[1] <= length:
+                raise ValueError(f"{path}: invalid normalized trans-spliced coordinates for {identifier}")
+            segments.append(normalized)
+            for parent in (identifier,):
+                adjusted_children[(seqid, start, end, parent)] = normalized
+        if segments and has_unwrapped and has_wrapped:
             adjusted[identifier] = (
                 min(start for start, _ in segments),
                 max(end for _, end in segments),
             )
-    return circular, adjusted
+        else:
+            for child_seqid, start, end in child_rows:
+                adjusted_children.pop((child_seqid, start, end, identifier), None)
+    return circular, adjusted, adjusted_children
 
 
 def write_annotation(path: Path, output: TextIO, prefix: str,
@@ -271,7 +296,7 @@ def write_annotation(path: Path, output: TextIO, prefix: str,
     identifiers: set[str] = set()
     references: set[str] = set()
     features = 0
-    circular, wrapped_bounds = circular_trans_splice_bounds(path, lengths)
+    circular, wrapped_bounds, wrapped_children = circular_trans_splice_bounds(path, lengths)
     with open_text(path) as source:
         for number, line in enumerate(source, 1):
             location = f"{path}:{number}"
@@ -301,10 +326,12 @@ def write_annotation(path: Path, output: TextIO, prefix: str,
                 if seqid not in circular or end > 2 * sequence_length:
                     raise ValueError(f"{location}: feature outside FASTA sequence")
                 if start > sequence_length:
-                    if attributes_by_key.get("exception") != "trans-splicing":
+                    normalized = next((wrapped_children[(seqid, start, end, parent)]
+                                       for parent in attributes_by_key.get("Parent", "").split(",")
+                                       if (seqid, start, end, parent) in wrapped_children), None)
+                    if normalized is None:
                         raise ValueError(f"{location}: unsupported circular feature coordinates")
-                    start -= sequence_length
-                    end -= sequence_length
+                    start, end = normalized
                 else:
                     identifier = attributes_by_key.get("ID")
                     if identifier not in wrapped_bounds:
