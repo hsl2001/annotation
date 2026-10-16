@@ -3,6 +3,10 @@
 
 #include "anno.h"
 
+#ifndef CWT_GPU_GANGS
+#define CWT_GPU_GANGS 256
+#endif
+
 #endif
 
 #ifdef CWT_IMPLEMENTATION
@@ -247,7 +251,6 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
 
 #ifdef _OPENACC
   size_t task_count = window_count * WAVE_COUNT;
-  enum { CWT_GPU_GANGS = 256 };
   size_t gang_count = task_count < CWT_GPU_GANGS ? task_count : CWT_GPU_GANGS;
   double complex *work_buf = anno_alloc(gang_count * max_fft, sizeof(*work_buf));
   int widths[WAVE_COUNT];

@@ -10,7 +10,7 @@ control*
 *.bed
 __pycache__/
 regions*
-anno
+bin/
 annevo/
 tmp*
 *plots-*

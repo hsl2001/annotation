@@ -11,8 +11,8 @@ else
   GPU_CFLAGS = -O3 -fcx-limited-range -foffload-options=nvptx-none="-fcx-limited-range" -std=c11 -Wall -Wextra -pthread
 endif
 
-CPU_DIR = build/cpu
-GPU_DIR = build/gpu
+CPU_DIR = bin/cpu
+GPU_DIR = bin/gpu
 
 PROGRAMS = anno
 HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
@@ -49,4 +49,4 @@ test: $(CPU_DIR)/test_compute $(GPU_DIR)/test_compute
 	./$(GPU_DIR)/test_compute --verify $(CPU_DIR)/ref.bin
 
 clean:
-	rm -rf *.o $(PROGRAMS) build
+	rm -rf *.o $(PROGRAMS) bin

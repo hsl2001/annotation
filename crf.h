@@ -5,7 +5,27 @@
 #include "lbfgs.h"
 #include <stdint.h>
 
+#ifndef CRF_L2_C2
 #define CRF_L2_C2 2.0
+#endif
+#ifndef CRF_WINDOW_SIZE
+#define CRF_WINDOW_SIZE 65536
+#endif
+#ifndef CRF_DECODE_CHUNK
+#define CRF_DECODE_CHUNK 262144
+#endif
+#ifndef CRF_GPU_GANGS
+#define CRF_GPU_GANGS 26
+#endif
+#ifndef CRF_GPU_VEC
+#define CRF_GPU_VEC 32
+#endif
+#ifndef CRF_GPU_THREADS
+#define CRF_GPU_THREADS (CRF_GPU_GANGS * CRF_GPU_VEC)
+#endif
+#ifndef CRF_GPU_BATCH_POS
+#define CRF_GPU_BATCH_POS 3200000
+#endif
 
 /* Linear-chain CRF decoded jointly for both strands.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
@@ -37,8 +57,6 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define CRF_WINDOW_SIZE 65536
 
 typedef struct {
   uint16_t k4_emit[2], k4_trans[2];
@@ -761,13 +779,6 @@ typedef struct {
 } CrfTrain;
 
 #ifdef _OPENACC
-enum {
-  CRF_GPU_GANGS = 26,
-  CRF_GPU_VEC = 32,
-  CRF_GPU_THREADS = CRF_GPU_GANGS * CRF_GPU_VEC,
-  CRF_GPU_BATCH_POS = 3200000
-};
-
 typedef struct {
   size_t total_seq_len, valid_wcount, skipped, positions;
   size_t max_batch_pos, max_batch_win, batch_count;
@@ -1615,8 +1626,6 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   if (status == LBFGS_MAX_ITERATIONS)
     fprintf(stderr, "L-BFGS reached the %d-iteration limit\n", completed);
 }
-
-enum { CRF_DECODE_CHUNK = 262144 };
 
 /* Exact whole-contig MAP decoding. */
 void crf_decode(const double *w, const Contig *c, uint8_t *path) {
