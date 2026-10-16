@@ -23,6 +23,7 @@ from make_dataset import fasta_sequences, open_text, rewrite_attributes, write_f
 
 SIZES = (10, 20, 100)
 LAND_PLANTS = "3193"
+DATASETS_URL = "https://ftp.ncbi.nlm.nih.gov/pub/datasets/command-line/v2/linux-amd64/datasets"
 PREFERRED_SPECIES = (
     "Oryza sativa", "Zea mays", "Solanum lycopersicum", "Glycine max",
     "Brachypodium distachyon", "Medicago truncatula", "Lotus japonicus",
@@ -104,6 +105,17 @@ def save_json(path: Path, value: object) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def ensure_cli(datasets: str) -> str:
+    cli = shutil.which(datasets)
+    if cli is not None:
+        return cli
+    path = Path(datasets) if "/" in datasets else Path(__file__).resolve().parent / "bin" / "datasets"
+    if not path.is_file():
+        run(["curl", "-fL", "-o", str(path), "--create-dirs", DATASETS_URL])
+        run(["chmod", "+x", str(path)])
+    return str(path.resolve())
 
 
 def get_selection(cli: str, cache: Path, min_busco: float) -> list[dict]:
@@ -303,13 +315,6 @@ def main() -> int:
     args = parser.parse_args()
     if not 1 <= args.workers <= 30 or not 0 <= args.min_busco <= 1:
         parser.error("--workers must be 1-30 and --min-busco must be 0-1")
-    cli = shutil.which(args.datasets)
-    if cli is None:
-        parser.error(
-            f"NCBI Datasets v2 CLI not found: {args.datasets}. "
-            "Install with `conda install -c conda-forge ncbi-datasets-cli` "
-            "or pass --datasets /path/to/datasets."
-        )
     root = args.output_dir.resolve()
     cache = (args.cache_dir or root / ".ncbi-datasets").resolve()
     try:
@@ -319,6 +324,7 @@ def main() -> int:
                     path = root / f"{size}-genomes" / name
                     if path.exists():
                         raise ValueError(f"Output already exists: {path}; use --overwrite")
+        cli = ensure_cli(args.datasets)
         root.mkdir(parents=True, exist_ok=True)
         cache.mkdir(parents=True, exist_ok=True)
         records = get_selection(cli, cache, args.min_busco)
