@@ -7,7 +7,11 @@ Usage:
 """
 
 import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
+import gzip
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -15,8 +19,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import TextIO
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
+import zlib
 
 from make_dataset import fasta_sequences, open_text, rewrite_attributes, write_fasta
 
@@ -173,6 +181,159 @@ def package_inputs(package: Path, records: list[dict]) -> list[tuple[Path, Path]
     return pairs
 
 
+def ftp_url_from_fetch_url(fetch_url: str) -> str | None:
+    token = urlparse(fetch_url).path.rstrip("/").rsplit("/", 1)[-1]
+    padded = token + "=" * (-len(token) % 4)
+    try:
+        raw = zlib.decompress(base64.urlsafe_b64decode(padded)).decode("latin1")
+    except Exception:
+        return None
+    match = re.search(r"ncbi\+ftp://(genomes/[^\x00-\x1f\s]+?\.gz)", raw)
+    return f"https://ftp.ncbi.nlm.nih.gov/{match.group(1)}" if match else None
+
+
+def load_package_metadata(package: Path) -> tuple[dict[Path, int], dict[Path, str], dict[Path, str]]:
+    ncbi_dir = package / "ncbi_dataset"
+    data = ncbi_dir / "data"
+    catalog = json.loads((data / "dataset_catalog.json").read_text(encoding="utf-8"))
+    expected_sizes: dict[Path, int] = {}
+    for entry in catalog.get("assemblies", []):
+        for item in entry.get("files", []):
+            if "filePath" in item and item.get("uncompressedLengthBytes") is not None:
+                path = (data / item["filePath"]).resolve()
+                expected_sizes[path] = int(item["uncompressedLengthBytes"])
+    md5sums: dict[Path, str] = {}
+    md5_file = package / "md5sum.txt"
+    if md5_file.is_file():
+        for line in md5_file.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split()
+            if len(parts) == 2:
+                md5sums[(package / parts[1]).resolve()] = parts[0].lower()
+    fetch_urls: dict[Path, str] = {}
+    fetch_file = ncbi_dir / "fetch.txt"
+    if fetch_file.is_file():
+        for line in fetch_file.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) >= 3:
+                target = (ncbi_dir / parts[2]).resolve()
+                if target.is_relative_to(ncbi_dir.resolve()):
+                    fetch_urls[target] = parts[0]
+    return expected_sizes, md5sums, fetch_urls
+
+
+def is_hydrated_file_valid(path: Path, expected_size: int | None) -> bool:
+    if not path.is_file():
+        return False
+    size = path.stat().st_size
+    if size <= 0:
+        return False
+    return expected_size is None or size == expected_size
+
+
+def stream_to_target(url: str, target: Path, expected_size: int | None,
+                     expected_md5: str | None, decompress_gzip: bool) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    request = Request(url, headers={"User-Agent": "ncbi-datasets-fallback/1.0"})
+    with tempfile.NamedTemporaryFile(
+        prefix=target.name + ".part-", dir=target.parent, delete=False
+    ) as temporary:
+        temp_path = Path(temporary.name)
+    try:
+        hasher = hashlib.md5() if expected_md5 else None
+        total = 0
+        with urlopen(request, timeout=120) as response:
+            source = gzip.GzipFile(fileobj=response) if decompress_gzip else response
+            with source, temp_path.open("wb") as out:
+                while chunk := source.read(1 << 20):
+                    out.write(chunk)
+                    total += len(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
+        if total <= 0:
+            raise ValueError(f"Empty download from {url}")
+        if expected_size is not None and total != expected_size:
+            raise ValueError(f"Size mismatch for {target.name}: got {total}, expected {expected_size}")
+        if hasher is not None and hasher.hexdigest().lower() != expected_md5:
+            raise ValueError(f"MD5 mismatch for {target.name}")
+        temp_path.replace(target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def fetch_missing_file(target: Path, fetch_url: str, expected_size: int | None,
+                       expected_md5: str | None) -> None:
+    candidates: list[tuple[str, bool]] = []
+    if (ftp_url := ftp_url_from_fetch_url(fetch_url)) is not None:
+        candidates.append((ftp_url, True))
+    candidates.append((fetch_url, True))
+    last_error: Exception | None = None
+    for attempt in range(1, 5):
+        for url, is_gzip in candidates:
+            try:
+                log(f"Fallback fetch ({attempt}/4): {url} -> {target.name}")
+                stream_to_target(url, target, expected_size, expected_md5, is_gzip)
+                return
+            except Exception as error:
+                last_error = error
+        if attempt < 4:
+            time.sleep(min(2 ** attempt, 10))
+    raise ValueError(f"Failed to fetch {target}: {last_error}")
+
+
+def rehydrate_package(cli: str, package: Path, records: list[dict], workers: int) -> None:
+    expected_sizes, md5sums, fetch_urls = load_package_metadata(package)
+    data = package / "ncbi_dataset" / "data"
+    catalog = json.loads((data / "dataset_catalog.json").read_text(encoding="utf-8"))
+    entries = {entry["accession"]: entry for entry in catalog["assemblies"]
+               if "accession" in entry}
+    required_paths: list[Path] = []
+    for record in records:
+        accession = record["accession"]
+        if accession not in entries:
+            raise ValueError(f"{accession}: missing from the cached package catalog")
+        for kind in ("GENOMIC_NUCLEOTIDE_FASTA", "GFF3"):
+            matches = [item for item in entries[accession]["files"] if item["fileType"] == kind]
+            if len(matches) != 1:
+                raise ValueError(f"{accession}: expected one {kind} file in catalog")
+            path = (data / matches[0]["filePath"]).resolve()
+            if not path.is_relative_to(data.resolve()):
+                raise ValueError(f"Unsafe catalog path: {matches[0]['filePath']}")
+            required_paths.append(path)
+
+    missing = [p for p in required_paths if not is_hydrated_file_valid(p, expected_sizes.get(p))]
+    if not missing:
+        return
+
+    rehydrate_cmd = [
+        cli, "rehydrate", "--directory", str(package),
+        "--max-workers", str(workers), "--no-progressbar",
+    ]
+    log("+ " + " ".join(rehydrate_cmd))
+    result = subprocess.run(rehydrate_cmd, text=True)
+    if result.returncode != 0:
+        log(f"WARNING: datasets rehydrate exited with {result.returncode}; "
+            "recovering remaining files via direct NCBI HTTPS mirror...")
+
+    still_missing = [p for p in required_paths if not is_hydrated_file_valid(p, expected_sizes.get(p))]
+    if not still_missing:
+        return
+
+    log(f"Recovering {len(still_missing)} incomplete/unavailable file(s) via direct HTTPS...")
+    pool_workers = max(1, min(workers, 8, len(still_missing)))
+    with ThreadPoolExecutor(max_workers=pool_workers) as executor:
+        futures = {}
+        for path in still_missing:
+            fetch_url = fetch_urls.get(path)
+            if not fetch_url:
+                raise ValueError(f"Missing fetch URL for unhydrated file: {path}")
+            futures[executor.submit(
+                fetch_missing_file, path, fetch_url, expected_sizes.get(path), md5sums.get(path)
+            )] = path
+        for future in as_completed(futures):
+            future.result()
+
+
 def download(cli: str, cache: Path, records: list[dict],
              workers: int) -> list[tuple[Path, Path]]:
     accessions = cache / "accessions.txt"
@@ -200,8 +361,7 @@ def download(cli: str, cache: Path, records: list[dict],
     # Rehydration resumes interrupted downloads; only mark complete after validation.
     complete = package / ".hydrated"
     if not complete.exists():
-        run([cli, "rehydrate", "--directory", str(package),
-             "--max-workers", str(workers), "--no-progressbar"])
+        rehydrate_package(cli, package, records, workers)
     pairs = package_inputs(package, records)
     complete.touch()
     return pairs
