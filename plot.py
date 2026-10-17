@@ -40,7 +40,7 @@ KmerHit = tuple[str, str]
 Arr = NDArray[Any]
 
 PLOT_NAMES: tuple[str, ...] = (
-    "exons", "exons-mutated", "exon-kmer", "control", "control-aggt",
+    "exons", "introns", "exons-mutated", "exon-kmer", "control", "control-aggt",
     "control-aggt-p1", "first-exons", "last-exons", "control-no-repeat",
     "control-aggt-no-repeat", "control-aggt-p1-no-repeat",
 )
@@ -347,7 +347,7 @@ class GenomeData:
             raise ValueError("No exon features found; CDS is not silently substituted for exon")
 
         sites: dict[str, set[int]] = defaultdict(set)
-        first_exons, last_exons, multi_exons = set(), set(), set()
+        first_exons, last_exons, multi_exons, introns = set(), set(), set(), set()
         kmer_bounds: dict[Interval, tuple[int, int]] = {}
         for raw_exons in tx_exons.values():
             exons = sorted(set(raw_exons), key=lambda x: (x[1], x[2]))
@@ -357,6 +357,7 @@ class GenomeData:
             sites[name].update(s - 1 for s in (exons[0][1], exons[0][1] + 1, exons[-1][2] - 1, exons[-1][2]) if 1 <= s <= ln)
             for (_, _, e0, _), ( _, s1, _, _) in zip(exons, exons[1:]):
                 if (hi := s1 - 1) >= (lo := e0 + 1):
+                    introns.add((name, lo, hi, strand))
                     sites[name].update(s - 1 for s in (lo, lo + 1, hi - 1, hi) if lo <= s <= hi and 1 <= s <= ln)
             f_pos = exons[0][1] if plus else exons[-1][2]
             l_pos = exons[-1][2] if plus else exons[0][1]
@@ -379,6 +380,7 @@ class GenomeData:
         return (
             {
                 "exons": sort_intervals(intervals),
+                "introns": sort_intervals(introns),
                 "multi-exons": sort_intervals(multi_exons),
                 "first-exons": sort_intervals(first_exons),
                 "last-exons": sort_intervals(last_exons),
@@ -689,6 +691,8 @@ class CwtPlotter:
                         if aggt
                         else (genome.sample_controls(args.seed, repeat_free=repeat_free) if base_group == "control" else genome.exon_sets[group])
                     )
+                    if not selected:
+                        raise ValueError(f"No {group} features found")
                     if repeat_free:
                         print(f"Sampled {len(selected):,}/{len(exons):,} {group} {sub_out.name}; unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
                     queue_abs(exons_agg if (group == "exons" and exons_agg is not None) else cwt.aggregate_boundaries(selected, args.rows), len(selected), sub_out)
