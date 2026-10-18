@@ -276,7 +276,8 @@ static void load_model(const char *path, double *w) {
   float *values = anno_alloc(WEIGHTS, sizeof(*values));
   FILE *file = fopen(path, "rb");
   if (!file || fread(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
-    anno_fail("Cannot read model: %s", path);
+    anno_fail("Cannot read model: %s (expected %d weights; older feature layouts require retraining)",
+              path, WEIGHTS);
   fclose(file);
   for (int i = 0; i < WEIGHTS; i++) {
     w[i] = values[i];
@@ -343,6 +344,8 @@ static int usage(const char *program, int status, int cwt_only) {
     fprintf(stderr, "Usage: %s [-p threads] <genome.fa[.gz]> <new_directory>\n", program);
   else
     fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+                    "Features: emit_k3, boundary_k2, boundary_cwt_power, boundary_cwt_deriv.\n"
+                    "Models from earlier feature layouts must be retrained.\n"
                     "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }

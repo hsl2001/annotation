@@ -16,14 +16,9 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K5 = 1025, KNUC = 5, RADIUS = 8,
-       FLANKS = RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
-enum { OFF_ENUC = 0, OFF_E5 = OFF_ENUC + STATES * KNUC,
-       OFF_EP = OFF_E5 + STATES * K5, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
-       OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
-       OFF_T5 = OFF_TNUC + STATES * STATES * KNUC,
-       OFF_TP = OFF_T5 + STATES * STATES * K5, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
-       OFF_SPLICE = OFF_TD + STATES * STATES * WAVE_COUNT,
+enum { K2 = 17, K3 = 65, KNUC = 5, RADIUS = 8,
+       FLANKS = RADIUS, TRANSITION_FEATURES = FLANKS };
+enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
        OFF_BP = OFF_SPLICE + 4 * FLANKS * K2,
        OFF_BD = OFF_BP + 4 * FLANKS * WAVE_COUNT,
        WEIGHTS = OFF_BD + 4 * FLANKS * WAVE_COUNT };
@@ -44,16 +39,14 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <string.h>
 
 typedef struct {
-  uint16_t k5_emit[2], k5_trans[2];
-  float cwt_power[WAVE_COUNT];
-  int16_t derivative[WAVE_COUNT];
+  uint8_t k3_emit[2];
   uint8_t nuc, flank[2][FLANKS];
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 28, 33, 41, 46};
 static const int hidden_counts[STATES] = {1, 3, 4, 2, 1, 3, 4, 2, 8, 5, 8, 5, 1};
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans;
-static int edge_pair[STATES * STATES], edge_rev[STATES * STATES], edge_kind[STATES * STATES];
+static int edge_rev[STATES * STATES], edge_kind[STATES * STATES];
 static int pair_to_edge[STATES][STATES];
 static uint8_t hidden_state[HIDDEN_STATES], hidden_context[HIDDEN_STATES];
 typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
@@ -76,27 +69,14 @@ static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
   Site s = {
-    .k5_emit = {kmer(c->seq, c->genome_length, position - 2, 5, 0),
-                kmer(c->seq, c->genome_length, position - 2, 5, 1)},
-    .k5_trans = {kmer(c->seq, c->genome_length, position - 2, 5, 0),
-                 kmer(c->seq, c->genome_length, position - 2, 5, 1)},
+    .k3_emit = {kmer(c->seq, c->genome_length, position - 1, 3, 0),
+                kmer(c->seq, c->genome_length, position - 1, 3, 1)},
     .nuc = base < 0 ? 4 : base
   };
   for (int offset = 0; offset < FLANKS; offset++) {
     int displacement = -RADIUS + 2 * offset;
     s.flank[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
     s.flank[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 2, 2, 1);
-  }
-  memcpy(s.cwt_power, c->cwt_power + (size_t)position * WAVE_COUNT, sizeof(s.cwt_power));
-  if (position > 0 && position + 1 < c->genome_length &&
-      base_index(c->seq[position - 1]) >= 0 && base >= 0 &&
-      base_index(c->seq[position + 1]) >= 0) {
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      double left = c->cwt_power[(size_t)(position - 1) * WAVE_COUNT + scale];
-      double right = c->cwt_power[(size_t)(position + 1) * WAVE_COUNT + scale];
-      double slope = (right - left) / (right + left + 1e-12);
-      s.derivative[scale] = (int16_t)lrint(slope * INT16_MAX);
-    }
   }
   return s;
 }
@@ -203,7 +183,6 @@ void crf_init(void) {
   for (int a = 0; a < STATES; a++)
     for (int b = 0; b < STATES; b++)
       if (allowed(a, b)) {
-        edge_pair[ntrans] = a * STATES + b;
         edge_rev[ntrans] = a >= 7 || b >= 7;
         edge_kind[ntrans] = boundary_kind(a, b);
         pair_to_edge[a][b] = ntrans;
@@ -229,25 +208,17 @@ void crf_init(void) {
       }
 }
 
-static void emission_indices(const Site *site, int state, int *indices) {
-  indices[0] = OFF_ENUC + state * KNUC + site->nuc;
-  indices[1] = OFF_E5 + state * K5 + site->k5_emit[state >= 7];
+static int emission_index(const Site *site, int state) {
+  return OFF_E3 + state * K3 + site->k3_emit[state >= 7];
 }
 
 static int transition_indices(const Site *site, int previous, int current, int *indices) {
-  int pair = previous * STATES + current, count = 2;
+  int count = 0;
   int reverse = previous >= 7 || current >= 7, kind = boundary_kind(previous, current);
-  indices[0] = OFF_TNUC + pair * KNUC + site->nuc;
-  indices[1] = OFF_T5 + pair * K5 + site->k5_trans[reverse];
   if (kind >= 0)
     for (int offset = 0; offset < FLANKS; offset++)
       indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * K2 + site->flank[reverse][offset];
   return count;
-}
-
-static float derivative_value(const Site *site, int scale, int reverse) {
-  float value = site->derivative[scale] / (float)INT16_MAX;
-  return reverse ? -value : value;
 }
 
 static double feature_score(const double *weights, const int *indices, int count) {
@@ -264,12 +235,8 @@ static double transition(const double *weights, const Contig *c, const Site *sit
                          int previous, int current) {
   int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
-  int pair = previous * STATES + current, kind = boundary_kind(previous, current);
+  int kind = boundary_kind(previous, current);
   double score = feature_score(weights, indices, count);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    score += weights[OFF_TP + pair * WAVE_COUNT + scale] * site->cwt_power[scale];
-    score += weights[OFF_TD + pair * WAVE_COUNT + scale] * derivative_value(site, scale, reverse);
-  }
   if (kind >= 0) {
     int genome_position = c->offset + position;
     for (int offset = 0; offset < FLANKS; offset++) {
@@ -291,11 +258,7 @@ static void add_transition(double *gradient, const Contig *c, const Site *site, 
   int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
   int count = transition_indices(site, previous, current, indices);
   add_features(gradient, indices, count, value);
-  int pair = previous * STATES + current, kind = boundary_kind(previous, current);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) {
-    gradient[OFF_TP + pair * WAVE_COUNT + scale] += value * site->cwt_power[scale];
-    gradient[OFF_TD + pair * WAVE_COUNT + scale] += value * derivative_value(site, scale, reverse);
-  }
+  int kind = boundary_kind(previous, current);
   if (kind >= 0) {
     int genome_position = c->offset + position;
     for (int offset = 0; offset < FLANKS; offset++) {
@@ -327,20 +290,8 @@ static double log_add(double left, double right) {
 static Site site_scores(const double *w, const Contig *c, int position,
                         double *emissions, double *psi) {
   Site site = site_at(c, position);
-  float deriv_pos[WAVE_COUNT];
-  for (int scale = 0; scale < WAVE_COUNT; scale++)
-    deriv_pos[scale] = site.derivative[scale] / (float)INT16_MAX;
-
   for (int state = 0; state < STATES; state++) {
-    int reverse = state >= 7;
-    double score = w[OFF_ENUC + state * KNUC + site.nuc] +
-                   w[OFF_E5 + state * K5 + site.k5_emit[reverse]];
-    const double *wp = w + OFF_EP + state * WAVE_COUNT;
-    const double *wd = w + OFF_ED + state * WAVE_COUNT;
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      score += wp[scale] * site.cwt_power[scale];
-      score += wd[scale] * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
-    }
+    double score = w[emission_index(&site, state)];
     if (!isfinite(score))
       anno_fail("Non-finite CRF emission at position %d", position + 1);
     emissions[state] = score;
@@ -373,16 +324,9 @@ static Site site_scores(const double *w, const Contig *c, int position,
   }
 
   for (int edge = 0; edge < ntrans; edge++) {
-    int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
-    double score = w[OFF_TNUC + pair * KNUC + site.nuc] +
-                   w[OFF_T5 + pair * K5 + site.k5_trans[reverse]];
+    int reverse = edge_rev[edge], kind = edge_kind[edge];
+    double score = 0;
     if (kind >= 0) score += b_splice[reverse][kind];
-    const double *wp = w + OFF_TP + pair * WAVE_COUNT;
-    const double *wd = w + OFF_TD + pair * WAVE_COUNT;
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      score += wp[scale] * site.cwt_power[scale];
-      score += wd[scale] * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
-    }
     if (kind >= 0) score += b_cwt[reverse][kind];
     double p = score + emissions[trans_b[edge]];
     if (!isfinite(p))
@@ -535,21 +479,9 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       state_marginals[hidden_state[hidden]] += B[hidden];
     state_marginals[state] -= 1.0;
 
-    float deriv_pos[WAVE_COUNT];
-    for (int scale = 0; scale < WAVE_COUNT; scale++)
-      deriv_pos[scale] = site->derivative[scale] / (float)INT16_MAX;
-
     for (int st = 0; st < STATES; st++) {
       double val = -state_marginals[st];
-      int reverse = st >= 7;
-      gradient[OFF_ENUC + st * KNUC + site->nuc] += val;
-      gradient[OFF_E5 + st * K5 + site->k5_emit[reverse]] += val;
-      double *gp = gradient + OFF_EP + st * WAVE_COUNT;
-      double *gd = gradient + OFF_ED + st * WAVE_COUNT;
-      for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        gp[scale] += val * site->cwt_power[scale];
-        gd[scale] += val * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
-      }
+      gradient[emission_index(site, st)] += val;
     }
 
     if (position) {
@@ -589,18 +521,10 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
         double m = edge_marginals[edge];
         if (m != 0) {
           double val = -m;
-          int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
-          gradient[OFF_TNUC + pair * KNUC + site->nuc] += val;
-          gradient[OFF_T5 + pair * K5 + site->k5_trans[reverse]] += val;
+          int reverse = edge_rev[edge], kind = edge_kind[edge];
           if (kind >= 0) {
             b_coeff[kind][reverse] += val;
             has_boundary = 1;
-          }
-          double *gp = gradient + OFF_TP + pair * WAVE_COUNT;
-          double *gd = gradient + OFF_TD + pair * WAVE_COUNT;
-          for (int scale = 0; scale < WAVE_COUNT; scale++) {
-            gp[scale] += val * site->cwt_power[scale];
-            gd[scale] += val * (reverse ? -deriv_pos[scale] : deriv_pos[scale]);
           }
         }
       }
@@ -798,23 +722,12 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
     for (int i = 0; i < contigs[c].length; i++) {
       Site site = site_at(contigs + c, i);
       int state = contigs[c].label[contigs[c].offset + i], indices[TRANSITION_FEATURES];
-      emission_indices(&site, state, indices);
-      for (int j = 0; j < EMISSION_FEATURES; j++) scale[indices[j]] += 1;
-      for (int k = 0; k < WAVE_COUNT; k++) {
-        double derivative = derivative_value(&site, k, state >= 7);
-        scale[OFF_EP + state * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
-        scale[OFF_ED + state * WAVE_COUNT + k] += derivative * derivative;
-      }
+      scale[emission_index(&site, state)] += 1;
       if (!i) continue;
-      int previous = contigs[c].label[contigs[c].offset + i - 1], pair = previous * STATES + state;
+      int previous = contigs[c].label[contigs[c].offset + i - 1];
       int n = transition_indices(&site, previous, state, indices);
       for (int j = 0; j < n; j++) scale[indices[j]] += 1;
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
-      for (int k = 0; k < WAVE_COUNT; k++) {
-        double derivative = derivative_value(&site, k, reverse);
-        scale[OFF_TP + pair * WAVE_COUNT + k] += (double)site.cwt_power[k] * site.cwt_power[k];
-        scale[OFF_TD + pair * WAVE_COUNT + k] += derivative * derivative;
-      }
       if (kind >= 0) {
         int genome_position = contigs[c].offset + i;
         for (int offset = 0; offset < FLANKS; offset++) {
@@ -951,7 +864,6 @@ void crf_save_weights_text(const char *path, const double *w) {
   static const char *const kind_names[4] = {
     "5ss", "3ss", "start_codon", "stop_codon"
   };
-  static const char *const nuc_names[KNUC] = {"A", "C", "G", "T", "N"};
 
   FILE *file = fopen(path, "w");
   if (!file) anno_fail("Cannot write weights text: %s", path);
@@ -959,78 +871,11 @@ void crf_save_weights_text(const char *path, const double *w) {
 
   char kbuf[8];
   for (int s = 0; s < STATES; s++) {
-    for (int n = 0; n < KNUC; n++) {
-      int idx = OFF_ENUC + s * KNUC + n;
-      fprintf(file, "%d\temit_nuc\t%s\tnuc=%s\t%.9g\n",
-              idx, state_names[s], nuc_names[n], (float)w[idx]);
-    }
-  }
-  for (int s = 0; s < STATES; s++) {
-    for (int k = 0; k < K5; k++) {
-      int idx = OFF_E5 + s * K5 + k;
-      format_kmer(k, 5, kbuf);
-      fprintf(file, "%d\temit_k5\t%s\tk5=%s\t%.9g\n",
+    for (int k = 0; k < K3; k++) {
+      int idx = OFF_E3 + s * K3 + k;
+      format_kmer(k, 3, kbuf);
+      fprintf(file, "%d\temit_k3\t%s\tk3=%s\t%.9g\n",
               idx, state_names[s], kbuf, (float)w[idx]);
-    }
-  }
-  for (int s = 0; s < STATES; s++) {
-    for (int sc = 0; sc < WAVE_COUNT; sc++) {
-      int idx = OFF_EP + s * WAVE_COUNT + sc;
-      fprintf(file, "%d\temit_cwt_power\t%s\tscale=%d\t%.9g\n",
-              idx, state_names[s], wave_sizes[sc], (float)w[idx]);
-    }
-  }
-  for (int s = 0; s < STATES; s++) {
-    for (int sc = 0; sc < WAVE_COUNT; sc++) {
-      int idx = OFF_ED + s * WAVE_COUNT + sc;
-      fprintf(file, "%d\temit_cwt_deriv\t%s\tscale=%d\t%.9g\n",
-              idx, state_names[s], wave_sizes[sc], (float)w[idx]);
-    }
-  }
-
-  for (int a = 0; a < STATES; a++) {
-    for (int b = 0; b < STATES; b++) {
-      if (!allowed(a, b)) continue;
-      int pair = a * STATES + b;
-      for (int n = 0; n < KNUC; n++) {
-        int idx = OFF_TNUC + pair * KNUC + n;
-        fprintf(file, "%d\ttrans_nuc\t%s->%s\tnuc=%s\t%.9g\n",
-                idx, state_names[a], state_names[b], nuc_names[n], (float)w[idx]);
-      }
-    }
-  }
-  for (int a = 0; a < STATES; a++) {
-    for (int b = 0; b < STATES; b++) {
-      if (!allowed(a, b)) continue;
-      int pair = a * STATES + b;
-      for (int k = 0; k < K5; k++) {
-        int idx = OFF_T5 + pair * K5 + k;
-        format_kmer(k, 5, kbuf);
-        fprintf(file, "%d\ttrans_k5\t%s->%s\tk5=%s\t%.9g\n",
-                idx, state_names[a], state_names[b], kbuf, (float)w[idx]);
-      }
-    }
-  }
-  for (int a = 0; a < STATES; a++) {
-    for (int b = 0; b < STATES; b++) {
-      if (!allowed(a, b)) continue;
-      int pair = a * STATES + b;
-      for (int sc = 0; sc < WAVE_COUNT; sc++) {
-        int idx = OFF_TP + pair * WAVE_COUNT + sc;
-        fprintf(file, "%d\ttrans_cwt_power\t%s->%s\tscale=%d\t%.9g\n",
-                idx, state_names[a], state_names[b], wave_sizes[sc], (float)w[idx]);
-      }
-    }
-  }
-  for (int a = 0; a < STATES; a++) {
-    for (int b = 0; b < STATES; b++) {
-      if (!allowed(a, b)) continue;
-      int pair = a * STATES + b;
-      for (int sc = 0; sc < WAVE_COUNT; sc++) {
-        int idx = OFF_TD + pair * WAVE_COUNT + sc;
-        fprintf(file, "%d\ttrans_cwt_deriv\t%s->%s\tscale=%d\t%.9g\n",
-                idx, state_names[a], state_names[b], wave_sizes[sc], (float)w[idx]);
-      }
     }
   }
 
