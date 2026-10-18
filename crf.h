@@ -16,10 +16,10 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K4 = 257, K6 = 4097, KNUC = 5, RADIUS = 4,
+enum { K2 = 17, K4 = 257, KNUC = 5, RADIUS = 12,
        FLANKS = RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
-enum { OFF_ENUC = 0, OFF_E6 = OFF_ENUC + STATES * KNUC,
-       OFF_EP = OFF_E6 + STATES * K6, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
+enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
+       OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
        OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
        OFF_T4 = OFF_TNUC + STATES * STATES * KNUC,
        OFF_TP = OFF_T4 + STATES * STATES * K4, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
@@ -43,7 +43,7 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 #include <string.h>
 
 typedef struct {
-  uint16_t k6_emit[2], k4_trans[2];
+  uint16_t k4_emit[2], k4_trans[2];
   float cwt_power[WAVE_COUNT];
   int16_t derivative[WAVE_COUNT];
   uint8_t nuc, flank[2][FLANKS];
@@ -75,8 +75,8 @@ static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
   Site s = {
-    .k6_emit = {kmer(c->seq, c->genome_length, position - 3, 6, 0),
-                kmer(c->seq, c->genome_length, position - 2, 6, 1)},
+    .k4_emit = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
+                kmer(c->seq, c->genome_length, position - 1, 4, 1)},
     .k4_trans = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
                  kmer(c->seq, c->genome_length, position - 2, 4, 1)},
     .nuc = base < 0 ? 4 : base
@@ -228,7 +228,7 @@ void crf_init(void) {
 
 static void emission_indices(const Site *site, int state, int *indices) {
   indices[0] = OFF_ENUC + state * KNUC + site->nuc;
-  indices[1] = OFF_E6 + state * K6 + site->k6_emit[state >= 7];
+  indices[1] = OFF_E4 + state * K4 + site->k4_emit[state >= 7];
 }
 
 static int transition_indices(const Site *site, int previous, int current, int *indices) {
@@ -331,7 +331,7 @@ static Site site_scores(const double *w, const Contig *c, int position,
   for (int state = 0; state < STATES; state++) {
     int reverse = state >= 7;
     double score = w[OFF_ENUC + state * KNUC + site.nuc] +
-                   w[OFF_E6 + state * K6 + site.k6_emit[reverse]];
+                   w[OFF_E4 + state * K4 + site.k4_emit[reverse]];
     const double *wp = w + OFF_EP + state * WAVE_COUNT;
     const double *wd = w + OFF_ED + state * WAVE_COUNT;
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
@@ -530,7 +530,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       double val = -state_marginals[st];
       int reverse = st >= 7;
       gradient[OFF_ENUC + st * KNUC + site->nuc] += val;
-      gradient[OFF_E6 + st * K6 + site->k6_emit[reverse]] += val;
+      gradient[OFF_E4 + st * K4 + site->k4_emit[reverse]] += val;
       double *gp = gradient + OFF_EP + st * WAVE_COUNT;
       double *gd = gradient + OFF_ED + st * WAVE_COUNT;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
