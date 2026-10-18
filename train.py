@@ -287,24 +287,37 @@ def evaluate_predictions(
 
 
 def resolve_genome_inputs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[tuple[str, Path, Path]]:
-    if args.pair:
-        if args.fasta or args.gff:
-            parser.error("use --pair or --fasta/--gff, not both")
+    has_pair = bool(args.pair)
+    has_fasta_gff = bool(args.fasta or args.gff)
+    has_dir = args.directory is not None
+    has_ncbi_opts = (
+        args.cache_dir is not None
+        or args.min_busco is not None
+        or args.workers is not None
+    )
+
+    local_sources = sum((has_pair, has_fasta_gff, has_dir))
+    if local_sources > 1:
+        parser.error("options -d/--directory, --pair, and --fasta/--gff are mutually exclusive")
+    if local_sources > 0 and has_ncbi_opts:
+        parser.error("--cache-dir, --min-busco, and --workers cannot be used with local inputs (-d, --pair, --fasta/--gff)")
+
+    if has_pair:
         raw_pairs = parse_explicit_pairs(args.pair)
         if len(raw_pairs) < args.num_genomes:
             parser.error(f"requested -n {args.num_genomes}, but only {len(raw_pairs)} --pair given")
         selected_pairs = raw_pairs[:args.num_genomes]
         return [(prefix_for(f).rstrip("_"), f, g) for f, g in selected_pairs]
 
-    if args.fasta or args.gff:
+    if has_fasta_gff:
         if not args.fasta or not args.gff or len(args.fasta) != len(args.gff):
-            parser.error("--fasta and --gff must be supplied with the same number of files")
+            parser.error("--fasta and --gff must be supplied together with the same number of files")
         if len(args.fasta) < args.num_genomes:
             parser.error(f"requested -n {args.num_genomes}, but only {len(args.fasta)} files given")
         selected_pairs = list(zip(args.fasta[:args.num_genomes], args.gff[:args.num_genomes]))
         return [(prefix_for(f).rstrip("_"), f, g) for f, g in selected_pairs]
 
-    if args.directory is not None:
+    if has_dir:
         fastas = source_files(args.directory, FASTA_SUFFIXES)
         gffs = source_files(args.directory, GFF_SUFFIXES)
         raw_pairs = pair_inputs(fastas, gffs)
@@ -313,10 +326,17 @@ def resolve_genome_inputs(args: argparse.Namespace, parser: argparse.ArgumentPar
         selected_pairs = raw_pairs[:args.num_genomes]
         return [(prefix_for(f).rstrip("_"), f, g) for f, g in selected_pairs]
 
+    min_busco = 0.95 if args.min_busco is None else args.min_busco
+    workers = 10 if args.workers is None else args.workers
+    if not 0.0 <= min_busco <= 1.0:
+        parser.error("--min-busco must be between 0 and 1")
+    if not 1 <= workers <= 30:
+        parser.error("--workers must be between 1 and 30")
+
     cache = (args.cache_dir or Path(".ncbi-datasets")).resolve()
     cache.mkdir(parents=True, exist_ok=True)
-    records = get_selection(cache, args.min_busco, args.num_genomes)
-    pairs = download(cache, records, args.workers)
+    records = get_selection(cache, min_busco, args.num_genomes)
+    pairs = download(cache, records, workers)
     return [
         (f"{rec['accession']} ({rec['organism']['organism_name']})", f, g)
         for rec, (f, g) in zip(records, pairs)
@@ -388,7 +408,7 @@ def main() -> int:
                         help="number of worker threads for anno and blastp (default: 4)")
     parser.add_argument("-e", "--iterations", type=int, default=0,
                         help="maximum L-BFGS iterations for anno (default: anno default)")
-    parser.add_argument("-m", "--model", type=Path, default=Path("anno.model"),
+    parser.add_argument("-m", "--model", type=Path,
                         help="output path for the final trained model (default: anno.model)")
     parser.add_argument("--anno", type=Path, default=Path("./anno"),
                         help="path to anno executable (default: ./anno)")
@@ -408,11 +428,16 @@ def main() -> int:
                         help="explicit local GFF3 files, paired with --fasta")
     parser.add_argument("--cache-dir", type=Path,
                         help="NCBI FTP download cache directory (default: .ncbi-datasets)")
-    parser.add_argument("--min-busco", type=float, default=0.95,
+    parser.add_argument("--min-busco", type=float,
                         help="minimum annotation BUSCO complete fraction (default: 0.95)")
-    parser.add_argument("--workers", type=int, default=10,
+    parser.add_argument("--workers", type=int,
                         help="FTP download workers (1-30, default: 10)")
     args = parser.parse_args()
+
+    if args.no_final_train and args.model is not None:
+        parser.error("-m / --model cannot be used with --no-final-train")
+    if args.model is None:
+        args.model = Path("anno.model")
 
     if args.num_genomes < 1:
         parser.error("-n / --num-genomes must be >= 1")

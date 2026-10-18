@@ -755,29 +755,70 @@ def main() -> int:
                         help="explicit local FASTA files, paired by order with --gff")
     parser.add_argument("--gff", nargs="+", type=Path,
                         help="explicit local GFF/GFF3 files, paired by order with --fasta")
-    parser.add_argument("-o", "--output-prefix", default="combined",
+    parser.add_argument("-o", "--output-prefix",
                         help="output basename inside -d (default: combined)")
-    parser.add_argument("--output-dir", type=Path, default=Path("."),
+    parser.add_argument("--output-dir", type=Path,
                         help="output directory for NCBI FTP plant datasets (default: .)")
     parser.add_argument("--cache-dir", type=Path,
                         help="default: OUTPUT_DIR/.ncbi-datasets; keep to resume/reuse selection")
-    parser.add_argument("-n", "--num-genomes", type=int, default=max(SIZES),
+    parser.add_argument("-n", "--num-genomes", type=int,
                         help=f"number of plant genomes to download (default: {max(SIZES)})")
-    parser.add_argument("--workers", type=int, default=10, help="download workers (1-30)")
-    parser.add_argument("--min-busco", type=float, default=0.95,
+    parser.add_argument("--workers", type=int, help="download workers (1-30, default: 10)")
+    parser.add_argument("--min-busco", type=float,
                         help="minimum annotation BUSCO complete fraction (default: 0.95)")
-    parser.add_argument("--select-only", action="store_true",
-                        help="freeze/print the selection without downloading sequence data")
-    parser.add_argument("--download-only", action="store_true",
-                        help="download per-genome FASTA/GFF3 via FTP without building concatenated sets")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--select-only", action="store_true",
+                            help="freeze/print the selection without downloading sequence data")
+    mode_group.add_argument("--download-only", action="store_true",
+                            help="download per-genome FASTA/GFF3 via FTP without building concatenated sets")
     parser.add_argument("--overwrite", action="store_true",
                         help="replace existing concatenated files after successful validation")
     args = parser.parse_args()
 
-    if args.directory is not None or args.pair or args.fasta or args.gff:
+    is_local_mode = (
+        args.directory is not None
+        or bool(args.pair)
+        or args.fasta is not None
+        or args.gff is not None
+        or args.output_prefix is not None
+    )
+    has_ncbi_opts = any((
+        args.output_dir is not None,
+        args.cache_dir is not None,
+        args.num_genomes is not None,
+        args.workers is not None,
+        args.min_busco is not None,
+        args.select_only,
+        args.download_only,
+        args.overwrite,
+    ))
+
+    if is_local_mode:
+        if has_ncbi_opts:
+            parser.error(
+                "NCBI download options (--output-dir, --cache-dir, -n, --workers, --min-busco, "
+                "--select-only, --download-only, --overwrite) cannot be used with local combine options "
+                "(-d, --pair, --fasta, --gff, -o)"
+            )
         if args.directory is None:
             args.directory = Path(".")
+        if args.output_prefix is None:
+            args.output_prefix = "combined"
         return run_local_combine(args, parser)
+
+    if args.select_only and (args.workers is not None or args.overwrite):
+        parser.error("--workers and --overwrite cannot be used with --select-only")
+    if args.download_only and args.overwrite:
+        parser.error("--overwrite cannot be used with --download-only")
+
+    if args.output_dir is None:
+        args.output_dir = Path(".")
+    if args.num_genomes is None:
+        args.num_genomes = max(SIZES)
+    if args.workers is None:
+        args.workers = 10
+    if args.min_busco is None:
+        args.min_busco = 0.95
 
     if not 1 <= args.workers <= 30 or not 0 <= args.min_busco <= 1 or args.num_genomes < 1:
         parser.error("--workers must be 1-30, --min-busco must be 0-1, and -n must be >= 1")
