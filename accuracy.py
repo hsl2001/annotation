@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Protein gene-level and gffcompare CDS exon-level accuracy.
-    micromamba run -n anno python3 accuracy.py \
-        -r reference.gff3 -q anno.gff3 -g genome.fasta.gz
-"""
+"""Protein gene-level and gffcompare CDS exon-level accuracy."""
 
 import argparse
 import gzip
@@ -64,7 +61,7 @@ def feature_parents(info):
 
 
 def transcript_intervals(path, feature):
-    metadata, intervals, plain = {}, defaultdict(list), set()
+    metadata, intervals = {}, defaultdict(list)
     for fields, info, start, end in gff_records(path):
         identifier = info.get("ID") or info.get("transcript_id")
         if fields[2].lower() in ("mrna", "transcript") and identifier:
@@ -72,10 +69,7 @@ def transcript_intervals(path, feature):
             metadata[identifier] = (gene or identifier, fields[0], fields[6])
         elif fields[2].lower() == feature:
             interval = (fields[0], fields[6], start, end)
-            parents = feature_parents(info)
-            if not parents:
-                plain.add(interval)
-            for parent in parents:
+            for parent in feature_parents(info):
                 intervals[parent].append(interval)
                 if info.get("gene_id"):
                     metadata.setdefault(parent, (info["gene_id"], fields[0], fields[6]))
@@ -85,7 +79,7 @@ def transcript_intervals(path, feature):
         gene, seqid, strand = metadata.get(transcript, (transcript, seqid, strand))
         if all(segment[:2] == (seqid, strand) for segment in segments):
             models[transcript] = gene, seqid, strand, segments
-    return models, plain
+    return models
 
 
 def read_genes(path):
@@ -93,7 +87,7 @@ def read_genes(path):
 
     Returns gene_id -> (seqid, start, end, strand, transcript_id).
     """
-    transcripts, _ = transcript_intervals(path, "cds")
+    transcripts = transcript_intervals(path, "cds")
     genes = {}
     for transcript, (gene, seqid, strand, intervals) in transcripts.items():
         length = sum(end - start + 1 for _, _, start, end in intervals)
@@ -118,7 +112,7 @@ def reverse_complement(sequence):
 
 def coding_transcripts(path, genome):
     """Read coding transcripts and apply the paper's invalid-model filters."""
-    transcripts, _ = transcript_intervals(path, "cds")
+    transcripts = transcript_intervals(path, "cds")
     valid = {}
     for transcript, (gene, seqid, strand, intervals) in transcripts.items():
         if seqid not in genome:
@@ -403,7 +397,6 @@ def main():
                         help="minimum best-HSP coverage of both proteins (fraction)")
     parser.add_argument("--threads", type=int, default=4, help="blastp threads")
     parser.add_argument("--workdir", type=pathlib.Path, help="keep protein/blast intermediates here")
-    parser.add_argument("--gffcompare", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be positive")

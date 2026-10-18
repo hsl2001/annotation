@@ -75,8 +75,8 @@ typedef struct { float *data; size_t size; } CwtStore;
 static CwtStore cwt_store(Contig *contigs, int count) {
   size_t bases = 0;
   for (int i = 0; i < count; i++) {
-    if ((size_t)contigs[i].length > SIZE_MAX - bases) anno_fail("CWT size overflow");
-    bases += (size_t)contigs[i].length;
+    if ((size_t)contigs[i].genome_length > SIZE_MAX - bases) anno_fail("CWT size overflow");
+    bases += (size_t)contigs[i].genome_length;
   }
   if (bases > SIZE_MAX / (WAVE_COUNT * sizeof(float))) anno_fail("CWT size overflow");
   size_t bytes = bases * WAVE_COUNT * sizeof(float);
@@ -89,7 +89,7 @@ static CwtStore cwt_store(Contig *contigs, int count) {
   size_t offset = 0;
   for (int i = 0; i < count; i++) {
     contigs[i].cwt_power = data + offset * WAVE_COUNT;
-    offset += (size_t)contigs[i].length;
+    offset += (size_t)contigs[i].genome_length;
   }
   return (CwtStore){data, mapping_size};
 }
@@ -110,6 +110,15 @@ Contig *read_fasta(const char *path, int *count) {
     c->seq = anno_strdup(record->seq.s);
     c->length = (int)record->seq.l;
     c->genome_length = c->length;
+    if (record->comment.l) {
+      const char *crop = strstr(record->comment.s, "crop=");
+      int offset = 0, length = 0;
+      if (crop && sscanf(crop + 5, "%d:%d", &offset, &length) == 2 &&
+          offset >= 0 && length > 0 && offset <= c->genome_length - length) {
+        c->offset = offset;
+        c->length = length;
+      }
+    }
   }
   kseq_destroy(record);
   if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
@@ -178,7 +187,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     int contig = 0;
     while (contig < count && strcmp(contigs[contig].name, field[0])) contig++;
     int start = atoi(field[3]), end = atoi(field[4]);
-    if (contig == count || start < 1 || end < start || end > contigs[contig].length) continue;
+    if (contig == count || start < 1 || end < start || end > contigs[contig].genome_length) continue;
     cds = anno_resize(cds, (size_t)n + 1, sizeof(*cds));
     cds[n].parent = anno_strdup(parent);
     cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
@@ -238,15 +247,16 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
     if (coding < MIN_CDS) continue;
     unsigned long g = ++*genes;
     char strand = minus ? '-' : '+';
-    printf("%s\tanno\tgene\t%d\t%d\t.\t%c\t.\tID=gene%lu\n", c->name, start + 1, i, strand, g);
-    printf("%s\tanno\tmRNA\t%d\t%d\t.\t%c\t.\tID=mRNA%lu;Parent=gene%lu\n", c->name, start + 1, i, strand, g, g);
+    int off = c->offset;
+    printf("%s\tanno\tgene\t%d\t%d\t.\t%c\t.\tID=gene%lu\n", c->name, off + start + 1, off + i, strand, g);
+    printf("%s\tanno\tmRNA\t%d\t%d\t.\t%c\t.\tID=mRNA%lu;Parent=gene%lu\n", c->name, off + start + 1, off + i, strand, g, g);
     for (int j = start; j < i;) {
       if (!is_cds(path[j])) { j++; continue; }
       int k = j;
       while (k < i && is_cds(path[k])) k++;
       int phase = (3 - (minus ? path[k - 1] - 7 : path[j] - 1)) % 3;
-      printf("%s\tanno\texon\t%d\t%d\t.\t%c\t.\tParent=mRNA%lu\n", c->name, j + 1, k, strand, g);
-      printf("%s\tanno\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%lu;Parent=mRNA%lu\n", c->name, j + 1, k, strand, phase, g, g);
+      printf("%s\tanno\texon\t%d\t%d\t.\t%c\t.\tParent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, g);
+      printf("%s\tanno\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%lu;Parent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, phase, g, g);
       j = k;
     }
   }
@@ -390,10 +400,10 @@ int main(int argc, char **argv) {
   Contig *contigs = read_fasta(args[0], &count);
   CwtStore cwt = cwt_store(contigs, count);
   for (int c = 0; c < count; c++) {
-    cwt_powers(&wavelets, contigs[c].seq, contigs[c].length, threads, contigs[c].cwt_power);
+    cwt_powers(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, contigs[c].cwt_power);
   }
   if (rest == 2) {
-    for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].length, 1);
+    for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].genome_length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
     crf_train(contigs, count, weights, iterations, threads);

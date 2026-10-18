@@ -625,12 +625,12 @@ typedef struct {
   double mass;
 } CrfWindow;
 
-static int next_window_end(const Contig *contig, int start) {
-  int end = contig->length - start > CRF_WINDOW_SIZE ? start + CRF_WINDOW_SIZE : contig->length;
-  if (end == contig->length || !contig->label[end - 1] || !contig->label[end]) return end;
+static int next_window_end(const Contig *contig, int start, int limit) {
+  int end = limit - start > CRF_WINDOW_SIZE ? start + CRF_WINDOW_SIZE : limit;
+  if (end == limit || !contig->label[end - 1] || !contig->label[end]) return end;
   int gene_start = end - 1, gene_end = end;
   while (gene_start > start && contig->label[gene_start - 1]) gene_start--;
-  while (gene_end < contig->length && contig->label[gene_end]) gene_end++;
+  while (gene_end < limit && contig->label[gene_end]) gene_end++;
   return gene_start > start && end - gene_start <= gene_end - end ? gene_start : gene_end;
 }
 
@@ -638,8 +638,9 @@ static size_t make_windows(Contig *contigs, int count, CrfWindow **windows) {
   size_t window_count = 0, capacity = 0;
   for (int i = 0; i < count; i++) {
     Contig *contig = contigs + i;
-    for (int start = 0; start < contig->length;) {
-      int end = next_window_end(contig, start);
+    int limit = contig->offset + contig->length;
+    for (int start = contig->offset; start < limit;) {
+      int end = next_window_end(contig, start, limit);
       if (end <= start) anno_fail("Cannot split contig into CRF windows: %s", contig->name);
       if (window_count == capacity) {
         if (capacity > SIZE_MAX / 2 / sizeof(**windows))
