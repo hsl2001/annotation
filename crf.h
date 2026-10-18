@@ -27,8 +27,7 @@ enum {
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0])
 };
 enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
-       OFF_CODON = OFF_SPLICE + 2 * BOUNDARY_KMER_COUNT * K2,
-       OFF_BP = OFF_CODON + 2 * BOUNDARY_KMER_COUNT * K3,
+       OFF_BP = OFF_SPLICE + 4 * BOUNDARY_KMER_COUNT * K2,
        OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
        WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT };
 
@@ -50,7 +49,6 @@ void crf_save_weights_text(const char *path, const double *weights);
 typedef struct {
   uint8_t k3_emit[2];
   uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
-  uint8_t boundary_k3[2][BOUNDARY_KMER_COUNT];
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 28, 33, 41, 46};
@@ -87,8 +85,6 @@ static Site site_at(const Contig *c, int i) {
     int displacement = boundary_kmer_offsets[offset];
     s.boundary_k2[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
     s.boundary_k2[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 2, 2, 1);
-    s.boundary_k3[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 3, 0);
-    s.boundary_k3[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 3, 3, 1);
   }
   return s;
 }
@@ -129,9 +125,7 @@ static void derivative_init(void) {
 }
 
 static int boundary_kmer_index(const Site *site, int reverse, int kind, int offset) {
-  if (kind < 2)
-    return OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
-  return OFF_CODON + ((kind - 2) * BOUNDARY_KMER_COUNT + offset) * K3 + site->boundary_k3[reverse][offset];
+  return OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
 }
 
 static int derivative_index(int slot, int offset, int scale) {
@@ -874,16 +868,13 @@ void crf_save_weights_text(const char *path, const double *w) {
   }
 
   for (int kind = 0; kind < 4; kind++) {
-    int size = kind < 2 ? 2 : 3;
-    int codes = kind < 2 ? K2 : K3;
-    int base = kind < 2 ? OFF_SPLICE : OFF_CODON;
     for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
       int disp = boundary_kmer_offsets[offset];
-      for (int k = 0; k < codes; k++) {
-        int idx = base + ((kind % 2) * BOUNDARY_KMER_COUNT + offset) * codes + k;
-        format_kmer(k, size, kbuf);
-        fprintf(file, "%d\tboundary_k%d\t%s\toffset=%+d,k%d=%s\t%.9g\n",
-                idx, size, kind_names[kind], disp, size, kbuf, (float)w[idx]);
+      for (int k = 0; k < K2; k++) {
+        int idx = OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
+        format_kmer(k, 2, kbuf);
+        fprintf(file, "%d\tboundary_k2\t%s\toffset=%+d,k2=%s\t%.9g\n",
+                idx, kind_names[kind], disp, kbuf, (float)w[idx]);
       }
     }
   }
