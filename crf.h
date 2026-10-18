@@ -16,8 +16,7 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K3 = 65, KNUC = 5, RADIUS = 8,
-       FLANKS = RADIUS, TRANSITION_FEATURES = FLANKS };
+enum { K2 = 17, K3 = 65, KNUC = 5, RADIUS = 8, FLANKS = RADIUS };
 enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
        OFF_BP = OFF_SPLICE + 4 * FLANKS * K2,
        OFF_BD = OFF_BP + 4 * FLANKS * WAVE_COUNT,
@@ -212,68 +211,6 @@ static int emission_index(const Site *site, int state) {
   return OFF_E3 + state * K3 + site->k3_emit[state >= 7];
 }
 
-static int transition_indices(const Site *site, int previous, int current, int *indices) {
-  int count = 0;
-  int reverse = previous >= 7 || current >= 7, kind = boundary_kind(previous, current);
-  if (kind >= 0)
-    for (int offset = 0; offset < FLANKS; offset++)
-      indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * K2 + site->flank[reverse][offset];
-  return count;
-}
-
-static double feature_score(const double *weights, const int *indices, int count) {
-  double score = 0;
-  for (int index = 0; index < count; index++) score += weights[indices[index]];
-  return score;
-}
-
-static void add_features(double *gradient, const int *indices, int count, double value) {
-  for (int index = 0; index < count; index++) gradient[indices[index]] += value;
-}
-
-static double transition(const double *weights, const Contig *c, const Site *site, int position,
-                         int previous, int current) {
-  int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
-  int count = transition_indices(site, previous, current, indices);
-  int kind = boundary_kind(previous, current);
-  double score = feature_score(weights, indices, count);
-  if (kind >= 0) {
-    int genome_position = c->offset + position;
-    for (int offset = 0; offset < FLANKS; offset++) {
-      float power[WAVE_COUNT];
-      double derivative[WAVE_COUNT];
-      boundary_cwt_at(c, genome_position, reverse, offset, power, derivative);
-      int base = (kind * FLANKS + offset) * WAVE_COUNT;
-      for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        score += weights[OFF_BP + base + scale] * power[scale];
-        score += weights[OFF_BD + base + scale] * derivative[scale];
-      }
-    }
-  }
-  return score;
-}
-
-static void add_transition(double *gradient, const Contig *c, const Site *site, int position,
-                           int previous, int current, double value) {
-  int indices[TRANSITION_FEATURES], reverse = previous >= 7 || current >= 7;
-  int count = transition_indices(site, previous, current, indices);
-  add_features(gradient, indices, count, value);
-  int kind = boundary_kind(previous, current);
-  if (kind >= 0) {
-    int genome_position = c->offset + position;
-    for (int offset = 0; offset < FLANKS; offset++) {
-      float power[WAVE_COUNT];
-      double derivative[WAVE_COUNT];
-      boundary_cwt_at(c, genome_position, reverse, offset, power, derivative);
-      int base = (kind * FLANKS + offset) * WAVE_COUNT;
-      for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        gradient[OFF_BP + base + scale] += value * power[scale];
-        gradient[OFF_BD + base + scale] += value * derivative[scale];
-      }
-    }
-  }
-}
-
 typedef struct {
   Site *sites;
   double *exp_psi, *alpha, *inv_scale;
@@ -326,8 +263,10 @@ static Site site_scores(const double *w, const Contig *c, int position,
   for (int edge = 0; edge < ntrans; edge++) {
     int reverse = edge_rev[edge], kind = edge_kind[edge];
     double score = 0;
-    if (kind >= 0) score += b_splice[reverse][kind];
-    if (kind >= 0) score += b_cwt[reverse][kind];
+    if (kind >= 0) {
+      score += b_splice[reverse][kind];
+      score += b_cwt[reverse][kind];
+    }
     double p = score + emissions[trans_b[edge]];
     if (!isfinite(p))
       anno_fail("Non-finite CRF transition at position %d", position + 1);
@@ -336,15 +275,15 @@ static Site site_scores(const double *w, const Contig *c, int position,
   return site;
 }
 
-static double gold_grammar_mass(const Contig *contig, int start, int end) {
+static double gold_grammar_mass(const Contig *contig) {
   double previous[HIDDEN_STATES], current[HIDDEN_STATES];
-  int position = contig->offset + start;
+  int position = contig->offset;
   int base = base_index(contig->seq[position]);
   if (base < 0) base = 4;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
     previous[hidden] = hidden_state[hidden] == contig->label[position] &&
       initial_allowed(base, hidden, contig->offset == 0) ? 0 : -INFINITY;
-  for (int position = start + 1; position < end; position++) {
+  for (int position = 1; position < contig->length; position++) {
     int genome_position = contig->offset + position;
     base = base_index(contig->seq[genome_position]);
     if (base < 0) base = 4;
@@ -359,7 +298,7 @@ static double gold_grammar_mass(const Contig *contig, int start, int end) {
   }
   double mass = -INFINITY;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    if (contig->offset + end < contig->genome_length || terminal_allowed(hidden))
+    if (contig->offset + contig->length < contig->genome_length || terminal_allowed(hidden))
       mass = log_add(mass, previous[hidden]);
   return mass;
 }
@@ -419,10 +358,8 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
     } else {
       int prev_gold = c->label[c->offset + position - 1];
       int gold_edge = pair_to_edge[prev_gold][gold_state];
-      if (gold_edge >= 0)
-        gold_score += psi[gold_edge] - emissions[gold_state];
-      else
-        gold_score += transition(w, c, &site, position, prev_gold, gold_state);
+      if (gold_edge < 0) anno_fail("Invalid transition in validated CRF training path");
+      gold_score += psi[gold_edge] - emissions[gold_state];
 
       const double *prev_A = A - HIDDEN_STATES;
       const HiddenEdge *edges = hidden_edges[site.nuc];
@@ -511,11 +448,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
 
       double b_coeff[4][2] = {{0}};
       int has_boundary = 0;
-      if (gold_edge >= 0) {
-        edge_marginals[gold_edge] -= 1.0;
-      } else {
-        add_transition(gradient, c, site, position, previous_state, state, 1);
-      }
+      edge_marginals[gold_edge] -= 1.0;
 
       for (int edge = 0; edge < ntrans; edge++) {
         double m = edge_marginals[edge];
@@ -595,7 +528,7 @@ static size_t make_windows(Contig *contigs, int count, CrfWindow **windows) {
       Contig instance = *contig;
       instance.offset = start;
       instance.length = end - start;
-      double mass = gold_grammar_mass(&instance, 0, instance.length);
+      double mass = gold_grammar_mass(&instance);
       (*windows)[window_count++] = (CrfWindow){contig, start, end - start, mass};
       start = end;
     }
@@ -721,14 +654,14 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
   for (int c = 0; c < count; c++)
     for (int i = 0; i < contigs[c].length; i++) {
       Site site = site_at(contigs + c, i);
-      int state = contigs[c].label[contigs[c].offset + i], indices[TRANSITION_FEATURES];
+      int state = contigs[c].label[contigs[c].offset + i];
       scale[emission_index(&site, state)] += 1;
       if (!i) continue;
       int previous = contigs[c].label[contigs[c].offset + i - 1];
-      int n = transition_indices(&site, previous, state, indices);
-      for (int j = 0; j < n; j++) scale[indices[j]] += 1;
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
       if (kind >= 0) {
+        for (int offset = 0; offset < FLANKS; offset++)
+          scale[OFF_SPLICE + (kind * FLANKS + offset) * K2 + site.flank[reverse][offset]] += 1;
         int genome_position = contigs[c].offset + i;
         for (int offset = 0; offset < FLANKS; offset++) {
           float power[WAVE_COUNT];
@@ -799,7 +732,7 @@ static void viterbi_step(const double *weights, const Contig *contig, int positi
   Site site = site_scores(weights, contig, position, emissions, transitions);
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
     current[hidden] = position == 0 && initial_allowed(site.nuc, hidden, 1) ? emissions[hidden_state[hidden]] : -INFINITY;
-    if (back) back[hidden] = 0;
+    back[hidden] = 0;
   }
   if (position) {
     const HiddenEdge *edges = hidden_edges[site.nuc];
@@ -808,7 +741,7 @@ static void viterbi_step(const double *weights, const Contig *contig, int positi
       double score = previous[step->previous] + transitions[step->transition];
       if (score > current[step->current]) {
         current[step->current] = score;
-        if (back) back[step->current] = step->previous;
+        back[step->current] = step->previous;
       }
     }
   }
