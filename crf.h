@@ -26,8 +26,8 @@ enum {
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0])
 };
-enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
-       OFF_BP = OFF_SPLICE + 4 * BOUNDARY_KMER_COUNT * K2,
+enum { OFF_E3 = 0, OFF_SPLICE_START_STOP = OFF_E3 + STATES * K3,
+       OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
        OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
        WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT };
 
@@ -125,7 +125,7 @@ static void derivative_init(void) {
 }
 
 static int boundary_kmer_index(const Site *site, int reverse, int kind, int offset) {
-  return OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
+  return OFF_SPLICE_START_STOP + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
 }
 
 static int derivative_index(int slot, int offset, int scale) {
@@ -871,7 +871,7 @@ void crf_save_weights_text(const char *path, const double *w) {
     for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
       int disp = boundary_kmer_offsets[offset];
       for (int k = 0; k < K2; k++) {
-        int idx = OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
+        int idx = OFF_SPLICE_START_STOP + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
         format_kmer(k, 2, kbuf);
         fprintf(file, "%d\tboundary_k2\t%s\toffset=%+d,k2=%s\t%.9g\n",
                 idx, kind_names[kind], disp, kbuf, (float)w[idx]);
