@@ -38,7 +38,6 @@ void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
 
 #include <math.h>
 #include <pthread.h>
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -666,11 +665,11 @@ typedef struct {
   CrfWindow *windows;
   size_t count;
   int threads;
-  atomic_size_t next_instance;
 } CrfTrain;
 
 typedef struct {
   CrfTrain *train;
+  int thread_id;
   const double *w;
   double likelihood;
   size_t positions, skipped;
@@ -685,8 +684,8 @@ static void *crf_worker(void *arg) {
   worker->positions = 0;
   worker->skipped = 0;
   memset(worker->gradient, 0, WEIGHTS * sizeof(*worker->gradient));
-  size_t slot = atomic_fetch_add_explicit(&train->next_instance, 1, memory_order_relaxed);
-  while (slot < train->count) {
+  for (size_t slot = (size_t)worker->thread_id; slot < train->count;
+       slot += (size_t)train->threads) {
     const CrfWindow *window = train->windows + slot;
     Contig instance = *window->contig;
     instance.offset = window->start;
@@ -700,7 +699,6 @@ static void *crf_worker(void *arg) {
       worker->likelihood += score;
       worker->positions += (size_t)instance.length;
     }
-    slot = atomic_fetch_add_explicit(&train->next_instance, 1, memory_order_relaxed);
   }
   return NULL;
 }
@@ -720,7 +718,6 @@ static double crf_objective(const double *w, double *gradient, void *context) {
   double likelihood = 0;
   size_t positions = 0, skipped = 0;
 
-  atomic_store_explicit(&train->next_instance, 0, memory_order_relaxed);
   memset(gradient, 0, WEIGHTS * sizeof(*gradient));
   for (int t = 0; t < train->threads; t++) {
     objective->workers[t].w = w;
@@ -827,7 +824,6 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   CrfObjective objective = {
     .train = {.windows = windows, .count = window_count, .threads = threads}
   };
-  atomic_init(&objective.train.next_instance, 0);
   fprintf(stderr, "Using %d worker threads for %zu training windows\n",
           objective.train.threads, objective.train.count);
   objective.workers = anno_alloc((size_t)objective.train.threads, sizeof(*objective.workers));
@@ -835,6 +831,7 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   for (int t = 0; t < objective.train.threads; t++)
     objective.workers[t] = (CrfWorker){
       .train = &objective.train,
+      .thread_id = t,
       .gradient = anno_alloc(WEIGHTS, sizeof(*objective.workers->gradient))
     };
 
