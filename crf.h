@@ -20,7 +20,7 @@ enum { DERIV_COUNT = CWT_COUNT(CRF_DERIV_ORDERS), DERIV_RADIUS = 2 };
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
 static const int boundary_kmer_offsets[] = {-8, -6, -4, -2, 0, 2, 4, 6};
-static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1};
+static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1, 2};
 enum {
   K2 = 17, K3 = 65, KNUC = 5,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
