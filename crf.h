@@ -16,7 +16,7 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K4 = 257, KNUC = 5, RADIUS = 12,
+enum { K2 = 17, K4 = 257, KNUC = 5, RADIUS = 8,
        FLANKS = RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
 enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
        OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
@@ -112,20 +112,21 @@ static int boundary_kind(int previous, int current) {
 
 static void boundary_cwt_at(const Contig *c, int position, int reverse, int offset,
                             float *power, double *derivative) {
-  int displacement = -RADIUS + 2 * offset;
-  int g = reverse ? position - displacement - 2 : position + displacement;
+  static const int offsets[FLANKS] = {-27, -26, -25, -24, -2, -1, 0, 1};
+  int displacement = offsets[offset];
+  int g = reverse ? position - displacement - 1 : position + displacement;
   if (g < 0 || g >= c->genome_length || base_index(c->seq[g]) < 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) power[scale] = 0, derivative[scale] = 0;
     return;
   }
   memcpy(power, c->cwt_power + (size_t)g * WAVE_COUNT, WAVE_COUNT * sizeof(*power));
-  if (g > 0 && g + 1 < c->genome_length &&
-      base_index(c->seq[g - 1]) >= 0 && base_index(c->seq[g + 1]) >= 0) {
+  if (g >= 2 && g + 2 < c->genome_length &&
+      base_index(c->seq[g - 2]) >= 0 && base_index(c->seq[g + 2]) >= 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      double left = c->cwt_power[(size_t)(g - 1) * WAVE_COUNT + scale];
-      double right = c->cwt_power[(size_t)(g + 1) * WAVE_COUNT + scale];
-      double slope = (right - left) / (right + left + 1e-12);
-      derivative[scale] = reverse ? -slope : slope;
+      double center = power[scale];
+      double left = c->cwt_power[(size_t)(g - 2) * WAVE_COUNT + scale];
+      double right = c->cwt_power[(size_t)(g + 2) * WAVE_COUNT + scale];
+      derivative[scale] = (2.0 * center - left - right) / (2.0 * center + left + right + 1e-12);
     }
   } else {
     for (int scale = 0; scale < WAVE_COUNT; scale++) derivative[scale] = 0;
