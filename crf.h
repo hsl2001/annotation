@@ -11,7 +11,7 @@
 #define CRF_WINDOW_SIZE 65536
 #endif
 #ifndef CRF_DERIV_ORDERS
-#define CRF_DERIV_ORDERS 1, 2, 3, 4
+#define CRF_DERIV_ORDERS 1, 2, 3
 #endif
 enum { DERIV_COUNT = CWT_COUNT(CRF_DERIV_ORDERS), DERIV_RADIUS = 2 };
 
@@ -100,7 +100,7 @@ static double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1];
 static void derivative_init(void) {
   for (int slot = 0; slot < DERIV_COUNT; slot++) {
     int order = derivative_orders[slot];
-    if (order < 1 || order > 4) anno_fail("CWT derivative order must be between 1 and 4");
+    if (order < 1 || order > 3) anno_fail("CWT derivative order must be between 1 and 3");
     for (int previous = 0; previous < slot; previous++)
       if (derivative_orders[previous] == order) anno_fail("Duplicate CWT derivative order: %d", order);
     double *kernel = derivative_kernels[slot];
