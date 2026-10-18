@@ -270,6 +270,7 @@ static void save_model(const char *path, const double *w) {
       fwrite(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
   free(values);
+  crf_save_weights_text("anno.weights.txt", w);
 }
 
 static void load_model(const char *path, double *w) {

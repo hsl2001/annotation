@@ -31,6 +31,7 @@ enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
 void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
+void crf_save_weights_text(const char *path, const double *weights);
 
 #endif
 
@@ -110,10 +111,11 @@ static int boundary_kind(int previous, int current) {
   return -1;
 }
 
+static const int boundary_cwt_offsets[FLANKS] = {-27, -26, -25, -24, -2, -1, 0, 1};
+
 static void boundary_cwt_at(const Contig *c, int position, int reverse, int offset,
                             float *power, double *derivative) {
-  static const int offsets[FLANKS] = {-27, -26, -25, -24, -2, -1, 0, 1};
-  int displacement = offsets[offset];
+  int displacement = boundary_cwt_offsets[offset];
   int g = reverse ? position - displacement - 1 : position + displacement;
   if (g < 0 || g >= c->genome_length || base_index(c->seq[g]) < 0) {
     for (int scale = 0; scale < WAVE_COUNT; scale++) power[scale] = 0, derivative[scale] = 0;
@@ -907,6 +909,151 @@ void crf_decode(const double *w, const Contig *c, uint8_t *path) {
     best = back[(size_t)position * HIDDEN_STATES + best];
   }
   free(back);
+}
+
+static void format_kmer(int code, int size, char *out) {
+  static const char bases[4] = {'A', 'C', 'G', 'T'};
+  if (code >= (1 << (2 * size))) {
+    out[0] = 'N';
+    out[1] = '\0';
+    return;
+  }
+  for (int i = size - 1; i >= 0; i--) {
+    out[i] = bases[code & 3];
+    code >>= 2;
+  }
+  out[size] = '\0';
+}
+
+void crf_save_weights_text(const char *path, const double *w) {
+  static const char *const state_names[STATES] = {
+    "intergenic",
+    "CDS(+):0", "CDS(+):1", "CDS(+):2",
+    "intron(+):0", "intron(+):1", "intron(+):2",
+    "CDS(-):0", "CDS(-):1", "CDS(-):2",
+    "intron(-):0", "intron(-):1", "intron(-):2"
+  };
+  static const char *const kind_names[4] = {
+    "5ss", "3ss", "start_codon", "stop_codon"
+  };
+  static const char *const nuc_names[KNUC] = {"A", "C", "G", "T", "N"};
+
+  FILE *file = fopen(path, "w");
+  if (!file) anno_fail("Cannot write weights text: %s", path);
+  fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
+
+  char kbuf[8];
+  for (int s = 0; s < STATES; s++) {
+    for (int n = 0; n < KNUC; n++) {
+      int idx = OFF_ENUC + s * KNUC + n;
+      fprintf(file, "%d\temit_nuc\t%s\tnuc=%s\t%.9g\n",
+              idx, state_names[s], nuc_names[n], (float)w[idx]);
+    }
+  }
+  for (int s = 0; s < STATES; s++) {
+    for (int k = 0; k < K4; k++) {
+      int idx = OFF_E4 + s * K4 + k;
+      format_kmer(k, 4, kbuf);
+      fprintf(file, "%d\temit_k4\t%s\tk4=%s\t%.9g\n",
+              idx, state_names[s], kbuf, (float)w[idx]);
+    }
+  }
+  for (int s = 0; s < STATES; s++) {
+    for (int sc = 0; sc < WAVE_COUNT; sc++) {
+      int idx = OFF_EP + s * WAVE_COUNT + sc;
+      fprintf(file, "%d\temit_cwt_power\t%s\tscale=%d\t%.9g\n",
+              idx, state_names[s], wave_sizes[sc], (float)w[idx]);
+    }
+  }
+  for (int s = 0; s < STATES; s++) {
+    for (int sc = 0; sc < WAVE_COUNT; sc++) {
+      int idx = OFF_ED + s * WAVE_COUNT + sc;
+      fprintf(file, "%d\temit_cwt_deriv\t%s\tscale=%d\t%.9g\n",
+              idx, state_names[s], wave_sizes[sc], (float)w[idx]);
+    }
+  }
+
+  for (int a = 0; a < STATES; a++) {
+    for (int b = 0; b < STATES; b++) {
+      if (!allowed(a, b)) continue;
+      int pair = a * STATES + b;
+      for (int n = 0; n < KNUC; n++) {
+        int idx = OFF_TNUC + pair * KNUC + n;
+        fprintf(file, "%d\ttrans_nuc\t%s->%s\tnuc=%s\t%.9g\n",
+                idx, state_names[a], state_names[b], nuc_names[n], (float)w[idx]);
+      }
+    }
+  }
+  for (int a = 0; a < STATES; a++) {
+    for (int b = 0; b < STATES; b++) {
+      if (!allowed(a, b)) continue;
+      int pair = a * STATES + b;
+      for (int k = 0; k < K4; k++) {
+        int idx = OFF_T4 + pair * K4 + k;
+        format_kmer(k, 4, kbuf);
+        fprintf(file, "%d\ttrans_k4\t%s->%s\tk4=%s\t%.9g\n",
+                idx, state_names[a], state_names[b], kbuf, (float)w[idx]);
+      }
+    }
+  }
+  for (int a = 0; a < STATES; a++) {
+    for (int b = 0; b < STATES; b++) {
+      if (!allowed(a, b)) continue;
+      int pair = a * STATES + b;
+      for (int sc = 0; sc < WAVE_COUNT; sc++) {
+        int idx = OFF_TP + pair * WAVE_COUNT + sc;
+        fprintf(file, "%d\ttrans_cwt_power\t%s->%s\tscale=%d\t%.9g\n",
+                idx, state_names[a], state_names[b], wave_sizes[sc], (float)w[idx]);
+      }
+    }
+  }
+  for (int a = 0; a < STATES; a++) {
+    for (int b = 0; b < STATES; b++) {
+      if (!allowed(a, b)) continue;
+      int pair = a * STATES + b;
+      for (int sc = 0; sc < WAVE_COUNT; sc++) {
+        int idx = OFF_TD + pair * WAVE_COUNT + sc;
+        fprintf(file, "%d\ttrans_cwt_deriv\t%s->%s\tscale=%d\t%.9g\n",
+                idx, state_names[a], state_names[b], wave_sizes[sc], (float)w[idx]);
+      }
+    }
+  }
+
+  for (int kind = 0; kind < 4; kind++) {
+    for (int offset = 0; offset < FLANKS; offset++) {
+      int disp = -RADIUS + 2 * offset;
+      for (int k = 0; k < K2; k++) {
+        int idx = OFF_SPLICE + (kind * FLANKS + offset) * K2 + k;
+        format_kmer(k, 2, kbuf);
+        fprintf(file, "%d\tboundary_k2\t%s\toffset=%+d,k2=%s\t%.9g\n",
+                idx, kind_names[kind], disp, kbuf, (float)w[idx]);
+      }
+    }
+  }
+  for (int kind = 0; kind < 4; kind++) {
+    for (int offset = 0; offset < FLANKS; offset++) {
+      int disp = boundary_cwt_offsets[offset];
+      int base = (kind * FLANKS + offset) * WAVE_COUNT;
+      for (int sc = 0; sc < WAVE_COUNT; sc++) {
+        int idx = OFF_BP + base + sc;
+        fprintf(file, "%d\tboundary_cwt_power\t%s\toffset=%+d,scale=%d\t%.9g\n",
+                idx, kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
+      }
+    }
+  }
+  for (int kind = 0; kind < 4; kind++) {
+    for (int offset = 0; offset < FLANKS; offset++) {
+      int disp = boundary_cwt_offsets[offset];
+      int base = (kind * FLANKS + offset) * WAVE_COUNT;
+      for (int sc = 0; sc < WAVE_COUNT; sc++) {
+        int idx = OFF_BD + base + sc;
+        fprintf(file, "%d\tboundary_cwt_deriv\t%s\toffset=%+d,scale=%d\t%.9g\n",
+                idx, kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
+      }
+    }
+  }
+
+  if (fclose(file)) anno_fail("Cannot finish writing weights text: %s", path);
 }
 
 #endif
