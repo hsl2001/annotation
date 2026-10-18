@@ -26,9 +26,9 @@ _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
                "CWT export requires binary32 floats");
 
 static double complex cwt_base_signal(char base) {
-  const double complex mapping[4] = {1.0 + I, -1.0 - I, -1.0 + I, 1.0 - I};
+  const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I};
   int index = base_index(base);
-  return index < 0 ? 0.0 : mapping[index] / sqrt(4.0);
+  return index < 0 ? 0.0 : mapping[index] / sqrt(2.0);
 }
 
 static double complex cwt_morlet_integral(double lower, double upper) {
