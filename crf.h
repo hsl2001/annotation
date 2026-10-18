@@ -19,17 +19,18 @@ enum { DERIV_COUNT = CWT_COUNT(CRF_DERIV_ORDERS), DERIV_RADIUS = 2 };
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-static const int boundary_k2_offsets[] = {-8, -6, -4, -2, 0, 2, 4, 6};
+static const int boundary_kmer_offsets[] = {-8, -6, -4, -2, 0, 2, 4, 6};
 static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1};
 enum {
   K2 = 17, K3 = 65, KNUC = 5,
-  BOUNDARY_K2_COUNT = sizeof(boundary_k2_offsets) / sizeof(boundary_k2_offsets[0]),
+  BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0])
 };
 enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
-       OFF_BP = OFF_SPLICE + 4 * BOUNDARY_K2_COUNT * K2,
-       OFF_BD = OFF_BP + 4 * BOUNDARY_CWT_COUNT * WAVE_COUNT,
-       WEIGHTS = OFF_BD + DERIV_COUNT * 4 * BOUNDARY_CWT_COUNT * WAVE_COUNT };
+       OFF_CODON = OFF_SPLICE + 2 * BOUNDARY_KMER_COUNT * K2,
+       OFF_BP = OFF_CODON + 2 * BOUNDARY_KMER_COUNT * K3,
+       OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
+       WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT };
 
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
@@ -48,7 +49,8 @@ void crf_save_weights_text(const char *path, const double *weights);
 
 typedef struct {
   uint8_t k3_emit[2];
-  uint8_t nuc, boundary_k2[2][BOUNDARY_K2_COUNT];
+  uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
+  uint8_t boundary_k3[2][BOUNDARY_KMER_COUNT];
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 28, 33, 41, 46};
@@ -81,10 +83,12 @@ static Site site_at(const Contig *c, int i) {
                 kmer(c->seq, c->genome_length, position - 1, 3, 1)},
     .nuc = base < 0 ? 4 : base
   };
-  for (int offset = 0; offset < BOUNDARY_K2_COUNT; offset++) {
-    int displacement = boundary_k2_offsets[offset];
+  for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
+    int displacement = boundary_kmer_offsets[offset];
     s.boundary_k2[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
     s.boundary_k2[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 2, 2, 1);
+    s.boundary_k3[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 3, 0);
+    s.boundary_k3[1][offset] = kmer(c->seq, c->genome_length, position - displacement - 3, 3, 1);
   }
   return s;
 }
@@ -124,8 +128,14 @@ static void derivative_init(void) {
   }
 }
 
-static int derivative_index(int slot, int kind, int offset, int scale) {
-  return OFF_BD + ((slot * 4 + kind) * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT + scale;
+static int boundary_kmer_index(const Site *site, int reverse, int kind, int offset) {
+  if (kind < 2)
+    return OFF_SPLICE + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
+  return OFF_CODON + ((kind - 2) * BOUNDARY_KMER_COUNT + offset) * K3 + site->boundary_k3[reverse][offset];
+}
+
+static int derivative_index(int slot, int offset, int scale) {
+  return OFF_BD + (slot * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT + scale;
 }
 
 static void boundary_cwt_at(const Contig *c, int position, int reverse, int offset,
@@ -291,18 +301,17 @@ static Site site_scores(const double *w, const Contig *c, int position,
     double derivative[BOUNDARY_CWT_COUNT][DERIV_COUNT][WAVE_COUNT];
     for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
       boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
-    const uint8_t *k2 = site.boundary_k2[rev];
     for (int kind = 0; kind < 4; kind++) {
       double sp = 0, cw = 0;
-      for (int offset = 0; offset < BOUNDARY_K2_COUNT; offset++)
-        sp += w[OFF_SPLICE + (kind * BOUNDARY_K2_COUNT + offset) * K2 + k2[offset]];
-      for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-        int base = (kind * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
+      for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
+        sp += w[boundary_kmer_index(&site, rev, kind, offset)];
+      for (int offset = 0; kind == 1 && offset < BOUNDARY_CWT_COUNT; offset++) {
+        int base = offset * WAVE_COUNT;
         const double *wbp = w + OFF_BP + base;
         for (int scale = 0; scale < WAVE_COUNT; scale++) {
           cw += wbp[scale] * power[offset][scale];
           for (int slot = 0; slot < DERIV_COUNT; slot++)
-            cw += w[derivative_index(slot, kind, offset, scale)] * derivative[offset][slot][scale];
+            cw += w[derivative_index(slot, offset, scale)] * derivative[offset][slot][scale];
         }
       }
       b_splice[rev][kind] = sp;
@@ -518,21 +527,20 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
               b_coeff[2][rev] == 0 && b_coeff[3][rev] == 0) continue;
           float power[BOUNDARY_CWT_COUNT][WAVE_COUNT];
           double derivative[BOUNDARY_CWT_COUNT][DERIV_COUNT][WAVE_COUNT];
-          for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
+          for (int offset = 0; b_coeff[1][rev] != 0 && offset < BOUNDARY_CWT_COUNT; offset++)
             boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
           for (int kind = 0; kind < 4; kind++) {
             double val = b_coeff[kind][rev];
             if (val == 0) continue;
-            const uint8_t *k2 = site->boundary_k2[rev];
-            for (int offset = 0; offset < BOUNDARY_K2_COUNT; offset++)
-              gradient[OFF_SPLICE + (kind * BOUNDARY_K2_COUNT + offset) * K2 + k2[offset]] += val;
-            for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-              int base = (kind * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
+            for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
+              gradient[boundary_kmer_index(site, rev, kind, offset)] += val;
+            for (int offset = 0; kind == 1 && offset < BOUNDARY_CWT_COUNT; offset++) {
+              int base = offset * WAVE_COUNT;
               double *gbp = gradient + OFF_BP + base;
               for (int scale = 0; scale < WAVE_COUNT; scale++) {
                 gbp[scale] += val * power[offset][scale];
                 for (int slot = 0; slot < DERIV_COUNT; slot++)
-                  gradient[derivative_index(slot, kind, offset, scale)] +=
+                  gradient[derivative_index(slot, offset, scale)] +=
                     val * derivative[offset][slot][scale];
               }
             }
@@ -711,18 +719,18 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
       int previous = contigs[c].label[contigs[c].offset + i - 1];
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
       if (kind >= 0) {
-        for (int offset = 0; offset < BOUNDARY_K2_COUNT; offset++)
-          scale[OFF_SPLICE + (kind * BOUNDARY_K2_COUNT + offset) * K2 + site.boundary_k2[reverse][offset]] += 1;
+        for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
+          scale[boundary_kmer_index(&site, reverse, kind, offset)] += 1;
         int genome_position = contigs[c].offset + i;
-        for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
+        for (int offset = 0; kind == 1 && offset < BOUNDARY_CWT_COUNT; offset++) {
           float power[WAVE_COUNT];
           double derivative[DERIV_COUNT][WAVE_COUNT];
           boundary_cwt_at(contigs + c, genome_position, reverse, offset, power, derivative);
-          int base = (kind * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
+          int base = offset * WAVE_COUNT;
           for (int k = 0; k < WAVE_COUNT; k++) {
             scale[OFF_BP + base + k] += (double)power[k] * power[k];
             for (int slot = 0; slot < DERIV_COUNT; slot++)
-              scale[derivative_index(slot, kind, offset, k)] +=
+              scale[derivative_index(slot, offset, k)] +=
                 derivative[slot][k] * derivative[slot][k];
           }
         }
@@ -866,36 +874,35 @@ void crf_save_weights_text(const char *path, const double *w) {
   }
 
   for (int kind = 0; kind < 4; kind++) {
-    for (int offset = 0; offset < BOUNDARY_K2_COUNT; offset++) {
-      int disp = boundary_k2_offsets[offset];
-      for (int k = 0; k < K2; k++) {
-        int idx = OFF_SPLICE + (kind * BOUNDARY_K2_COUNT + offset) * K2 + k;
-        format_kmer(k, 2, kbuf);
-        fprintf(file, "%d\tboundary_k2\t%s\toffset=%+d,k2=%s\t%.9g\n",
-                idx, kind_names[kind], disp, kbuf, (float)w[idx]);
+    int size = kind < 2 ? 2 : 3;
+    int codes = kind < 2 ? K2 : K3;
+    int base = kind < 2 ? OFF_SPLICE : OFF_CODON;
+    for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
+      int disp = boundary_kmer_offsets[offset];
+      for (int k = 0; k < codes; k++) {
+        int idx = base + ((kind % 2) * BOUNDARY_KMER_COUNT + offset) * codes + k;
+        format_kmer(k, size, kbuf);
+        fprintf(file, "%d\tboundary_k%d\t%s\toffset=%+d,k%d=%s\t%.9g\n",
+                idx, size, kind_names[kind], disp, size, kbuf, (float)w[idx]);
       }
     }
   }
-  for (int kind = 0; kind < 4; kind++) {
-    for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-      int disp = boundary_cwt_offsets[offset];
-      int base = (kind * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
-      for (int sc = 0; sc < WAVE_COUNT; sc++) {
-        int idx = OFF_BP + base + sc;
-        fprintf(file, "%d\tboundary_cwt_power\t%s\toffset=%+d,scale=%d\t%.9g\n",
-                idx, kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
-      }
+  for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
+    int disp = boundary_cwt_offsets[offset];
+    int base = offset * WAVE_COUNT;
+    for (int sc = 0; sc < WAVE_COUNT; sc++) {
+      int idx = OFF_BP + base + sc;
+      fprintf(file, "%d\tboundary_cwt_power\t%s\toffset=%+d,scale=%d\t%.9g\n",
+              idx, kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
     }
   }
   for (int slot = 0; slot < DERIV_COUNT; slot++) {
-    for (int kind = 0; kind < 4; kind++) {
-      for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-        int disp = boundary_cwt_offsets[offset];
-        for (int sc = 0; sc < WAVE_COUNT; sc++) {
-          int idx = derivative_index(slot, kind, offset, sc);
-          fprintf(file, "%d\tboundary_cwt_deriv%d\t%s\toffset=%+d,scale=%d\t%.9g\n",
-                  idx, derivative_orders[slot], kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
-        }
+    for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
+      int disp = boundary_cwt_offsets[offset];
+      for (int sc = 0; sc < WAVE_COUNT; sc++) {
+        int idx = derivative_index(slot, offset, sc);
+        fprintf(file, "%d\tboundary_cwt_deriv%d\t%s\toffset=%+d,scale=%d\t%.9g\n",
+                idx, derivative_orders[slot], kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
       }
     }
   }
