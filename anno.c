@@ -266,8 +266,7 @@ static void save_model(const char *path, const double *w) {
   float *values = anno_alloc(WEIGHTS, sizeof(*values));
   for (int i = 0; i < WEIGHTS; i++) values[i] = (float)w[i];
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite("ANNOCRFE", 1, 8, file) != 8 ||
-      fwrite(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fclose(file))
+  if (!file || fwrite(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
   free(values);
   crf_save_weights_text("anno.weights.txt", w);
@@ -276,10 +275,7 @@ static void save_model(const char *path, const double *w) {
 static void load_model(const char *path, double *w) {
   float *values = anno_alloc(WEIGHTS, sizeof(*values));
   FILE *file = fopen(path, "rb");
-  char magic[8];
-  if (!file || fread(magic, 1, 8, file) != 8) anno_fail("Cannot read model: %s", path);
-  if (memcmp(magic, "ANNOCRFE", 8)) anno_fail("Incompatible model; retrain with this executable: %s", path);
-  if (fread(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
+  if (!file || fread(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
     anno_fail("Cannot read model: %s", path);
   fclose(file);
   for (int i = 0; i < WEIGHTS; i++) {

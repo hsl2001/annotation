@@ -16,13 +16,13 @@
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
 enum { STATES = 13, HIDDEN_STATES = 47 };
-enum { K2 = 17, K4 = 257, KNUC = 5, RADIUS = 8,
+enum { K2 = 17, K6 = 4097, KNUC = 5, RADIUS = 8,
        FLANKS = RADIUS, EMISSION_FEATURES = 2, TRANSITION_FEATURES = 2 + FLANKS };
-enum { OFF_ENUC = 0, OFF_E4 = OFF_ENUC + STATES * KNUC,
-       OFF_EP = OFF_E4 + STATES * K4, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
+enum { OFF_ENUC = 0, OFF_E6 = OFF_ENUC + STATES * KNUC,
+       OFF_EP = OFF_E6 + STATES * K6, OFF_ED = OFF_EP + STATES * WAVE_COUNT,
        OFF_TNUC = OFF_ED + STATES * WAVE_COUNT,
-       OFF_T4 = OFF_TNUC + STATES * STATES * KNUC,
-       OFF_TP = OFF_T4 + STATES * STATES * K4, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
+       OFF_T6 = OFF_TNUC + STATES * STATES * KNUC,
+       OFF_TP = OFF_T6 + STATES * STATES * K6, OFF_TD = OFF_TP + STATES * STATES * WAVE_COUNT,
        OFF_SPLICE = OFF_TD + STATES * STATES * WAVE_COUNT,
        OFF_BP = OFF_SPLICE + 4 * FLANKS * K2,
        OFF_BD = OFF_BP + 4 * FLANKS * WAVE_COUNT,
@@ -44,7 +44,7 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <string.h>
 
 typedef struct {
-  uint16_t k4_emit[2], k4_trans[2];
+  uint16_t k6_emit[2], k6_trans[2];
   float cwt_power[WAVE_COUNT];
   int16_t derivative[WAVE_COUNT];
   uint8_t nuc, flank[2][FLANKS];
@@ -76,10 +76,10 @@ static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
   Site s = {
-    .k4_emit = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
-                kmer(c->seq, c->genome_length, position - 1, 4, 1)},
-    .k4_trans = {kmer(c->seq, c->genome_length, position - 2, 4, 0),
-                 kmer(c->seq, c->genome_length, position - 2, 4, 1)},
+    .k6_emit = {kmer(c->seq, c->genome_length, position - 3, 6, 0),
+                kmer(c->seq, c->genome_length, position - 2, 6, 1)},
+    .k6_trans = {kmer(c->seq, c->genome_length, position - 3, 6, 0),
+                 kmer(c->seq, c->genome_length, position - 3, 6, 1)},
     .nuc = base < 0 ? 4 : base
   };
   for (int offset = 0; offset < FLANKS; offset++) {
@@ -231,14 +231,14 @@ void crf_init(void) {
 
 static void emission_indices(const Site *site, int state, int *indices) {
   indices[0] = OFF_ENUC + state * KNUC + site->nuc;
-  indices[1] = OFF_E4 + state * K4 + site->k4_emit[state >= 7];
+  indices[1] = OFF_E6 + state * K6 + site->k6_emit[state >= 7];
 }
 
 static int transition_indices(const Site *site, int previous, int current, int *indices) {
   int pair = previous * STATES + current, count = 2;
   int reverse = previous >= 7 || current >= 7, kind = boundary_kind(previous, current);
   indices[0] = OFF_TNUC + pair * KNUC + site->nuc;
-  indices[1] = OFF_T4 + pair * K4 + site->k4_trans[reverse];
+  indices[1] = OFF_T6 + pair * K6 + site->k6_trans[reverse];
   if (kind >= 0)
     for (int offset = 0; offset < FLANKS; offset++)
       indices[count++] = OFF_SPLICE + (kind * FLANKS + offset) * K2 + site->flank[reverse][offset];
@@ -334,7 +334,7 @@ static Site site_scores(const double *w, const Contig *c, int position,
   for (int state = 0; state < STATES; state++) {
     int reverse = state >= 7;
     double score = w[OFF_ENUC + state * KNUC + site.nuc] +
-                   w[OFF_E4 + state * K4 + site.k4_emit[reverse]];
+                   w[OFF_E6 + state * K6 + site.k6_emit[reverse]];
     const double *wp = w + OFF_EP + state * WAVE_COUNT;
     const double *wd = w + OFF_ED + state * WAVE_COUNT;
     for (int scale = 0; scale < WAVE_COUNT; scale++) {
@@ -375,7 +375,7 @@ static Site site_scores(const double *w, const Contig *c, int position,
   for (int edge = 0; edge < ntrans; edge++) {
     int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
     double score = w[OFF_TNUC + pair * KNUC + site.nuc] +
-                   w[OFF_T4 + pair * K4 + site.k4_trans[reverse]];
+                   w[OFF_T6 + pair * K6 + site.k6_trans[reverse]];
     if (kind >= 0) score += b_splice[reverse][kind];
     const double *wp = w + OFF_TP + pair * WAVE_COUNT;
     const double *wd = w + OFF_TD + pair * WAVE_COUNT;
@@ -533,7 +533,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       double val = -state_marginals[st];
       int reverse = st >= 7;
       gradient[OFF_ENUC + st * KNUC + site->nuc] += val;
-      gradient[OFF_E4 + st * K4 + site->k4_emit[reverse]] += val;
+      gradient[OFF_E6 + st * K6 + site->k6_emit[reverse]] += val;
       double *gp = gradient + OFF_EP + st * WAVE_COUNT;
       double *gd = gradient + OFF_ED + st * WAVE_COUNT;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
@@ -576,7 +576,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
           double val = -m;
           int pair = edge_pair[edge], reverse = edge_rev[edge], kind = edge_kind[edge];
           gradient[OFF_TNUC + pair * KNUC + site->nuc] += val;
-          gradient[OFF_T4 + pair * K4 + site->k4_trans[reverse]] += val;
+          gradient[OFF_T6 + pair * K6 + site->k6_trans[reverse]] += val;
           if (kind >= 0) {
             b_coeff[kind][reverse] += val;
             has_boundary = 1;
@@ -951,10 +951,10 @@ void crf_save_weights_text(const char *path, const double *w) {
     }
   }
   for (int s = 0; s < STATES; s++) {
-    for (int k = 0; k < K4; k++) {
-      int idx = OFF_E4 + s * K4 + k;
-      format_kmer(k, 4, kbuf);
-      fprintf(file, "%d\temit_k4\t%s\tk4=%s\t%.9g\n",
+    for (int k = 0; k < K6; k++) {
+      int idx = OFF_E6 + s * K6 + k;
+      format_kmer(k, 6, kbuf);
+      fprintf(file, "%d\temit_k6\t%s\tk6=%s\t%.9g\n",
               idx, state_names[s], kbuf, (float)w[idx]);
     }
   }
@@ -988,10 +988,10 @@ void crf_save_weights_text(const char *path, const double *w) {
     for (int b = 0; b < STATES; b++) {
       if (!allowed(a, b)) continue;
       int pair = a * STATES + b;
-      for (int k = 0; k < K4; k++) {
-        int idx = OFF_T4 + pair * K4 + k;
-        format_kmer(k, 4, kbuf);
-        fprintf(file, "%d\ttrans_k4\t%s->%s\tk4=%s\t%.9g\n",
+      for (int k = 0; k < K6; k++) {
+        int idx = OFF_T6 + pair * K6 + k;
+        format_kmer(k, 6, kbuf);
+        fprintf(file, "%d\ttrans_k6\t%s->%s\tk6=%s\t%.9g\n",
                 idx, state_names[a], state_names[b], kbuf, (float)w[idx]);
       }
     }
