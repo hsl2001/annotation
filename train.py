@@ -201,14 +201,26 @@ def select_windows_for_genome(
     target_count: int,
     rng: random.Random,
 ) -> list[SampledWindow]:
-    """Select up to target_count windows per genome, prioritizing coding windows."""
+    """Select up to target_count windows per genome using stratified (coding/noncoding) sampling."""
+    if len(all_windows) <= target_count:
+        selected = list(all_windows)
+        selected.sort(key=lambda w: (w.seqid, w.start))
+        return selected
+
     coding = [w for w in all_windows if w.gene_count > 0]
     noncoding = [w for w in all_windows if w.gene_count == 0]
-    if len(coding) >= target_count:
+    if not coding:
+        selected = rng.sample(noncoding, target_count)
+    elif not noncoding:
         selected = rng.sample(coding, target_count)
     else:
-        need = min(target_count - len(coding), len(noncoding))
-        selected = coding + (rng.sample(noncoding, need) if need > 0 else [])
+        target_coding = round(target_count * len(coding) / len(all_windows))
+        target_coding = max(1, min(len(coding), target_coding))
+        target_noncoding = target_count - target_coding
+        if target_noncoding > len(noncoding):
+            target_noncoding = len(noncoding)
+            target_coding = target_count - target_noncoding
+        selected = rng.sample(coding, target_coding) + rng.sample(noncoding, target_noncoding)
     selected.sort(key=lambda w: (w.seqid, w.start))
     return selected
 
@@ -216,6 +228,52 @@ def select_windows_for_genome(
 def window_contig_id(window: SampledWindow, index: int) -> str:
     safe_seqid = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in window.seqid)
     return f"g{window.genome_index}_w{index:05d}_{safe_seqid}_{window.start + 1}_{window.end}"
+
+
+def gff_id_and_parents(attr_text: str) -> tuple[str | None, list[str]]:
+    feat_id: str | None = None
+    parents: list[str] = []
+    for item in attr_text.split(";"):
+        if item.startswith("ID="):
+            feat_id = item[3:]
+        elif item.startswith("Parent="):
+            parents = [p for p in item[7:].split(",") if p]
+    return feat_id, parents
+
+
+def parse_contig_gff_features(
+    contig_lines: list[str],
+) -> tuple[
+    list[tuple[list[str], int, int, str | None, list[str]]],
+    dict[str, tuple[int, int]],
+    dict[str, list[str]],
+]:
+    parsed_rows: list[tuple[list[str], int, int, str | None, list[str]]] = []
+    cds_bounds_by_tx: dict[str, list[int]] = {}
+    id_to_parents: dict[str, list[str]] = {}
+
+    for line in contig_lines:
+        fields = line.split("\t")
+        if fields[2] == "region":
+            continue
+        f_start, f_end = int(fields[3]), int(fields[4])
+        feat_id, parents = gff_id_and_parents(fields[8])
+        if feat_id and parents:
+            id_to_parents[feat_id] = parents
+        parsed_rows.append((fields, f_start, f_end, feat_id, parents))
+        if fields[2] == "CDS":
+            for parent in parents:
+                bounds = cds_bounds_by_tx.get(parent)
+                if bounds is None:
+                    cds_bounds_by_tx[parent] = [f_start, f_end]
+                else:
+                    if f_start < bounds[0]:
+                        bounds[0] = f_start
+                    if f_end > bounds[1]:
+                        bounds[1] = f_end
+
+    tx_bounds = {tx: (b[0], b[1]) for tx, b in cds_bounds_by_tx.items()}
+    return parsed_rows, tx_bounds, id_to_parents
 
 
 def write_window_dataset(
@@ -226,6 +284,15 @@ def write_window_dataset(
     gff_path: Path,
 ) -> None:
     """Write padded FASTA (with crop=offset:length) and shifted GFF3 for sampled windows."""
+    parsed_cache: dict[
+        tuple[int, str],
+        tuple[
+            list[tuple[list[str], int, int, str | None, list[str]]],
+            dict[str, tuple[int, int]],
+            dict[str, list[str]],
+        ],
+    ] = {}
+
     with fasta_path.open("w", encoding="utf-8") as fasta_out, gff_path.open("w", encoding="utf-8") as gff_out:
         gff_out.write("##gff-version 3\n")
         for idx, win in enumerate(windows):
@@ -241,20 +308,58 @@ def write_window_dataset(
             for pos in range(0, len(subseq), 80):
                 fasta_out.write(subseq[pos:pos + 80] + "\n")
 
+            cache_key = (win.genome_index, win.seqid)
+            if cache_key not in parsed_cache:
+                parsed_cache[cache_key] = parse_contig_gff_features(
+                    genome_gff_lines[win.genome_index].get(win.seqid, [])
+                )
+            parsed_rows, tx_bounds, id_to_parents = parsed_cache[cache_key]
+
             active_start_1 = win.start + 1
             active_end_1 = win.end
-            for line in genome_gff_lines[win.genome_index].get(win.seqid, []):
-                fields = line.split("\t")
-                if fields[2] == "region":
+            valid_tx = {
+                tx
+                for tx, (t_start, t_end) in tx_bounds.items()
+                if t_start >= active_start_1 and t_end <= active_end_1
+            }
+            if not valid_tx:
+                continue
+
+            ancestor_bounds: dict[str, list[int]] = {
+                tx: list(tx_bounds[tx]) for tx in valid_tx
+            }
+            frontier = list(valid_tx)
+            while frontier:
+                child_id = frontier.pop()
+                c_start, c_end = ancestor_bounds[child_id]
+                for parent_id in id_to_parents.get(child_id, ()):
+                    bounds = ancestor_bounds.get(parent_id)
+                    if bounds is None:
+                        ancestor_bounds[parent_id] = [c_start, c_end]
+                        frontier.append(parent_id)
+                    else:
+                        if c_start < bounds[0]:
+                            bounds[0] = c_start
+                        if c_end > bounds[1]:
+                            bounds[1] = c_end
+
+            for fields, f_start, f_end, feat_id, parents in parsed_rows:
+                if feat_id and feat_id in ancestor_bounds:
+                    c_start, c_end = ancestor_bounds[feat_id]
+                    f_start = max(f_start, min(active_start_1, c_start))
+                    f_end = min(f_end, max(active_end_1, c_end))
+                elif any(p in valid_tx for p in parents):
+                    if f_start < active_start_1 or f_end > active_end_1:
+                        continue
+                else:
                     continue
-                f_start, f_end = int(fields[3]), int(fields[4])
-                if f_start < active_start_1 or f_end > active_end_1:
-                    continue
-                fields[0] = contig_id
-                fields[3] = str(f_start - win.ext_start)
-                fields[4] = str(f_end - win.ext_start)
-                fields[8] = rewrite_attributes(fields[8], f"{contig_id}__")
-                gff_out.write("\t".join(fields) + "\n")
+
+                row = list(fields)
+                row[0] = contig_id
+                row[3] = str(f_start - win.ext_start)
+                row[4] = str(f_end - win.ext_start)
+                row[8] = rewrite_attributes(row[8], f"{contig_id}__")
+                gff_out.write("\t".join(row) + "\n")
 
 
 def evaluate_predictions(
