@@ -1,6 +1,5 @@
 #ifndef CRF_H
 #define CRF_H
-
 #include "anno.h"
 #include "lbfgs.h"
 #include <stdint.h>
@@ -11,6 +10,10 @@
 #ifndef CRF_WINDOW_SIZE
 #define CRF_WINDOW_SIZE 65536
 #endif
+#ifndef CRF_DERIV_ORDERS
+#define CRF_DERIV_ORDERS 1, 2, 3, 4
+#endif
+enum { DERIV_COUNT = CWT_COUNT(CRF_DERIV_ORDERS), DERIV_RADIUS = 2 };
 
 /* Linear-chain CRF decoded jointly for both strands.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
@@ -20,7 +23,7 @@ enum { K2 = 17, K3 = 65, KNUC = 5, RADIUS = 8, FLANKS = RADIUS };
 enum { OFF_E3 = 0, OFF_SPLICE = OFF_E3 + STATES * K3,
        OFF_BP = OFF_SPLICE + 4 * FLANKS * K2,
        OFF_BD = OFF_BP + 4 * FLANKS * WAVE_COUNT,
-       WEIGHTS = OFF_BD + 4 * FLANKS * WAVE_COUNT };
+       WEIGHTS = OFF_BD + DERIV_COUNT * 4 * FLANKS * WAVE_COUNT };
 
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
@@ -91,26 +94,67 @@ static int boundary_kind(int previous, int current) {
 }
 
 static const int boundary_cwt_offsets[FLANKS] = {-27, -26, -25, -24, -2, -1, 0, 1};
+static const int derivative_orders[DERIV_COUNT] = {CRF_DERIV_ORDERS};
+static double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1];
+
+static void derivative_init(void) {
+  for (int slot = 0; slot < DERIV_COUNT; slot++) {
+    int order = derivative_orders[slot];
+    if (order < 1 || order > 4) anno_fail("CWT derivative order must be between 1 and 4");
+    for (int previous = 0; previous < slot; previous++)
+      if (derivative_orders[previous] == order) anno_fail("Duplicate CWT derivative order: %d", order);
+    double *kernel = derivative_kernels[slot];
+    memset(kernel, 0, sizeof(derivative_kernels[slot]));
+    if (order % 2) kernel[DERIV_RADIUS - 1] = -.5, kernel[DERIV_RADIUS + 1] = .5;
+    else kernel[DERIV_RADIUS] = 1;
+    for (int degree = 0; degree < order / 2; degree++) {
+      double next[2 * DERIV_RADIUS + 1] = {0};
+      for (int j = 0; j <= 2 * DERIV_RADIUS; j++) {
+        if (j) next[j - 1] += kernel[j];
+        next[j] -= 2 * kernel[j];
+        if (j < 2 * DERIV_RADIUS) next[j + 1] += kernel[j];
+      }
+      memcpy(kernel, next, sizeof(next));
+    }
+  }
+}
+
+static int derivative_index(int slot, int kind, int offset, int scale) {
+  return OFF_BD + ((slot * 4 + kind) * FLANKS + offset) * WAVE_COUNT + scale;
+}
 
 static void boundary_cwt_at(const Contig *c, int position, int reverse, int offset,
-                            float *power, double *derivative) {
+                            float *power, double derivative[DERIV_COUNT][WAVE_COUNT]) {
   int displacement = boundary_cwt_offsets[offset];
   int g = reverse ? position - displacement - 1 : position + displacement;
   if (g < 0 || g >= c->genome_length || base_index(c->seq[g]) < 0) {
-    for (int scale = 0; scale < WAVE_COUNT; scale++) power[scale] = 0, derivative[scale] = 0;
+    memset(power, 0, WAVE_COUNT * sizeof(*power));
+    memset(derivative, 0, DERIV_COUNT * WAVE_COUNT * sizeof(double));
     return;
   }
   memcpy(power, c->cwt_power + (size_t)g * WAVE_COUNT, WAVE_COUNT * sizeof(*power));
-  if (g >= 2 && g + 2 < c->genome_length &&
-      base_index(c->seq[g - 2]) >= 0 && base_index(c->seq[g + 2]) >= 0) {
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
-      double center = power[scale];
-      double left = c->cwt_power[(size_t)(g - 2) * WAVE_COUNT + scale];
-      double right = c->cwt_power[(size_t)(g + 2) * WAVE_COUNT + scale];
-      derivative[scale] = (2.0 * center - left - right) / (2.0 * center + left + right + 1e-12);
+  for (int slot = 0; slot < DERIV_COUNT; slot++) {
+    int order = derivative_orders[slot];
+    const double *kernel = derivative_kernels[slot];
+    int valid = 1;
+    for (int j = -DERIV_RADIUS; j <= DERIV_RADIUS; j++) {
+      if (!kernel[j + DERIV_RADIUS]) continue;
+      if (j < -g || j >= c->genome_length - g ||
+          base_index(c->seq[g + j]) < 0) {
+        valid = 0;
+        break;
+      }
     }
-  } else {
-    for (int scale = 0; scale < WAVE_COUNT; scale++) derivative[scale] = 0;
+    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+      double value = 0;
+      if (valid)
+        for (int j = -DERIV_RADIUS; j <= DERIV_RADIUS; j++) {
+          double coefficient = kernel[j + DERIV_RADIUS];
+          if (!coefficient) continue;
+          value += coefficient * c->cwt_power[(size_t)(g + j) * WAVE_COUNT + scale];
+        }
+      derivative[slot][scale] = reverse && order % 2 ? -value : value;
+    }
   }
 }
 
@@ -177,6 +221,7 @@ static int terminal_allowed(int hidden) {
 }
 
 void crf_init(void) {
+  derivative_init();
   ntrans = 0;
   memset(pair_to_edge, -1, sizeof(pair_to_edge));
   for (int a = 0; a < STATES; a++)
@@ -238,7 +283,7 @@ static Site site_scores(const double *w, const Contig *c, int position,
   double b_splice[2][4], b_cwt[2][4];
   for (int rev = 0; rev < 2; rev++) {
     float power[FLANKS][WAVE_COUNT];
-    double derivative[FLANKS][WAVE_COUNT];
+    double derivative[FLANKS][DERIV_COUNT][WAVE_COUNT];
     for (int offset = 0; offset < FLANKS; offset++)
       boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
     const uint8_t *fl = site.flank[rev];
@@ -249,10 +294,10 @@ static Site site_scores(const double *w, const Contig *c, int position,
       for (int offset = 0; offset < FLANKS; offset++) {
         int base = (kind * FLANKS + offset) * WAVE_COUNT;
         const double *wbp = w + OFF_BP + base;
-        const double *wbd = w + OFF_BD + base;
         for (int scale = 0; scale < WAVE_COUNT; scale++) {
           cw += wbp[scale] * power[offset][scale];
-          cw += wbd[scale] * derivative[offset][scale];
+          for (int slot = 0; slot < DERIV_COUNT; slot++)
+            cw += w[derivative_index(slot, kind, offset, scale)] * derivative[offset][slot][scale];
         }
       }
       b_splice[rev][kind] = sp;
@@ -467,7 +512,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
           if (b_coeff[0][rev] == 0 && b_coeff[1][rev] == 0 &&
               b_coeff[2][rev] == 0 && b_coeff[3][rev] == 0) continue;
           float power[FLANKS][WAVE_COUNT];
-          double derivative[FLANKS][WAVE_COUNT];
+          double derivative[FLANKS][DERIV_COUNT][WAVE_COUNT];
           for (int offset = 0; offset < FLANKS; offset++)
             boundary_cwt_at(c, genome_position, rev, offset, power[offset], derivative[offset]);
           for (int kind = 0; kind < 4; kind++) {
@@ -479,10 +524,11 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
             for (int offset = 0; offset < FLANKS; offset++) {
               int base = (kind * FLANKS + offset) * WAVE_COUNT;
               double *gbp = gradient + OFF_BP + base;
-              double *gbd = gradient + OFF_BD + base;
               for (int scale = 0; scale < WAVE_COUNT; scale++) {
                 gbp[scale] += val * power[offset][scale];
-                gbd[scale] += val * derivative[offset][scale];
+                for (int slot = 0; slot < DERIV_COUNT; slot++)
+                  gradient[derivative_index(slot, kind, offset, scale)] +=
+                    val * derivative[offset][slot][scale];
               }
             }
           }
@@ -665,12 +711,14 @@ static void feature_scales(const Contig *contigs, int count, double *scale) {
         int genome_position = contigs[c].offset + i;
         for (int offset = 0; offset < FLANKS; offset++) {
           float power[WAVE_COUNT];
-          double derivative[WAVE_COUNT];
+          double derivative[DERIV_COUNT][WAVE_COUNT];
           boundary_cwt_at(contigs + c, genome_position, reverse, offset, power, derivative);
           int base = (kind * FLANKS + offset) * WAVE_COUNT;
           for (int k = 0; k < WAVE_COUNT; k++) {
             scale[OFF_BP + base + k] += (double)power[k] * power[k];
-            scale[OFF_BD + base + k] += derivative[k] * derivative[k];
+            for (int slot = 0; slot < DERIV_COUNT; slot++)
+              scale[derivative_index(slot, kind, offset, k)] +=
+                derivative[slot][k] * derivative[slot][k];
           }
         }
       }
@@ -834,14 +882,15 @@ void crf_save_weights_text(const char *path, const double *w) {
       }
     }
   }
-  for (int kind = 0; kind < 4; kind++) {
-    for (int offset = 0; offset < FLANKS; offset++) {
-      int disp = boundary_cwt_offsets[offset];
-      int base = (kind * FLANKS + offset) * WAVE_COUNT;
-      for (int sc = 0; sc < WAVE_COUNT; sc++) {
-        int idx = OFF_BD + base + sc;
-        fprintf(file, "%d\tboundary_cwt_deriv\t%s\toffset=%+d,scale=%d\t%.9g\n",
-                idx, kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
+  for (int slot = 0; slot < DERIV_COUNT; slot++) {
+    for (int kind = 0; kind < 4; kind++) {
+      for (int offset = 0; offset < FLANKS; offset++) {
+        int disp = boundary_cwt_offsets[offset];
+        for (int sc = 0; sc < WAVE_COUNT; sc++) {
+          int idx = derivative_index(slot, kind, offset, sc);
+          fprintf(file, "%d\tboundary_cwt_deriv%d\t%s\toffset=%+d,scale=%d\t%.9g\n",
+                  idx, derivative_orders[slot], kind_names[kind], disp, wave_sizes[sc], (float)w[idx]);
+        }
       }
     }
   }

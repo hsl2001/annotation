@@ -344,8 +344,11 @@ static int usage(const char *program, int status, int cwt_only) {
     fprintf(stderr, "Usage: %s [-p threads] <genome.fa[.gz]> <new_directory>\n", program);
   else
     fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                    "Features: emit_k3, boundary_k2, boundary_cwt_power, boundary_cwt_deriv.\n"
-                    "Models from earlier feature layouts must be retrained.\n"
+                    "Features: emit_k3, boundary_k2, boundary_cwt_power, boundary_cwt_derivN.\n"
+                    "Derivative orders are selected at build time with CRF_DERIV_ORDERS (default: 1,2,3,4).\n"
+                    "Standard central finite differences at h=1 bp, without signal-dependent normalization.\n"
+                    "Training and prediction must use the same derivative order list and CWT scales.\n"
+                    "Models from earlier feature layouts or normalized derivative features must be retrained.\n"
                     "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
