@@ -452,7 +452,8 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
     if (!position) {
       double max_e = -INFINITY;
       for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-        if (initial_allowed(site.nuc, hidden, c->offset == 0)) {
+        if (initial_allowed(site.nuc, hidden, c->offset == 0) &&
+            (c->length > 1 || c->offset + c->length < c->genome_length || terminal_allowed(hidden))) {
           double e = emissions[hidden_state[hidden]];
           if (e > max_e) max_e = e;
         }
@@ -472,10 +473,6 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       k->inv_scale[0] = inv;
       logz += max_e + log(sum);
     } else {
-      double max_psi = psi[0];
-      for (int edge = 1; edge < ntrans; edge++)
-        if (psi[edge] > max_psi) max_psi = psi[edge];
-
       int prev_gold = c->label[c->offset + position - 1];
       int gold_edge = pair_to_edge[prev_gold][gold_state];
       if (gold_edge >= 0)
@@ -483,13 +480,26 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       else
         gold_score += transition(w, c, &site, position, prev_gold, gold_state);
 
+      const double *prev_A = A - HIDDEN_STATES;
+      const HiddenEdge *edges = hidden_edges[site.nuc];
+      int edge_count = hidden_edge_count[site.nuc];
+      double max_psi = -INFINITY;
+      for (int edge = 0; edge < edge_count; edge++) {
+        const HiddenEdge *step = edges + edge;
+        if (prev_A[step->previous] > 0.0 &&
+            (position < c->length - 1 || c->offset + c->length < c->genome_length ||
+             terminal_allowed(step->current))) {
+          double p = psi[step->transition];
+          if (p > max_psi) max_psi = p;
+        }
+      }
+      if (!isfinite(max_psi))
+        anno_fail("Invalid CRF partition at position %d", position + 1);
+
       double *ep = k->exp_psi + (size_t)position * ntrans;
       for (int edge = 0; edge < ntrans; edge++) ep[edge] = exp(psi[edge] - max_psi);
 
-      const double *prev_A = A - HIDDEN_STATES;
       for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] = 0.0;
-      const HiddenEdge *edges = hidden_edges[site.nuc];
-      int edge_count = hidden_edge_count[site.nuc];
       for (int edge = 0; edge < edge_count; edge++) {
         const HiddenEdge *step = edges + edge;
         A[step->current] += prev_A[step->previous] * ep[step->transition];
@@ -511,9 +521,9 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
 
   double likelihood = mass - logz + gold_score;
   double B[HIDDEN_STATES];
-  int reaches_contig_end = c->offset + c->length == c->genome_length;
+  const double *last_A = k->alpha + (size_t)(c->length - 1) * HIDDEN_STATES;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    B[hidden] = !reaches_contig_end || terminal_allowed(hidden) ? 1.0 : 0.0;
+    B[hidden] = last_A[hidden];
 
   for (int position = c->length - 1; position >= 0; position--) {
     const Site *site = k->sites + position;
@@ -522,7 +532,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
 
     double state_marginals[STATES] = {0};
     for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-      state_marginals[hidden_state[hidden]] += A[hidden] * B[hidden];
+      state_marginals[hidden_state[hidden]] += B[hidden];
     state_marginals[state] -= 1.0;
 
     float deriv_pos[WAVE_COUNT];
@@ -555,15 +565,20 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       int edge_count = hidden_edge_count[site->nuc];
       for (int edge = 0; edge < edge_count; edge++) {
         const HiddenEdge *step = edges + edge;
-        double w_bq = ep[step->transition] * B[step->current];
-        B_prev[step->previous] += w_bq;
-        edge_marginals[step->transition] += prev_A[step->previous] * w_bq;
+        double a_cur = A[step->current], b_cur = B[step->current];
+        if (a_cur > 0.0 && b_cur > 0.0) {
+          double edge_prob = ((prev_A[step->previous] * ep[step->transition] * inv_c) / a_cur) * b_cur;
+          B_prev[step->previous] += edge_prob;
+          edge_marginals[step->transition] += edge_prob;
+        }
       }
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) B[hidden] = B_prev[hidden] * inv_c;
+      double sum_b = 0;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) sum_b += B_prev[hidden];
+      double inv_b = sum_b > 0.0 ? 1.0 / sum_b : 0.0;
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) B[hidden] = B_prev[hidden] * inv_b;
 
       double b_coeff[4][2] = {{0}};
       int has_boundary = 0;
-      for (int edge = 0; edge < ntrans; edge++) edge_marginals[edge] *= inv_c;
       if (gold_edge >= 0) {
         edge_marginals[gold_edge] -= 1.0;
       } else {
