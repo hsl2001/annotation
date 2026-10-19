@@ -654,61 +654,43 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
 
   for (int b0 = 0; b0 < length; b0 += SM_BLK_SIZE) {
     int b_end = b0 + SM_BLK_SIZE < length ? b0 + SM_BLK_SIZE : length;
-    double anchor_ex[6], anchor_int[6];
-    for (int ch = 0; ch < 6; ch++) anchor_ex[ch] = S_exon[b0 * 6 + ch];
-    for (int iq = 0; iq < 6; iq++) anchor_int[iq] = S_intron[b0 * 6 + iq];
-
-    double m_ex[6], m_int[6];
+    int t_ex_earliest[6];
+    double m_ex[6], m_int[INTRON_CHANNELS];
     for (int ch = 0; ch < 6; ch++) {
       int t_earliest = b0;
       for (int u = b0; u < b_end; u++)
         if (u >= 2 && canon_h[u * 6 + ch] >= 0 && min_t[u * 6 + ch] < t_earliest)
           t_earliest = min_t[u * 6 + ch];
+      t_ex_earliest[ch] = t_earliest;
       double m = -INFINITY;
-      if (b0 > 0) {
-        double *le_prev = log_a_end + (size_t)(b0 - 1) * HIDDEN_STATES;
-        for (int h = 0; h < HIDDEN_STATES; h++) if (le_prev[h] > m) m = le_prev[h];
+      for (int t = t_earliest; t < b0; t++)
+        if (X_exon[t * 6 + ch] > m) m = X_exon[t * 6 + ch];
+      m_ex[ch] = m;
+      double * restrict ex_ptr = exp_X_exon + (size_t)ch * e_stride;
+      if (m > -INFINITY) {
+        for (int t = t_earliest; t < b0; t++) {
+          double v = X_exon[t * 6 + ch] - m;
+          ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
+        }
       } else {
-        m = 0.0;
-      }
-      for (int t = t_earliest; t < b0; t++) {
-        double v = X_exon[t * 6 + ch] + anchor_ex[ch];
-        if (v > m) m = v;
-      }
-      if (!isfinite(m)) m = 0.0;
-      m_ex[ch] = m - anchor_ex[ch];
-      for (int t = t_earliest; t < b0; t++) {
-        double v = X_exon[t * 6 + ch] - m_ex[ch];
-        exp_X_exon[(size_t)ch * e_stride + (size_t)t] = v > -745.0 ? exp(v) : 0.0;
+        for (int t = t_earliest; t < b0; t++) ex_ptr[t] = 0.0;
       }
     }
 
     int t_int_earliest = b0 - CRF_INTRON_LEN + 1 > 0 ? b0 - CRF_INTRON_LEN + 1 : 0;
-    for (int iq = 0; iq < 6; iq++) {
-      double m = -INFINITY;
-      if (b0 > 0) {
-        double *le_prev = log_a_end + (size_t)(b0 - 1) * HIDDEN_STATES;
-        for (int h = 0; h < HIDDEN_STATES; h++) if (le_prev[h] > m) m = le_prev[h];
-      } else {
-        m = 0.0;
-      }
-      for (int t = t_int_earliest; t < b0; t++) {
-        for (int ic = 0; ic < INTRON_CHANNELS; ic++) {
-          if (intron_ch_to_iq[ic] != iq) continue;
-          double v = X_intron[t * INTRON_CHANNELS + ic] + anchor_int[iq];
-          if (v > m) m = v;
-        }
-      }
-      if (!isfinite(m)) m = 0.0;
-      m_int[iq] = m - anchor_int[iq];
-    }
     for (int ic = 0; ic < INTRON_CHANNELS; ic++) {
-      int iq = intron_ch_to_iq[ic];
-      double mi = m_int[iq];
+      double m = -INFINITY;
+      for (int t = t_int_earliest; t < b0; t++)
+        if (X_intron[t * INTRON_CHANNELS + ic] > m) m = X_intron[t * INTRON_CHANNELS + ic];
+      m_int[ic] = m;
       double * restrict ex_ptr = exp_X_intron + (size_t)ic * i_stride;
-      for (int t = t_int_earliest; t < b0; t++) {
-        double v = X_intron[t * INTRON_CHANNELS + ic] - mi;
-        ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
+      if (m > -INFINITY) {
+        for (int t = t_int_earliest; t < b0; t++) {
+          double v = X_intron[t * INTRON_CHANNELS + ic] - m;
+          ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
+        }
+      } else {
+        for (int t = t_int_earliest; t < b0; t++) ex_ptr[t] = 0.0;
       }
     }
 
@@ -761,8 +743,22 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
           log_exon_merged[u * 6 + ch] = m;
           double x = m == -INFINITY ? -INFINITY : m - S_exon[u * 6 + ch];
           X_exon[u * 6 + ch] = x;
-          double v = x - m_ex[ch];
-          exp_X_exon[(size_t)ch * e_stride + (size_t)u] = v > -745.0 ? exp(v) : 0.0;
+          if (x == -INFINITY) {
+            exp_X_exon[(size_t)ch * e_stride + (size_t)u] = 0.0;
+          } else {
+            if (m_ex[ch] == -INFINITY) {
+              m_ex[ch] = x;
+            } else if (x > m_ex[ch] + 250.0) {
+              m_ex[ch] = x;
+              double * restrict ex_ptr = exp_X_exon + (size_t)ch * e_stride;
+              for (int t = t_ex_earliest[ch]; t < u; t++) {
+                double vt = X_exon[t * 6 + ch] - x;
+                ex_ptr[t] = vt > -745.0 ? exp(vt) : 0.0;
+              }
+            }
+            double v = x - m_ex[ch];
+            exp_X_exon[(size_t)ch * e_stride + (size_t)u] = v > -745.0 ? exp(v) : 0.0;
+          }
         }
       } else {
         for (int ch = 0; ch < 6; ch++) exp_X_exon[(size_t)ch * e_stride + (size_t)u] = 0.0;
@@ -778,10 +774,24 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
           log_add(X_intron[u * INTRON_CHANNELS + ic], v0 - S_intron[u * 6 + iq]);
       }
       for (int ic = 0; ic < INTRON_CHANNELS; ic++) {
-        int iq = intron_ch_to_iq[ic];
         double x = X_intron[u * INTRON_CHANNELS + ic];
-        double v = x - m_int[iq];
-        exp_X_intron[(size_t)ic * i_stride + (size_t)u] = v > -745.0 ? exp(v) : 0.0;
+        if (x == -INFINITY) {
+          exp_X_intron[(size_t)ic * i_stride + (size_t)u] = 0.0;
+        } else {
+          if (m_int[ic] == -INFINITY) {
+            m_int[ic] = x;
+          } else if (x > m_int[ic] + 250.0) {
+            m_int[ic] = x;
+            double * restrict ex_ptr = exp_X_intron + (size_t)ic * i_stride;
+            int t0 = u - CRF_INTRON_LEN + 1 > 0 ? u - CRF_INTRON_LEN + 1 : 0;
+            for (int t = t0; t < u; t++) {
+              double vt = X_intron[t * INTRON_CHANNELS + ic] - x;
+              ex_ptr[t] = vt > -745.0 ? exp(vt) : 0.0;
+            }
+          }
+          double v = x - m_int[ic];
+          exp_X_intron[(size_t)ic * i_stride + (size_t)u] = v > -745.0 ? exp(v) : 0.0;
+        }
       }
 
       le_u[0] = ls_u[0];
@@ -810,7 +820,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       if (u >= 2) {
         for (int ch = 0; ch < 6; ch++) {
           int h_end = canon_h[u * 6 + ch];
-          if (h_end < 0) continue;
+          if (h_end < 0 || m_ex[ch] == -INFINITY) continue;
           int t_min = min_t[u * 6 + ch];
           int t_max = u - 2;
           if (t_min > t_max) continue;
@@ -849,10 +859,14 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
         } else if (full_end) {
           continue;
         }
-        const double * restrict xs = exp_X_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
-        double Z = 0.0;
-        for (int i = 0; i < n_len_int; i++) Z += xs[i] * ks_int[i];
-        double log_exp = Z > 0.0 ? m_int[iq] + max_phi_int + S_intron[u * 6 + iq] + log(Z) : -INFINITY;
+        double log_exp = -INFINITY;
+        if (m_int[ic] > -INFINITY) {
+          const double * restrict xs = exp_X_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
+          double Z = 0.0;
+          for (int i = 0; i < n_len_int; i++) Z += xs[i] * ks_int[i];
+          if (Z > 0.0)
+            log_exp = m_int[ic] + max_phi_int + S_intron[u * 6 + iq] + log(Z);
+        }
         int h = intron_ch_rep[ic];
         le_u[h] = log_add(log_exp, log_tail[u * INTRON_CHANNELS + ic]);
       }
@@ -886,7 +900,7 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
     int b_end = b0 + SM_BLK_SIZE < length ? b0 + SM_BLK_SIZE : length;
 
     int t_ex_earliest[6];
-    double m_ex[6], m_int[6];
+    double m_ex[6], m_int[INTRON_CHANNELS];
     for (int ch = 0; ch < 6; ch++) {
       int te = b0;
       for (int u = b0; u < b_end; u++)
@@ -896,35 +910,42 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       double m = -INFINITY;
       for (int t = te; t < b_end; t++)
         if (X_exon[t * 6 + ch] > m) m = X_exon[t * 6 + ch];
-      if (!isfinite(m)) m = 0.0;
       m_ex[ch] = m;
-      for (int t = te; t < b_end; t++) {
-        double v = X_exon[t * 6 + ch] - m_ex[ch];
-        exp_X_exon[(size_t)ch * e_stride + (size_t)t] = v > -745.0 ? exp(v) : 0.0;
-        Z_exon[(size_t)ch * e_stride + (size_t)t] = 0.0;
+      double * restrict ex_ptr = exp_X_exon + (size_t)ch * e_stride;
+      double * restrict z_ptr = Z_exon + (size_t)ch * e_stride;
+      if (m > -INFINITY) {
+        for (int t = te; t < b_end; t++) {
+          double v = X_exon[t * 6 + ch] - m;
+          ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
+          z_ptr[t] = 0.0;
+        }
+      } else {
+        for (int t = te; t < b_end; t++) {
+          ex_ptr[t] = 0.0;
+          z_ptr[t] = 0.0;
+        }
       }
     }
 
     int t_int_earliest = b0 - CRF_INTRON_LEN + 1 > 0 ? b0 - CRF_INTRON_LEN + 1 : 0;
-    for (int iq = 0; iq < 6; iq++) {
-      double m = -INFINITY;
-      for (int ic = 0; ic < INTRON_CHANNELS; ic++) {
-        if (intron_ch_to_iq[ic] != iq) continue;
-        for (int t = t_int_earliest; t < b_end; t++)
-          if (X_intron[t * INTRON_CHANNELS + ic] > m) m = X_intron[t * INTRON_CHANNELS + ic];
-      }
-      if (!isfinite(m)) m = 0.0;
-      m_int[iq] = m;
-    }
     for (int ic = 0; ic < INTRON_CHANNELS; ic++) {
-      int iq = intron_ch_to_iq[ic];
-      double mi = m_int[iq];
+      double m = -INFINITY;
+      for (int t = t_int_earliest; t < b_end; t++)
+        if (X_intron[t * INTRON_CHANNELS + ic] > m) m = X_intron[t * INTRON_CHANNELS + ic];
+      m_int[ic] = m;
       double * restrict ex_ptr = exp_X_intron + (size_t)ic * i_stride;
       double * restrict z_ptr = Z_intron + (size_t)ic * i_stride;
-      for (int t = t_int_earliest; t < b_end; t++) {
-        double v = X_intron[t * INTRON_CHANNELS + ic] - mi;
-        ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
-        z_ptr[t] = 0.0;
+      if (m > -INFINITY) {
+        for (int t = t_int_earliest; t < b_end; t++) {
+          double v = X_intron[t * INTRON_CHANNELS + ic] - m;
+          ex_ptr[t] = v > -745.0 ? exp(v) : 0.0;
+          z_ptr[t] = 0.0;
+        }
+      } else {
+        for (int t = t_int_earliest; t < b_end; t++) {
+          ex_ptr[t] = 0.0;
+          z_ptr[t] = 0.0;
+        }
       }
     }
 
@@ -1030,15 +1051,36 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
       if (u >= 2) {
         for (int ch = 0; ch < 6; ch++) {
           int h_end = canon_h[u * 6 + ch];
-          if (h_end < 0) continue;
+          if (h_end < 0 || m_ex[ch] == -INFINITY) continue;
           double pe = pe_u[h_end];
-          if (pe <= 0.0) continue;
+          if (pe <= 0.0 || le_u[h_end] == -INFINITY) continue;
           int t_min = min_t[u * 6 + ch];
           int t_max = u - 2;
           if (t_min > t_max) continue;
+          double log_coeff = log(pe) + m_ex[ch] + max_phi_ex + S_exon[u * 6 + ch] - le_u[h_end];
+          if (log_coeff > 250.0) {
+            double m_cur = -INFINITY;
+            for (int t = t_min; t <= t_max; t++)
+              if (X_exon[t * 6 + ch] > m_cur) m_cur = X_exon[t * 6 + ch];
+            if (m_cur == -INFINITY) continue;
+            double m_new = -INFINITY;
+            for (int t = t_ex_earliest[ch]; t <= t_max; t++)
+              if (X_exon[t * 6 + ch] > m_new) m_new = X_exon[t * 6 + ch];
+            double * restrict ex_ptr = exp_X_exon + (size_t)ch * e_stride;
+            double * restrict z_ptr = Z_exon + (size_t)ch * e_stride;
+            double scale_z = m_new - m_ex[ch] > -745.0 ? exp(m_new - m_ex[ch]) : 0.0;
+            for (int t = t_ex_earliest[ch]; t <= u; t++) {
+              double vt = X_exon[t * 6 + ch] - m_new;
+              ex_ptr[t] = vt > -745.0 ? exp(vt) : 0.0;
+              z_ptr[t] *= scale_z;
+            }
+            m_ex[ch] = m_new;
+            log_coeff = log(pe) + m_new + max_phi_ex + S_exon[u * 6 + ch] - le_u[h_end];
+          }
+          double coeff = log_coeff > -745.0 && log_coeff < 700.0 ? exp(log_coeff) : 0.0;
+          if (coeff <= 0.0) continue;
           int n_len = t_max - t_min + 1;
           int d_at_tmin = u - t_min + 1;
-          double coeff = pe * exp(m_ex[ch] + max_phi_ex + S_exon[u * 6 + ch] - le_u[h_end]);
           const double * restrict xs = exp_X_exon + ((size_t)ch * e_stride + (size_t)t_min);
           double * restrict zs = Z_exon + ((size_t)ch * e_stride + (size_t)t_min);
           const double * restrict ks = K_exon_rev + (max_exon_d - d_at_tmin);
@@ -1064,13 +1106,38 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
           double lt = log_tail[u * INTRON_CHANNELS + ic];
           if (lt > -INFINITY)
             P_tail[u * INTRON_CHANNELS + ic] += p_end * exp(lt - le_u[h]);
-          double coeff = p_end * exp(m_int[iq] + max_phi_int + S_intron[u * 6 + iq] - le_u[h]);
-          if (coeff > 0.0) {
-            const double * restrict xs = exp_X_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
-            double * restrict zs = Z_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
-            for (int i = 0; i < n_len_int; i++) {
-              zs[i] += coeff * ks_int[i];
-              gs_int[i] += coeff * xs[i];
+          if (m_int[ic] > -INFINITY) {
+            double log_coeff = log(p_end) + m_int[ic] + max_phi_int + S_intron[u * 6 + iq] - le_u[h];
+            if (log_coeff > 250.0) {
+              double m_cur = -INFINITY;
+              for (int t = t_min_int; t <= u; t++)
+                if (X_intron[t * INTRON_CHANNELS + ic] > m_cur) m_cur = X_intron[t * INTRON_CHANNELS + ic];
+              if (m_cur > -INFINITY) {
+                double m_new = -INFINITY;
+                for (int t = t_int_earliest; t <= u; t++)
+                  if (X_intron[t * INTRON_CHANNELS + ic] > m_new) m_new = X_intron[t * INTRON_CHANNELS + ic];
+                double * restrict ex_ptr = exp_X_intron + (size_t)ic * i_stride;
+                double * restrict z_ptr = Z_intron + (size_t)ic * i_stride;
+                double scale_z = m_new - m_int[ic] > -745.0 ? exp(m_new - m_int[ic]) : 0.0;
+                for (int t = t_int_earliest; t <= u; t++) {
+                  double vt = X_intron[t * INTRON_CHANNELS + ic] - m_new;
+                  ex_ptr[t] = vt > -745.0 ? exp(vt) : 0.0;
+                  z_ptr[t] *= scale_z;
+                }
+                m_int[ic] = m_new;
+                log_coeff = log(p_end) + m_new + max_phi_int + S_intron[u * 6 + iq] - le_u[h];
+              } else {
+                log_coeff = -INFINITY;
+              }
+            }
+            double coeff = log_coeff > -745.0 && log_coeff < 700.0 ? exp(log_coeff) : 0.0;
+            if (coeff > 0.0) {
+              const double * restrict xs = exp_X_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
+              double * restrict zs = Z_intron + ((size_t)ic * i_stride + (size_t)t_min_int);
+              for (int i = 0; i < n_len_int; i++) {
+                zs[i] += coeff * ks_int[i];
+                gs_int[i] += coeff * xs[i];
+              }
             }
           }
         }
