@@ -431,7 +431,8 @@ static double contig_gradient(const double *w, const Contig *c, double mass,
         anno_fail("Invalid CRF partition at position %d", position + 1);
 
       double *ep = k->exp_psi + (size_t)position * ntrans;
-      for (int edge = 0; edge < ntrans; edge++) ep[edge] = exp(psi[edge] - max_psi);
+      for (int edge = 0; edge < ntrans; edge++)
+        ep[edge] = psi[edge] > max_psi ? 0.0 : exp(psi[edge] - max_psi);
 
       for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] = 0.0;
       for (int edge = 0; edge < edge_count; edge++) {
