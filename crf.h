@@ -4,32 +4,25 @@
 #include "lbfgs.h"
 #include <stdint.h>
 
-#ifndef CRF_L2_C2
 #define CRF_L2_C2 1.0
-#endif
-#ifndef CRF_WINDOW_SIZE
-#define CRF_WINDOW_SIZE 65536
-#endif
-#ifndef CRF_DERIV_ORDERS
-#define CRF_DERIV_ORDERS 1, 2, 3
-#endif
-enum { DERIV_COUNT = CWT_COUNT(CRF_DERIV_ORDERS), DERIV_RADIUS = 2 };
 
-/* Linear-chain CRF decoded jointly for both strands.
+/* Linear-chain CRF decoded jointly for both strands with strand-shared emissions.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
    next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
-enum { STATES = 13, HIDDEN_STATES = 39 };
 static const int boundary_kmer_offsets[] = {-8, -6, -4, -2, 0, 2, 4, 6};
 static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1, 2};
 enum {
+  CRF_WINDOW_SIZE = 65536,
+  DERIV_COUNT = 3, DERIV_RADIUS = 2,
+  STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
   K2 = 17, K3 = 65, KNUC = 5,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
-  BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0])
+  BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0]),
+  OFF_E3 = 0, OFF_SPLICE_START_STOP = OFF_E3 + EMIT_STATES * K3,
+  OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
+  OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
+  WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT
 };
-enum { OFF_E3 = 0, OFF_SPLICE_START_STOP = OFF_E3 + STATES * K3,
-       OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
-       OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
-       WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT };
 
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
@@ -47,8 +40,7 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <string.h>
 
 typedef struct {
-  uint8_t k3_emit[2];
-  uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
+  uint8_t k3_emit[2], nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 24, 29, 33, 38};
@@ -98,30 +90,11 @@ static int boundary_kind(int previous, int current) {
   return -1;
 }
 
-static const int derivative_orders[DERIV_COUNT] = {CRF_DERIV_ORDERS};
-static double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1];
-
-static void derivative_init(void) {
-  for (int slot = 0; slot < DERIV_COUNT; slot++) {
-    int order = derivative_orders[slot];
-    if (order < 1 || order > 3) anno_fail("CWT derivative order must be between 1 and 3");
-    for (int previous = 0; previous < slot; previous++)
-      if (derivative_orders[previous] == order) anno_fail("Duplicate CWT derivative order: %d", order);
-    double *kernel = derivative_kernels[slot];
-    memset(kernel, 0, sizeof(derivative_kernels[slot]));
-    if (order % 2) kernel[DERIV_RADIUS - 1] = -.5, kernel[DERIV_RADIUS + 1] = .5;
-    else kernel[DERIV_RADIUS] = 1;
-    for (int degree = 0; degree < order / 2; degree++) {
-      double next[2 * DERIV_RADIUS + 1] = {0};
-      for (int j = 0; j <= 2 * DERIV_RADIUS; j++) {
-        if (j) next[j - 1] += kernel[j];
-        next[j] -= 2 * kernel[j];
-        if (j < 2 * DERIV_RADIUS) next[j + 1] += kernel[j];
-      }
-      memcpy(kernel, next, sizeof(next));
-    }
-  }
-}
+static const double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1] = {
+  {0, -0.5, 0, 0.5, 0},
+  {0, 1, -2, 1, 0},
+  {-0.5, 1, 0, -1, 0.5}
+};
 
 static int boundary_kmer_index(const Site *site, int reverse, int kind, int offset) {
   return OFF_SPLICE_START_STOP + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + site->boundary_k2[reverse][offset];
@@ -142,7 +115,6 @@ static void boundary_cwt_at(const Contig *c, int position, int reverse, int offs
   }
   memcpy(power, c->cwt_power + (size_t)g * WAVE_COUNT, WAVE_COUNT * sizeof(*power));
   for (int slot = 0; slot < DERIV_COUNT; slot++) {
-    int order = derivative_orders[slot];
     const double *kernel = derivative_kernels[slot];
     int valid = 1;
     for (int j = -DERIV_RADIUS; j <= DERIV_RADIUS; j++) {
@@ -161,7 +133,7 @@ static void boundary_cwt_at(const Contig *c, int position, int reverse, int offs
           if (!coefficient) continue;
           value += coefficient * c->cwt_power[(size_t)(g + j) * WAVE_COUNT + scale];
         }
-      derivative[slot][scale] = reverse && order % 2 ? -value : value;
+      derivative[slot][scale] = reverse && !(slot % 2) ? -value : value;
     }
   }
 }
@@ -231,7 +203,6 @@ static int terminal_allowed(int hidden) {
 }
 
 void crf_init(void) {
-  derivative_init();
   ntrans = 0;
   memset(pair_to_edge, -1, sizeof(pair_to_edge));
   for (int a = 0; a < STATES; a++)
@@ -260,8 +231,13 @@ void crf_init(void) {
       }
 }
 
+static int emit_state(int state) {
+  if (state < 7) return state;
+  return state <= 9 ? state - 6 : 4 + (state - 9) % 3;
+}
+
 static int emission_index(const Site *site, int state) {
-  return OFF_E3 + state * K3 + site->k3_emit[state >= 7];
+  return OFF_E3 + emit_state(state) * K3 + site->k3_emit[state >= 7];
 }
 
 typedef struct {
@@ -804,12 +780,10 @@ static void format_kmer(int code, int size, char *out) {
 }
 
 void crf_save_weights_text(const char *path, const double *w) {
-  static const char *const state_names[STATES] = {
+  static const char *const state_names[EMIT_STATES] = {
     "intergenic",
-    "CDS(+):0", "CDS(+):1", "CDS(+):2",
-    "intron(+):0", "intron(+):1", "intron(+):2",
-    "CDS(-):0", "CDS(-):1", "CDS(-):2",
-    "intron(-):0", "intron(-):1", "intron(-):2"
+    "CDS:0", "CDS:1", "CDS:2",
+    "intron:0", "intron:1", "intron:2"
   };
   static const char *const kind_names[4] = {
     "5ss", "3ss", "start_codon", "stop_codon"
@@ -819,8 +793,8 @@ void crf_save_weights_text(const char *path, const double *w) {
   if (!file) anno_fail("Cannot write weights text: %s", path);
   fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
 
-  char kbuf[8];
-  for (int s = 0; s < STATES; s++) {
+  char kbuf[4];
+  for (int s = 0; s < EMIT_STATES; s++) {
     for (int k = 0; k < K3; k++) {
       int idx = OFF_E3 + s * K3 + k;
       format_kmer(k, 3, kbuf);
@@ -855,7 +829,7 @@ void crf_save_weights_text(const char *path, const double *w) {
       for (int sc = 0; sc < WAVE_COUNT; sc++) {
         int idx = derivative_index(slot, offset, sc);
         fprintf(file, "%d\tboundary_cwt_deriv%d\t%s\toffset=%+d,scale=%d\t%.9g\n",
-                idx, derivative_orders[slot], kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
+                idx, slot + 1, kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
       }
     }
   }
