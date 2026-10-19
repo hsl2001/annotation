@@ -42,7 +42,7 @@ Arr = NDArray[Any]
 PLOT_NAMES: tuple[str, ...] = (
     "exons", "introns", "exons-mutated", "exon-kmer", "control", "control-aggt",
     "control-aggt-p1", "first-exons", "last-exons", "control-no-repeat",
-    "control-aggt-no-repeat", "control-aggt-p1-no-repeat",
+    "control-aggt-no-repeat", "control-aggt-p1-no-repeat", "control-gtag", "control-gtag-no-repeat",
 )
 PLOT_CHOICES: tuple[str, ...] = ("all", *PLOT_NAMES)
 REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
@@ -280,7 +280,7 @@ class GenomeData:
         self.c_offs = np.concatenate(([0], np.cumsum(self.c_lens[:-1])))
         self.exon_sets, self.kmer_bounds, self.has_repeats, self._excl_spans, self.splice_sites = self._parse_gff()
         self.sequences: dict[str, str] = sequences or {}
-        self._aggt_cache: tuple[list[tuple[Arr, Arr]], list[Arr]] | None = None
+        self._motif_cache: dict[bool, tuple[list[tuple[Arr, Arr]], list[Arr]]] = {}
 
     def _parse_gff(self) -> tuple[dict[str, list[Interval]], dict[Interval, tuple[int, int]], bool, dict[bool, tuple[Arr, Arr]], dict[str, list[int]]]:
         intervals, gene_ids, rrna_ids = set(), set(), set()
@@ -374,9 +374,11 @@ class GenomeData:
                 prev_lo, prev_hi = kmer_bounds.get(iv, (0, ln))
                 kmer_bounds[iv] = (max(prev_lo, lo), min(prev_hi, hi))
         exon_spans = [(int(self.c_offs[self.name_to_id[n]]) + s, int(self.c_offs[self.name_to_id[n]]) + e) for n, s, e, _ in intervals]
-        excl = {False: merge_spans(list(exon_spans))}
+        intron_spans = [(int(self.c_offs[self.name_to_id[n]]) + s, int(self.c_offs[self.name_to_id[n]]) + e) for n, s, e, _ in introns]
+        excl = {(False, False): merge_spans(list(exon_spans)), (False, True): merge_spans(exon_spans + intron_spans)}
         if rep_spans:
-            excl[True] = merge_spans(exon_spans + rep_spans)
+            excl[True, False] = merge_spans(exon_spans + rep_spans)
+            excl[True, True] = merge_spans(exon_spans + intron_spans + rep_spans)
         return (
             {
                 "exons": sort_intervals(intervals),
@@ -403,8 +405,11 @@ class GenomeData:
             self.sequences = seqs
         return self.sequences
 
-    def _aggt_tables(self) -> tuple[list[tuple[Arr, Arr]], list[Arr]]:
-        if self._aggt_cache is None:
+    def _motif_tables(self, gtag: bool = False) -> tuple[list[tuple[Arr, Arr]], list[Arr]]:
+        # AG/GT: motifs flank the interval (exon-like). GT/AG: motifs are the interval's own first/last 2 bp (intron-like).
+        # Per strand: (start dinucleotide, end dinucleotide) on the genomic + strand; minus uses reverse complements.
+        if gtag not in self._motif_cache:
+            motifs, st_shift, en_shift = ((("G", "T", "A", "G"), ("C", "T", "A", "C")), 1, 2) if gtag else ((("A", "G", "G", "T"), ("A", "C", "C", "T")), 3, 0)
             codes = {b: ord(b) for b in "ACGT"}
             c_pos: list[list[Arr]] = [[], []]
             c_cid: list[list[Arr]] = [[], []]
@@ -414,34 +419,37 @@ class GenomeData:
                 arr = np.frombuffer(self.sequences[name].encode("ascii"), dtype=np.uint8)
                 if len(arr) >= 3:
                     l, r = arr[:-1], arr[1:]
-                    for s_idx, (a0, a1, d0, d1) in enumerate((("A", "G", "G", "T"), ("A", "C", "C", "T"))):
-                        st = (np.nonzero((l == codes[a0]) & (r == codes[a1]))[0] + 3).astype(np.int32)
+                    for s_idx, (a0, a1, d0, d1) in enumerate(motifs):
+                        st = (np.nonzero((l == codes[a0]) & (r == codes[a1]))[0] + st_shift).astype(np.int32)
                         st = st[st <= len(arr)]
                         c_pos[s_idx].append(st)
                         c_cid[s_idx].append(np.full(len(st), cid, dtype=np.int32))
-                        e_pos[s_idx].append(np.nonzero((l == codes[d0]) & (r == codes[d1]))[0].astype(np.int64) + off)
+                        e_pos[s_idx].append(np.nonzero((l == codes[d0]) & (r == codes[d1]))[0].astype(np.int64) + en_shift + off)
             cands = [(np.concatenate(c_pos[i]) if c_pos[i] else np.empty(0, dtype=np.int32),
                       np.concatenate(c_cid[i]) if c_cid[i] else np.empty(0, dtype=np.int32)) for i in (0, 1)]
             ends = [np.concatenate(e_pos[i]) if e_pos[i] else np.empty(0, dtype=np.int64) for i in (0, 1)]
             if cands[0][0].size == 0 and cands[1][0].size == 0:
-                raise ValueError("No AG/GT-flanked non-exon sites available in the provided FASTA")
-            self._aggt_cache = (cands, ends)
-        return self._aggt_cache
+                raise ValueError(f"No {'GT/AG' if gtag else 'AG/GT-flanked'} sites available in the provided FASTA")
+            self._motif_cache[gtag] = (cands, ends)
+        return self._motif_cache[gtag]
 
     def sample_controls(
-        self, seed: int, aggt: bool = False, length_offset: int = 0, repeat_free: bool = False, attempts: int = 200
+        self, seed: int, aggt: bool = False, length_offset: int = 0, repeat_free: bool = False, attempts: int = 200,
+        gtag: bool = False,
     ) -> list[Interval]:
-        cands, ends = self._aggt_tables() if aggt else ([], [])
-        ex_s, ex_e = self._excl_spans[repeat_free and self.has_repeats]
+        motif = aggt or gtag
+        cands, ends = self._motif_tables(gtag) if motif else ([], [])
+        end_margin = 0 if gtag else 2
+        ex_s, ex_e = self._excl_spans[repeat_free and self.has_repeats, gtag]
         weights, rng = np.cumsum(self.c_lens, dtype=np.float64), np.random.default_rng(seed)
-        needs = np.array([e - s + 1 + length_offset for _, s, e, _ in self.exon_sets["exons"]], dtype=np.int64)
+        needs = np.array([e - s + 1 + length_offset for _, s, e, _ in self.exon_sets["introns" if gtag else "exons"]], dtype=np.int64)
         res_cid, res_st, res_en, res_str = np.full(len(needs), -1, dtype=np.int32), np.empty_like(needs), np.empty_like(needs), np.empty(len(needs), dtype=np.int8)
         rem = np.arange(len(needs), dtype=np.int64)
         for _ in range(attempts):
             if not len(rem):
                 break
             strands = (rng.random(len(rem)) >= 0.5).astype(np.int8)
-            if aggt:
+            if motif:
                 batches = []
                 for s_idx, (pos_arr, cid_arr) in enumerate(cands):
                     if len(pos_arr) and len(sel := rem[strands == s_idx]):
@@ -450,7 +458,7 @@ class GenomeData:
                         en, e_arr = st + needs[sel] - 1, ends[s_idx]
                         ge = self.c_offs[cid] + en
                         pos_idx = np.minimum(np.searchsorted(e_arr, ge), max(0, len(e_arr) - 1))
-                        cond = (en <= self.c_lens[cid] - 2) & (len(e_arr) > 0) & (e_arr[pos_idx] == ge if len(e_arr) else False)
+                        cond = (en <= self.c_lens[cid] - end_margin) & (len(e_arr) > 0) & (e_arr[pos_idx] == ge if len(e_arr) else False)
                         batches.append((sel, cid, st, en, s_idx, cond))
             else:
                 cid = np.minimum(np.searchsorted(weights, rng.random(len(rem)) * weights[-1], side="right"), len(self.names) - 1)
@@ -466,7 +474,8 @@ class GenomeData:
                 res_str[hit] = s_val if isinstance(s_val, int) else s_val[ok]
             rem = rem[res_cid[rem] < 0]
         if not len(valid := np.flatnonzero(res_cid >= 0)):
-            raise ValueError(f"Could not place any {'AG/GT-flanked ' if aggt else ''}non-exon control at the requested lengths")
+            kind = "GT/AG non-genic " if gtag else ("AG/GT-flanked non-exon " if aggt else "non-exon ")
+            raise ValueError(f"Could not place any {kind}control at the requested lengths")
         return [(self.names[res_cid[i]], int(res_st[i]), int(res_en[i]), "+" if res_str[i] == 0 else "-") for i in valid]
 
     def write_mutated_fasta(self, fasta: Path, seed: int, output: Path) -> Path:
@@ -496,7 +505,7 @@ def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> N
         fig.colorbar(ax.imshow(panel, aspect="auto", origin="lower", interpolation="nearest", extent=ext, cmap="viridis", vmin=0, vmax=vmax), ax=ax, pad=0.01)
         ax.set(title=f"{param} {w} bp", ylabel="Interval rank" if s == 0 else "", ylim=ext[2:])
         prof.plot(pos, profile[s], color="#256c87", linewidth=1.3)
-        prof.set(ylabel="Mean power" if s == 0 else "", ylim=(0.6, 1.2), xlabel=f"Position from {boundary} boundary (bp)")
+        prof.set(ylabel="Mean power" if s == 0 else "", ylim=(0.6, 1.2), xlabel=f"Position from {boundary} boundary (bp)")  # FIXHERE!!!
         for p in (ax, prof):
             p.set_xticks((-ABS_RADIUS, 0, ABS_RADIUS), (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"), fontsize=8)
             p.set_xlim(ext[:2])
@@ -654,7 +663,7 @@ class CwtPlotter:
             names = [n for n in names if n not in rep_names]
         if not names:
             return []
-        if any(k in n for n in names for k in ("exon-kmer", "control-aggt")):
+        if any(k in n for n in names for k in ("exon-kmer", "control-aggt", "control-gtag")):
             genome.load_sequences(fasta)
 
         exons = genome.exon_sets["exons"]
@@ -682,19 +691,23 @@ class CwtPlotter:
                 cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
             else:
                 group = name.removesuffix("-mutated")
-                base_group, repeat_free, aggt = group.removesuffix("-no-repeat"), group.endswith("-no-repeat"), name.startswith("control-aggt")
-                for rep in range(1, CONTROL_REPLICATES + 1) if aggt else (0,):
-                    sub_out = out_dir / f"replicate-{rep}" if aggt else out_dir
+                base_group, repeat_free = group.removesuffix("-no-repeat"), group.endswith("-no-repeat")
+                aggt, gtag = name.startswith("control-aggt"), name.startswith("control-gtag")
+                for rep in range(1, CONTROL_REPLICATES + 1) if aggt or gtag else (0,):
+                    sub_out = out_dir / f"replicate-{rep}" if aggt or gtag else out_dir
                     off = int(base_group.endswith("-p1"))
                     selected = (
-                        genome.sample_controls(args.seed + off * CONTROL_REPLICATES + rep - 1, aggt=True, length_offset=off, repeat_free=repeat_free)
+                        genome.sample_controls(args.seed + rep - 1, gtag=True, repeat_free=repeat_free)
+                        if gtag
+                        else genome.sample_controls(args.seed + off * CONTROL_REPLICATES + rep - 1, aggt=True, length_offset=off, repeat_free=repeat_free)
                         if aggt
                         else (genome.sample_controls(args.seed, repeat_free=repeat_free) if base_group == "control" else genome.exon_sets[group])
                     )
                     if not selected:
                         raise ValueError(f"No {group} features found")
-                    if repeat_free:
-                        print(f"Sampled {len(selected):,}/{len(exons):,} {group} {sub_out.name}; unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
+                    if repeat_free or gtag:
+                        total = len(genome.exon_sets["introns"] if gtag else exons)
+                        print(f"Sampled {len(selected):,}/{total:,} {group} {sub_out.name}; unmatched lengths skipped after 200 attempts", file=sys.stderr, flush=True)
                     queue_abs(exons_agg if (group == "exons" and exons_agg is not None) else cwt.aggregate_boundaries(selected, args.rows), len(selected), sub_out)
         return abs_tasks
 
