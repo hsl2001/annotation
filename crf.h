@@ -294,7 +294,7 @@ static void emission_accumulate(double *values, const Site *site, int state, dou
 
 typedef struct {
   Site *sites;
-  double *exp_psi, *alpha;
+  double *psi, *log_norm, *log_alpha;
   int capacity;
 } Work;
 
@@ -466,18 +466,45 @@ static int gold_path_valid(const Contig *c) {
 
 static void work_ensure(Work *k, int length) {
   if (length <= k->capacity) return;
-  free(k->sites), free(k->exp_psi), free(k->alpha);
+  free(k->sites), free(k->psi), free(k->log_norm), free(k->log_alpha);
   k->sites = anno_alloc((size_t)length, sizeof(Site));
-  k->exp_psi = anno_alloc((size_t)length, (size_t)ntrans * sizeof(double));
-  k->alpha = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(double));
+  k->psi = anno_alloc((size_t)length, (size_t)ntrans * sizeof(double));
+  k->log_norm = anno_alloc((size_t)length, sizeof(double));
+  k->log_alpha = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(double));
   k->capacity = length;
 }
 
 static void work_free(Work *k) {
-  free(k->sites), free(k->exp_psi), free(k->alpha);
+  free(k->sites), free(k->psi), free(k->log_norm), free(k->log_alpha);
 }
 
-/* Accumulates the exact observed-minus-expected gradient for one training window. */
+static inline int forward_edge_allowed(const double *prev_log_alpha, const HiddenEdge *step,
+                                       int last) {
+  return prev_log_alpha[step->previous] > -INFINITY &&
+         (!last || terminal_allowed(step->current));
+}
+
+/* Normalizes unnormalized log-forward scores in place and returns their log-sum-exp. */
+static double normalize_log_alpha(double *log_alpha, int position) {
+  double max_score = -INFINITY;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    if (log_alpha[hidden] > max_score) max_score = log_alpha[hidden];
+  if (!isfinite(max_score)) anno_fail("Invalid CRF partition at position %d", position + 1);
+  double sum = 0;
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    if (log_alpha[hidden] > -INFINITY) sum += exp(log_alpha[hidden] - max_score);
+  double log_norm = max_score + log(sum);
+  if (!isfinite(log_norm)) anno_fail("Invalid CRF partition at position %d", position + 1);
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) log_alpha[hidden] -= log_norm;
+  return log_norm;
+}
+
+/*
+ * Accumulates the exact observed-minus-expected gradient for one training window.
+ * Forward scores are kept in log space so no reachable state underflows to zero, and the
+ * backward pass uses P(prev, cur) = P(cur) * exp(log_alpha[prev] + psi - log_norm - log_alpha[cur]),
+ * whose exponent is never positive, so posteriors stay in [0, 1] for arbitrarily sharp weights.
+ */
 static double contig_gradient(const double *w, const Contig *c,
                               Work *k, double *gradient) {
   work_ensure(k, c->length);
@@ -485,86 +512,59 @@ static double contig_gradient(const double *w, const Contig *c,
   site_stream_init(&stream, c, 0);
   double logz = 0, gold_score = 0;
   for (int position = 0; position < c->length; position++) {
-    double emissions[STATES], psi[STATES * STATES];
+    double emissions[STATES];
+    double *psi = k->psi + (size_t)position * ntrans;
     Site site = site_scores_stream(w, &stream, position, emissions, psi);
     k->sites[position] = site;
     int gold_state = c->label[c->offset + position];
     gold_score += emissions[gold_state];
 
-    double *A = k->alpha + (size_t)position * HIDDEN_STATES;
+    double *L = k->log_alpha + (size_t)position * HIDDEN_STATES;
     if (!position) {
-      double max_e = -INFINITY;
       for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-        if (initial_allowed(site.nuc, hidden) &&
-            (c->length > 1 || terminal_allowed(hidden))) {
-          double e = emissions[hidden_state[hidden]];
-          if (e > max_e) max_e = e;
-        }
-      if (!isfinite(max_e)) anno_fail("Invalid CRF partition at position %d", position + 1);
-      double sum = 0;
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
-        double v = initial_allowed(site.nuc, hidden) &&
-                   (c->length > 1 || terminal_allowed(hidden))
-          ? exp(emissions[hidden_state[hidden]] - max_e) : 0.0;
-        A[hidden] = v;
-        sum += v;
-      }
-      if (!(sum > 0) || !isfinite(sum)) anno_fail("Invalid CRF partition at position %d", position + 1);
-      double inv = 1.0 / sum;
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] *= inv;
-      logz += max_e + log(sum);
+        L[hidden] = initial_allowed(site.nuc, hidden) &&
+                    (c->length > 1 || terminal_allowed(hidden))
+          ? emissions[hidden_state[hidden]] : -INFINITY;
     } else {
       int prev_gold = c->label[c->offset + position - 1];
       int gold_edge = pair_to_edge[prev_gold][gold_state];
       if (gold_edge < 0) anno_fail("Invalid transition in validated CRF training path");
       gold_score += psi[gold_edge] - emissions[gold_state];
 
-      const double *prev_A = A - HIDDEN_STATES;
+      const double *prev_L = L - HIDDEN_STATES;
       const HiddenEdge *edges = hidden_edges[site.nuc];
       int edge_count = hidden_edge_count[site.nuc];
       int last = position == c->length - 1;
-      double max_psi = -INFINITY;
+      double incoming_sum[HIDDEN_STATES] = {0};
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) L[hidden] = -INFINITY;
       for (int edge = 0; edge < edge_count; edge++) {
         const HiddenEdge *step = edges + edge;
-        if (prev_A[step->previous] > 0.0 && (!last || terminal_allowed(step->current))) {
-          double p = psi[step->transition];
-          if (p > max_psi) max_psi = p;
-        }
+        if (!forward_edge_allowed(prev_L, step, last)) continue;
+        double score = prev_L[step->previous] + psi[step->transition];
+        if (score > L[step->current]) L[step->current] = score;
       }
-      if (!isfinite(max_psi))
-        anno_fail("Invalid CRF partition at position %d", position + 1);
-
-      double *ep = k->exp_psi + (size_t)position * ntrans;
-      for (int edge = 0; edge < ntrans; edge++)
-        ep[edge] = psi[edge] > max_psi ? 0.0 : exp(psi[edge] - max_psi);
-
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] = 0.0;
       for (int edge = 0; edge < edge_count; edge++) {
         const HiddenEdge *step = edges + edge;
-        if (prev_A[step->previous] > 0.0 && (!last || terminal_allowed(step->current)))
-          A[step->current] += prev_A[step->previous] * ep[step->transition];
+        if (!forward_edge_allowed(prev_L, step, last)) continue;
+        incoming_sum[step->current] +=
+          exp(prev_L[step->previous] + psi[step->transition] - L[step->current]);
       }
-
-      double sum = 0;
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) sum += A[hidden];
-      if (!(sum > 0) || !isfinite(sum))
-        anno_fail("Invalid CRF partition at position %d", position + 1);
-      double inv = 1.0 / sum;
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) A[hidden] *= inv;
-      for (int edge = 0; edge < ntrans; edge++) ep[edge] *= inv;
-      logz += max_psi + log(sum);
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        if (L[hidden] > -INFINITY) L[hidden] += log(incoming_sum[hidden]);
     }
+    k->log_norm[position] = normalize_log_alpha(L, position);
+    logz += k->log_norm[position];
   }
 
   double likelihood = gold_score - logz;
   double B[HIDDEN_STATES];
-  const double *last_A = k->alpha + (size_t)(c->length - 1) * HIDDEN_STATES;
+  const double *last_L = k->log_alpha + (size_t)(c->length - 1) * HIDDEN_STATES;
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-    B[hidden] = last_A[hidden];
+    B[hidden] = exp(last_L[hidden]);
 
   for (int position = c->length - 1; position >= 0; position--) {
     const Site *site = k->sites + position;
-    const double *A = k->alpha + (size_t)position * HIDDEN_STATES;
+    const double *L = k->log_alpha + (size_t)position * HIDDEN_STATES;
     int state = c->label[c->offset + position];
 
     double state_marginals[STATES] = {0};
@@ -576,14 +576,12 @@ static double contig_gradient(const double *w, const Contig *c,
       emission_accumulate(gradient, site, st, -state_marginals[st]);
 
     if (position) {
-      const double *prev_A = A - HIDDEN_STATES;
-      const double *ep = k->exp_psi + (size_t)position * ntrans;
+      const double *prev_L = L - HIDDEN_STATES;
+      const double *psi = k->psi + (size_t)position * ntrans;
+      double log_norm = k->log_norm[position];
+      int last = position == c->length - 1;
       int previous_state = c->label[c->offset + position - 1];
       int gold_edge = pair_to_edge[previous_state][state];
-
-      double ratio[HIDDEN_STATES];
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-        ratio[hidden] = A[hidden] > 0.0 && B[hidden] > 0.0 ? B[hidden] / A[hidden] : 0.0;
 
       double edge_marginals[STATES * STATES] = {0};
       double B_prev[HIDDEN_STATES] = {0};
@@ -591,17 +589,17 @@ static double contig_gradient(const double *w, const Contig *c,
       int edge_count = hidden_edge_count[site->nuc];
       for (int edge = 0; edge < edge_count; edge++) {
         const HiddenEdge *step = edges + edge;
-        double r = ratio[step->current];
-        if (r > 0.0 && prev_A[step->previous] > 0.0) {
-          double edge_prob = prev_A[step->previous] * ep[step->transition] * r;
-          B_prev[step->previous] += edge_prob;
-          edge_marginals[step->transition] += edge_prob;
-        }
+        if (!(B[step->current] > 0.0) || !forward_edge_allowed(prev_L, step, last)) continue;
+        double edge_prob = B[step->current] *
+          exp(prev_L[step->previous] + psi[step->transition] - log_norm - L[step->current]);
+        B_prev[step->previous] += edge_prob;
+        edge_marginals[step->transition] += edge_prob;
       }
       double sum_b = 0;
       for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) sum_b += B_prev[hidden];
-      double inv_b = sum_b > 0.0 ? 1.0 / sum_b : 0.0;
-      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) B[hidden] = B_prev[hidden] * inv_b;
+      if (!(sum_b > 0.0) || !isfinite(sum_b))
+        anno_fail("Invalid CRF posterior at position %d", position + 1);
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) B[hidden] = B_prev[hidden] / sum_b;
 
       double b_coeff[4][2] = {{0}};
       int has_boundary = 0;

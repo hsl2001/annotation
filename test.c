@@ -389,35 +389,32 @@ static void dp_extract_marginals(const double *w, const Contig *c,
   memset(edge_marg, 0, sizeof(double) * BF_MAX_T * STATES * STATES);
 
   double B[HIDDEN_STATES];
-  const double *last_A = work.alpha + (size_t)(c->length - 1) * HIDDEN_STATES;
-  for (int h = 0; h < HIDDEN_STATES; h++) B[h] = last_A[h];
+  const double *last_L = work.log_alpha + (size_t)(c->length - 1) * HIDDEN_STATES;
+  for (int h = 0; h < HIDDEN_STATES; h++) B[h] = exp(last_L[h]);
 
   for (int pos = c->length - 1; pos >= 0; pos--) {
     const Site *site = work.sites + pos;
-    const double *A = work.alpha + (size_t)pos * HIDDEN_STATES;
+    const double *L = work.log_alpha + (size_t)pos * HIDDEN_STATES;
     for (int h = 0; h < HIDDEN_STATES; h++)
       node_marg[pos][hidden_state[h]] += B[h];
 
     if (pos > 0) {
-      const double *prev_A = A - HIDDEN_STATES;
-      const double *ep = work.exp_psi + (size_t)pos * ntrans;
-      double ratio[HIDDEN_STATES];
-      for (int h = 0; h < HIDDEN_STATES; h++)
-        ratio[h] = A[h] > 0.0 && B[h] > 0.0 ? B[h] / A[h] : 0.0;
-
+      const double *prev_L = L - HIDDEN_STATES;
+      const double *psi = work.psi + (size_t)pos * ntrans;
+      double log_norm = work.log_norm[pos];
+      int last = pos == c->length - 1;
       double B_prev[HIDDEN_STATES] = {0};
       const HiddenEdge *edges = hidden_edges[site->nuc];
       int edge_count = hidden_edge_count[site->nuc];
       for (int e = 0; e < edge_count; e++) {
         const HiddenEdge *step = edges + e;
-        double r = ratio[step->current];
-        if (r > 0.0 && prev_A[step->previous] > 0.0) {
-          double ep_prob = prev_A[step->previous] * ep[step->transition] * r;
-          B_prev[step->previous] += ep_prob;
-          int a = trans_a[step->transition];
-          int b = trans_b[step->transition];
-          edge_marg[pos][a][b] += ep_prob;
-        }
+        if (!(B[step->current] > 0.0) || !forward_edge_allowed(prev_L, step, last)) continue;
+        double ep_prob = B[step->current] *
+          exp(prev_L[step->previous] + psi[step->transition] - log_norm - L[step->current]);
+        B_prev[step->previous] += ep_prob;
+        int a = trans_a[step->transition];
+        int b = trans_b[step->transition];
+        edge_marg[pos][a][b] += ep_prob;
       }
       double sum_b = 0.0;
       for (int h = 0; h < HIDDEN_STATES; h++) sum_b += B_prev[h];
