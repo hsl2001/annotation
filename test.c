@@ -239,12 +239,8 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
     total_score += w[e_idx];
     if (feat_accum) feat_accum[e_idx] += scale;
     int backoff_idx = OFF_E3 + emit_state(st) * K3 + site.k3_emit[st >= 7];
-    int bias_idx = OFF_EMIT_BIAS + emit_state(st);
-    total_score += w[backoff_idx] + w[bias_idx];
-    if (feat_accum) {
-      feat_accum[backoff_idx] += scale;
-      feat_accum[bias_idx] += scale;
-    }
+    total_score += w[backoff_idx];
+    if (feat_accum) feat_accum[backoff_idx] += scale;
 
     if (t > 0) {
       int prev = y[t - 1];
@@ -720,15 +716,14 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
 
   /* Verify finite differences against dp_grad across active emission, boundary_k2, CWT power, and CWT deriv weights */
   const double eps = 1e-6;
-  int checked_groups[7] = {0};
+  int checked_groups[6] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
     int group = (f < OFF_SPLICE_START_STOP) ? 0 :
                 (f < OFF_BP) ? 1 :
                 (f < OFF_BD) ? 2 :
                 (f < OFF_E3) ? 3 :
-                (f < OFF_EMIT_BIAS) ? 4 :
-                (f < OFF_PWM) ? 5 : 6;
+                (f < OFF_PWM) ? 4 : 5;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -745,7 +740,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     double fd = (ll_p - ll_m) / (2.0 * eps);
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd, dp_grad[f]);
   }
-  for (int g = 0; g < 7; g++) TEST_ASSERT(checked_groups[g] > 0);
+  for (int g = 0; g < 6; g++) TEST_ASSERT(checked_groups[g] > 0);
 
   /* Case B: Minus-strand sequence with reverse-complement stop ("TTA"), intron (10..12), and start ("CAT") */
   const char *minus_genome =

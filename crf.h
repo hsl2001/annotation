@@ -24,8 +24,7 @@ enum {
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   OFF_E3 = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
-  OFF_EMIT_BIAS = OFF_E3 + EMIT_STATES * K3,
-  OFF_PWM = OFF_EMIT_BIAS + EMIT_STATES,
+  OFF_PWM = OFF_E3 + EMIT_STATES * K3,
   WEIGHTS = OFF_PWM + 4 * BOUNDARY_PWM_COUNT * KNUC
 };
 
@@ -285,14 +284,12 @@ static int emission_backoff_index(const Site *site, int state) {
 }
 
 static double emission_score(const double *w, const Site *site, int state) {
-  return w[emission_index(site, state)] + w[emission_backoff_index(site, state)] +
-         w[OFF_EMIT_BIAS + emit_state(state)];
+  return w[emission_index(site, state)] + w[emission_backoff_index(site, state)];
 }
 
 static void emission_accumulate(double *values, const Site *site, int state, double value) {
   values[emission_index(site, state)] += value;
   values[emission_backoff_index(site, state)] += value;
-  values[OFF_EMIT_BIAS + emit_state(state)] += value;
 }
 
 typedef struct {
@@ -816,7 +813,6 @@ static void feature_scales(const CrfWindow *windows, size_t count, double *scale
       int state = c.label[c.offset + i];
       scale[emission_index(&site, state)] += 1;
       scale[emission_backoff_index(&site, state)] += 1;
-      scale[OFF_EMIT_BIAS + emit_state(state)] += 1;
       if (!i) continue;
       int previous = c.label[c.offset + i - 1];
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
@@ -1139,10 +1135,6 @@ void crf_save_weights_text(const char *path, const double *w) {
       fprintf(file, "%d\temit_k3\t%s\tk3=%s\t%.9g\n",
               idx, state_names[s], kbuf, (float)w[idx]);
     }
-  for (int s = 0; s < EMIT_STATES; s++) {
-    int idx = OFF_EMIT_BIAS + s;
-    fprintf(file, "%d\temit_bias\t%s\tbias\t%.9g\n", idx, state_names[s], (float)w[idx]);
-  }
   for (int kind = 0; kind < 4; kind++)
     for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++)
       for (int b = 0; b < KNUC; b++) {
