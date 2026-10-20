@@ -1262,9 +1262,9 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   /* Unregularized sum over windows via contig_gradient_f1 */
   Work wk = {0};
   double ll_sum = 0.0, f1_sum = 0.0, f1_part = 0.0;
-  ll_sum += contig_gradient_f1(w, &contigs[0], &wk, grad_unreg, CRF_F1_WEIGHT, &f1_part);
+  ll_sum += contig_gradient_f1(w, &contigs[0], &wk, grad_unreg, CRF_F1_BASE_WEIGHT, &f1_part);
   f1_sum += f1_part;
-  ll_sum += contig_gradient_f1(w, &contigs[1], &wk, grad_unreg, CRF_F1_WEIGHT, &f1_part);
+  ll_sum += contig_gradient_f1(w, &contigs[1], &wk, grad_unreg, CRF_F1_BASE_WEIGHT, &f1_part);
   f1_sum += f1_part;
   work_free(&wk);
 
@@ -1335,9 +1335,10 @@ static void test_crf_soft_f1_loss_and_gradient(void) {
         }
     }
     double f1_weight = 0.25;
-    double expected_f1 = gold_pos > 0.0
-      ? f1_weight * gold_pos * (1.0 - 2.0 * tp / (pred_pos + gold_pos))
-      : f1_weight * pred_pos;
+    double s = w[OFF_F1_WEIGHT];
+    double base_scale = gold_pos > 0.0 ? f1_weight * gold_pos : f1_weight;
+    double raw_loss = gold_pos > 0.0 ? 1.0 - 2.0 * tp / (pred_pos + gold_pos) : pred_pos;
+    double expected_f1 = base_scale * (exp(-s) * raw_loss + CRF_F1_TARGET_LOSS * exp(s));
 
     Work wk = {0};
     double grad_nll[WEIGHTS] = {0}, grad_total[WEIGHTS] = {0}, f1_loss = -1.0;
@@ -2388,7 +2389,8 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
         if (s == gold[t]) tp0 += bf0.node_marginals[t][s];
       }
   }
-  double f1_0 = CRF_F1_WEIGHT * gold_pos0 * (1.0 - 2.0 * tp0 / (pred0 + gold_pos0));
+  double f1_0 = CRF_F1_BASE_WEIGHT * gold_pos0 *
+                ((1.0 - 2.0 * tp0 / (pred0 + gold_pos0)) + CRF_F1_TARGET_LOSS);
   TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf0.logz - gold_s0 + f1_0, loss0);
 
   /* Step 2: Optimize CRF objective with L-BFGS (crf_train) */

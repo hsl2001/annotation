@@ -5,7 +5,8 @@
 #include <stdint.h>
 
 #define CRF_L2_C2 1.0
-#define CRF_F1_WEIGHT 0.05
+#define CRF_F1_BASE_WEIGHT 0.03
+#define CRF_F1_TARGET_LOSS 0.25
 #define CRF_MIN_FREQ 1
 
 static const int boundary_kmer_offsets[] = {-8, -7, -6, -5, -4, -3, -2, -1,
@@ -25,7 +26,8 @@ enum {
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   OFF_PWM = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
   OFF_TRANSITION = OFF_PWM + 4 * BOUNDARY_PWM_COUNT * KNUC,
-  WEIGHTS = OFF_TRANSITION + TRANSITION_FEATURES
+  OFF_F1_WEIGHT = OFF_TRANSITION + TRANSITION_FEATURES,
+  WEIGHTS = OFF_F1_WEIGHT + 1
 };
 
 void crf_init(void);
@@ -804,14 +806,18 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
       pred_pos += B[hidden] * last_Ap[hidden];
       tp += B[hidden] * last_At[hidden];
     }
+    double s = w[OFF_F1_WEIGHT], exp_s = exp(s), exp_neg_s = exp(-s);
+    double denom = pred_pos + gold_pos;
+    double base_scale = gold_pos > 0.0 ? f1_weight * gold_pos : f1_weight;
+    double raw_loss = gold_pos > 0.0 ? 1.0 - 2.0 * tp / denom : pred_pos;
+    double scale = base_scale * exp_neg_s;
+    *f1_loss = scale * raw_loss + base_scale * CRF_F1_TARGET_LOSS * exp_s;
+    gradient[OFF_F1_WEIGHT] -= base_scale * (CRF_F1_TARGET_LOSS * exp_s - exp_neg_s * raw_loss);
     if (gold_pos > 0.0) {
-      double denom = pred_pos + gold_pos, scale = f1_weight * gold_pos;
-      *f1_loss = scale * (1.0 - 2.0 * tp / denom);
       c_pred = 2.0 * scale * tp / (denom * denom);
       c_tp = -2.0 * scale / denom;
     } else {
-      *f1_loss = f1_weight * pred_pos;
-      c_pred = f1_weight;
+      c_pred = scale;
     }
     r_bar = c_pred * pred_pos + c_tp * tp;
   } else if (f1_loss) {
@@ -955,7 +961,7 @@ static void *crf_worker(void *arg) {
     instance.length = window->length;
     double f1 = 0;
     double score = contig_gradient_f1(worker->w, &instance, &worker->work,
-                                      worker->gradient, CRF_F1_WEIGHT, &f1);
+                                      worker->gradient, CRF_F1_BASE_WEIGHT, &f1);
     if (!isfinite(score) || !isfinite(f1)) anno_fail("Non-finite training likelihood");
     worker->likelihood += score;
     worker->f1_loss += f1;
@@ -1048,6 +1054,8 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
       int state = y[i];
       for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
         feature_observe(NULL, scale, freq, emission_index(&site, layer, state), 1, 1);
+      if (is_cds(state))
+        feature_observe(NULL, scale, freq, OFF_F1_WEIGHT, 1, CRF_F1_BASE_WEIGHT);
       if (!i) continue;
       int edge = path_edge(y, c.length, i);
       if (edge < 0) anno_fail("Invalid transition in validated CRF training path");
@@ -1076,7 +1084,8 @@ static const struct {
   {"boundary_cwt_power", OFF_BP, OFF_BD},
   {"boundary_cwt_deriv", OFF_BD, OFF_PWM},
   {"boundary_pwm", OFF_PWM, OFF_TRANSITION},
-  {"transition", OFF_TRANSITION, WEIGHTS}
+  {"transition", OFF_TRANSITION, OFF_F1_WEIGHT},
+  {"f1_weight", OFF_F1_WEIGHT, WEIGHTS}
 };
 enum { FEATURE_GROUPS = sizeof(feature_groups) / sizeof(feature_groups[0]) };
 
@@ -1408,6 +1417,9 @@ void crf_save_weights_text(const char *path, const double *w) {
     fprintf(file, "%d\ttransition\t%s\tbias\t%.9g\n",
             idx, transition_names[transition], (float)w[idx]);
   }
+  if ((float)w[OFF_F1_WEIGHT])
+    fprintf(file, "%d\tf1_weight\tCDS\tlog_scale\t%.9g\n",
+            OFF_F1_WEIGHT, (float)w[OFF_F1_WEIGHT]);
 
   if (fclose(file)) anno_fail("Cannot finish writing weights text: %s", path);
 }
