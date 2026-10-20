@@ -12,7 +12,7 @@
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
 #define MIN_CDS 12
-#define DEFAULT_ITERATIONS 100
+#define DEFAULT_ITERATIONS 300
 
 typedef struct {
    double _Complex *kernel[WAVE_COUNT];
