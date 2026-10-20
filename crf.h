@@ -201,7 +201,8 @@ static void cwt_at_pos(const Contig *c, int g, float *power,
       double value = 0;
       if (valid)
         for (int j = -DERIV_RADIUS; j <= DERIV_RADIUS; j++)
-          value += kernel[j + DERIV_RADIUS] * c->cwt_power[(size_t)(g + j) * WAVE_COUNT + scale];
+          if (kernel[j + DERIV_RADIUS])
+            value += kernel[j + DERIV_RADIUS] * c->cwt_power[(size_t)(g + j) * WAVE_COUNT + scale];
       derivative[slot][scale] = value;
     }
   }
