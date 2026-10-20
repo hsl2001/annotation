@@ -31,8 +31,9 @@ awk -F '\t' '
       failed = 1
       exit 1
     }
-    if ($1 != rows || seen_index[$1]++) {
-      printf "Unexpected or duplicate feature index at line %d\n", NR > "/dev/stderr"
+    # Sparse exports omit zero weights, so indices need not be consecutive.
+    if (seen_index[$1 + 0]++) {
+      printf "Duplicate feature index at line %d\n", NR > "/dev/stderr"
       failed = 1
       exit 1
     }
