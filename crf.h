@@ -15,10 +15,10 @@ enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
   STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
-  K2 = 17, K5 = 1025, KNUC = 5,
+  K2 = 17, K6 = 4097, KNUC = 5,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0]),
-  OFF_E5 = 0, OFF_SPLICE_START_STOP = OFF_E5 + EMIT_STATES * K5,
+  OFF_E6 = 0, OFF_SPLICE_START_STOP = OFF_E6 + EMIT_STATES * K6,
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT
@@ -41,7 +41,7 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <string.h>
 
 typedef struct {
-  uint16_t k5_emit[2];
+  uint16_t k6_emit[2];
   uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
 } Site;
 
@@ -55,7 +55,7 @@ typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
 static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
 static int hidden_edge_count[KNUC];
 static uint8_t rev_k2[K2];
-static uint16_t rev_k5[K5];
+static uint16_t rev_k6[K6];
 
 static int kmer(const char *seq, int length, int from, int size, int reverse) {
   int code = 0;
@@ -72,8 +72,8 @@ static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
   Site s = {
-    .k5_emit = {kmer(c->seq, c->genome_length, position - 2, 5, 0),
-                kmer(c->seq, c->genome_length, position - 2, 5, 1)},
+    .k6_emit = {kmer(c->seq, c->genome_length, position - 2, 6, 0),
+                kmer(c->seq, c->genome_length, position - 2, 6, 1)},
     .nuc = base < 0 ? 4 : base
   };
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
@@ -236,15 +236,15 @@ void crf_init(void) {
   for (int k = 0; k < 16; k++)
     rev_k2[k] = (uint8_t)(((3 - (k & 3)) << 2) | (3 - ((k >> 2) & 3)));
   rev_k2[16] = 16;
-  for (int k = 0; k < 1024; k++) {
+  for (int k = 0; k < 4096; k++) {
     int r = 0, tmp = k;
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 6; i++) {
       r = (r << 2) | (3 - (tmp & 3));
       tmp >>= 2;
     }
-    rev_k5[k] = (uint16_t)r;
+    rev_k6[k] = (uint16_t)r;
   }
-  rev_k5[1024] = 1024;
+  rev_k6[4096] = 4096;
 }
 
 static int emit_state(int state) {
@@ -253,7 +253,7 @@ static int emit_state(int state) {
 }
 
 static int emission_index(const Site *site, int state) {
-  return OFF_E5 + emit_state(state) * K5 + site->k5_emit[state >= 7];
+  return OFF_E6 + emit_state(state) * K6 + site->k6_emit[state >= 7];
 }
 
 typedef struct {
@@ -272,8 +272,8 @@ typedef struct {
   uint8_t nuc_ring[64];
   uint8_t k2_ring[64];
   CwtCached cwt_ring[64];
-  uint16_t k5_fwd;
-  int k5_valid_run;
+  uint16_t k6_fwd;
+  int k6_valid_run;
 } SiteStream;
 
 static inline void site_stream_fill_cwt(SiteStream *s, int g) {
@@ -316,15 +316,15 @@ static void site_stream_init(SiteStream *s, const Contig *c, int start_position)
     uint8_t b0 = s->nuc_ring[g & 63], b1 = s->nuc_ring[(g + 1) & 63];
     s->k2_ring[g & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
   }
-  s->k5_fwd = 0;
-  s->k5_valid_run = 0;
-  for (int g = g_start - 2; g <= g_start + 1; g++) {
+  s->k6_fwd = 0;
+  s->k6_valid_run = 0;
+  for (int g = g_start - 2; g <= g_start + 2; g++) {
     uint8_t b = s->nuc_ring[g & 63];
     if (b < 4) {
-      s->k5_fwd = (uint16_t)(((s->k5_fwd << 2) | b) & 1023);
-      s->k5_valid_run++;
+      s->k6_fwd = (uint16_t)(((s->k6_fwd << 2) | b) & 4095);
+      s->k6_valid_run++;
     } else {
-      s->k5_valid_run = 0;
+      s->k6_valid_run = 0;
     }
   }
   for (int g = g_start - 27; g <= g_start + 25; g++)
@@ -343,20 +343,20 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
   uint8_t b0 = s->nuc_ring[g_k2 & 63], b1 = s->nuc_ring[(g_k2 + 1) & 63];
   s->k2_ring[g_k2 & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
 
-  uint8_t b_k5 = s->nuc_ring[(g0 + 2) & 63];
-  if (b_k5 < 4) {
-    s->k5_fwd = (uint16_t)(((s->k5_fwd << 2) | b_k5) & 1023);
-    s->k5_valid_run++;
+  uint8_t b_k6 = s->nuc_ring[(g0 + 3) & 63];
+  if (b_k6 < 4) {
+    s->k6_fwd = (uint16_t)(((s->k6_fwd << 2) | b_k6) & 4095);
+    s->k6_valid_run++;
   } else {
-    s->k5_valid_run = 0;
+    s->k6_valid_run = 0;
   }
   site_stream_fill_cwt(s, g0 + 26);
 
   Site site;
   site.nuc = s->nuc_ring[g0 & 63];
-  uint16_t k5 = s->k5_valid_run >= 5 ? s->k5_fwd : 1024;
-  site.k5_emit[0] = k5;
-  site.k5_emit[1] = rev_k5[k5];
+  uint16_t k6 = s->k6_valid_run >= 6 ? s->k6_fwd : 4096;
+  site.k6_emit[0] = k6;
+  site.k6_emit[1] = rev_k6[k6];
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
     uint8_t k2f = s->k2_ring[(g0 + boundary_kmer_offsets[offset]) & 63];
     site.boundary_k2[0][offset] = k2f;
@@ -1038,12 +1038,12 @@ void crf_save_weights_text(const char *path, const double *w) {
   if (!file) anno_fail("Cannot write weights text: %s", path);
   fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
 
-  char kbuf[6];
+  char kbuf[7];
   for (int s = 0; s < EMIT_STATES; s++) {
-    for (int k = 0; k < K5; k++) {
-      int idx = OFF_E5 + s * K5 + k;
-      format_kmer(k, 5, kbuf);
-      fprintf(file, "%d\temit_k5\t%s\tk5=%s\t%.9g\n",
+    for (int k = 0; k < K6; k++) {
+      int idx = OFF_E6 + s * K6 + k;
+      format_kmer(k, 6, kbuf);
+      fprintf(file, "%d\temit_k6\t%s\tk6=%s\t%.9g\n",
               idx, state_names[s], kbuf, (float)w[idx]);
     }
   }

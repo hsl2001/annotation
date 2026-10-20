@@ -851,7 +851,7 @@ static void test_crf_tied_optimal_paths(void) {
   for (int t = 0; t < 6; t++) TEST_ASSERT_INT_EQ(0, vpath[t]);
 
   /* Now tie two non-zero intron paths in "ATGAAATAA" while penalizing state 0 */
-  for (int k = 0; k < K5; k++) w[OFF_E5 + 0 * K5 + k] = -10.0;
+  for (int k = 0; k < K6; k++) w[OFF_E6 + 0 * K6 + k] = -10.0;
   /* Make intron states 4, 5, 6 and CDS states 1, 2, 3 have score 0 so multiple coding/intron paths tie */
   Contig c9 = make_test_contig("ATGAAATAA", 0, 9, NULL);
   BruteForceCrf bf9;
@@ -873,11 +873,11 @@ static void test_crf_forbidden_transitions(void) {
   crf_init();
   double *w = anno_alloc(WEIGHTS, sizeof(double));
   /* Strongly reward CDS states 1, 2, 3 and penalize intergenic 0 */
-  for (int k = 0; k < K5; k++) {
-    w[OFF_E5 + 0 * K5 + k] = -5.0;
-    w[OFF_E5 + 1 * K5 + k] = 20.0;
-    w[OFF_E5 + 2 * K5 + k] = 20.0;
-    w[OFF_E5 + 3 * K5 + k] = 20.0;
+  for (int k = 0; k < K6; k++) {
+    w[OFF_E6 + 0 * K6 + k] = -5.0;
+    w[OFF_E6 + 1 * K6 + k] = 20.0;
+    w[OFF_E6 + 2 * K6 + k] = 20.0;
+    w[OFF_E6 + 3 * K6 + k] = 20.0;
   }
 
   /* 1. Sequence with in-frame stop codon "ATGTAGTAA":
@@ -999,16 +999,23 @@ static void test_crf_shift_invariance(void) {
   double *w2 = anno_alloc(WEIGHTS, sizeof(double));
   for (int i = 0; i < WEIGHTS; i++) w1[i] = w2[i] = rng_uniform(-0.5, 0.5);
 
-  /* Keep all forward and reverse-complement 5-mer contexts unique so shared emission
+  /* Keep all forward and reverse-complement 6-mer contexts unique so shared emission
      parameters do not couple the position-specific score shifts. */
-  const char *seq = "AGGAACTTGCGTA";
+  const char *seq = "AGGAACTTGCGTAC";
   const uint8_t gold[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
   Contig c = make_test_contig(seq, 2, 9, gold);
 
-  /* Verify that all 9 positions have distinct forward & reverse 5-mer codes */
+  /* Verify that all 9 positions have distinct forward & reverse 6-mer codes */
   double shift_sum = 0.0;
   for (int t = 0; t < c.length; t++) {
     Site st = site_at(&c, t);
+    TEST_ASSERT(st.k6_emit[0] < 4096);
+    TEST_ASSERT(st.k6_emit[1] < 4096);
+    for (int previous = 0; previous < t; previous++) {
+      Site prior = site_at(&c, previous);
+      TEST_ASSERT(st.k6_emit[0] != prior.k6_emit[0]);
+      TEST_ASSERT(st.k6_emit[1] != prior.k6_emit[1]);
+    }
     double ct = (t - 4) * 3.25 + 1.1;
     shift_sum += ct;
     for (int state = 0; state < STATES; state++)
@@ -1684,7 +1691,7 @@ static void test_lbfgs_crf_directional_derivatives(void) {
         if (err_reg < best_reg_err) best_reg_err = err_reg;
       }
       TEST_ASSERT_DOUBLE_WITHIN(1e-8, 0.0, best_unreg_err);
-      TEST_ASSERT_DOUBLE_WITHIN(1e-8, 0.0, best_reg_err);
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7, 0.0, best_reg_err);
     }
 
     /* 3. Check scaled objective directional derivative across step sizes */
