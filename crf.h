@@ -7,20 +7,13 @@
 #define CRF_L2_C2 1.0
 #define CRF_MIN_FREQ 1
 
-/* Linear-chain CRF decoded jointly for both strands with strand-shared emissions.
-   0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
-   next exon base; 7-9 CDS(-) codon position; 10-12 intron(-).
-   Seven phase-independent transition biases are strand-shared in transcript direction:
-   intergenic->intergenic, intergenic->CDS, CDS->intergenic, CDS->CDS,
-   CDS->intron, intron->CDS, intron->intron. No bias is applied at the first base.
-   Adding these weights changes the model layout; older models require retraining. */
 static const int boundary_kmer_offsets[] = {-8, -7, -6, -5, -4, -3, -2, -1,
                                            0, 1, 2, 3, 4, 5, 6};
 static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1, 2};
 enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
-  STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39, TRANSITION_FEATURES = 7,
+  STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 137, TRANSITION_FEATURES = 21,
   K2 = 17, K3 = 65, KNUC = 5, EMIT_KMER_LAYERS = 1,
   BOUNDARY_PWM_FROM = -24, BOUNDARY_PWM_COUNT = 33,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
@@ -60,12 +53,13 @@ typedef struct {
   uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
 } Site;
 
-static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 24, 29, 33, 38};
-static const int hidden_counts[STATES] = {1, 3, 4, 2, 1, 3, 4, 2, 4, 5, 4, 5, 1};
+static const int hidden_offsets[STATES] = {0, 1, 5, 11, 14, 19, 39, 69, 72, 76, 82, 102, 132};
+static const int hidden_counts[STATES] = {1, 4, 6, 3, 5, 20, 30, 3, 4, 6, 20, 30, 5};
 static int trans_a[STATES * STATES], trans_b[STATES * STATES], ntrans;
-static int edge_rev[STATES * STATES], edge_kind[STATES * STATES];
+static int edge_rev[STATES * STATES], edge_kind[STATES * STATES], edge_trans[STATES * STATES];
 static int pair_to_edge[STATES][STATES];
 static uint8_t hidden_state[HIDDEN_STATES], hidden_context[HIDDEN_STATES];
+static uint8_t hidden_motif[HIDDEN_STATES], hidden_sub[HIDDEN_STATES];
 typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
 static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
 static int hidden_edge_count[KNUC];
@@ -121,18 +115,60 @@ static int boundary_kind(int previous, int current) {
   return -1;
 }
 
-static int transition_index(int previous, int current) {
-  static const int indices[3][3] = {{0, 1, -1}, {2, 3, 4}, {-1, 5, 6}};
-  int a = previous == 0 ? 0 : (previous - 1) % 6 < 3 ? 1 : 2;
-  int b = current == 0 ? 0 : (current - 1) % 6 < 3 ? 1 : 2;
-  if (previous >= 7 || current >= 7) {
-    int swap = a;
-    a = b;
-    b = swap;
+static int motif_transition_try(int prev_motif, int cur_motif, int reverse) {
+  static const int indices[7][7] = {
+    { 0,  1, -1, -1, -1, -1, -1},
+    {-1,  2,  3,  4,  5, -1, -1},
+    {-1, -1,  6,  7,  8, -1, -1},
+    {10, -1, -1,  9, 11, -1, -1},
+    {-1, -1, -1, -1, 12, 13, 14},
+    {-1, -1, -1, -1, -1, 15, 16},
+    {-1, 18, 19, 20, -1, -1, 17}
+  };
+  if (reverse) {
+    int swap = prev_motif;
+    prev_motif = cur_motif;
+    cur_motif = swap;
   }
-  int index = indices[a][b];
-  if (index < 0) anno_fail("Invalid CRF transition feature: %d -> %d", previous, current);
-  return OFF_TRANSITION + index;
+  if (prev_motif < 0 || prev_motif >= 7 || cur_motif < 0 || cur_motif >= 7) return -1;
+  int index = indices[prev_motif][cur_motif];
+  return index < 0 ? -1 : OFF_TRANSITION + index;
+}
+
+static int motif_transition_index(int prev_motif, int cur_motif, int reverse) {
+  int trans = motif_transition_try(prev_motif, cur_motif, reverse);
+  if (trans < 0)
+    anno_fail("Invalid CRF transition feature: %d -> %d", prev_motif, cur_motif);
+  return trans;
+}
+
+static int motif_at(const uint8_t *y, int length, int i) {
+  int st = y[i];
+  if (!st) return 0;
+  if ((st >= 4 && st <= 6) || st >= 10) {
+    int dl = (i == 0 || y[i - 1] != st) ? 0 : (i == 1 || y[i - 2] != st) ? 1 : 2;
+    int dr = (i + 1 == length || y[i + 1] != st) ? 0 :
+             (i + 2 == length || y[i + 2] != st) ? 1 : 2;
+    return st <= 6
+      ? (dl == 0 ? 4 : dr == 0 ? 6 : dl == 1 ? 4 : dr == 1 ? 6 : 5)
+      : (dr == 0 ? 4 : dl == 0 ? 6 : dr == 1 ? 4 : dl == 1 ? 6 : 5);
+  }
+  if (st <= 3) {
+    int p = i;
+    while (p > 0 && y[p] != 1) p--;
+    if (p == 0 || y[p - 1] == 0) return 1;
+    int q = i;
+    while (q + 1 < length && y[q] != 3) q++;
+    if (q + 1 == length || y[q + 1] == 0) return 3;
+    return 2;
+  }
+  int p = i;
+  while (p > 0 && y[p] != 9) p--;
+  if (p == 0 || y[p - 1] == 0) return 3;
+  int q = i;
+  while (q + 1 < length && y[q] != 7) q++;
+  if (q + 1 == length || y[q + 1] == 0) return 1;
+  return 2;
 }
 
 static const double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1] = {
@@ -196,89 +232,249 @@ static int allowed(int a, int b) {
   return b == a || b == a - 3;
 }
 
-/* Prefix classes carry start/stop recognition through introns without adding learned features. */
-static int grammar_next(int previous, int current, int base) {
-  int state = hidden_state[previous], context = hidden_context[previous];
-  if (!allowed(state, current)) return -1;
-  if (!state) {
-    if (!current) return 0;
-    if (current == 1) return base == 0 ? hidden_offsets[1] + 2 : -1;
-    return base == 3 ? hidden_offsets[9] + 3 : base == 1 ? hidden_offsets[9] + 4 : -1;
-  }
-  if (!current)
-    return (state == 3 || state == 7) && context == 1 ? 0 : -1;
-  if (state <= 6) {
-    if (current >= 4) {
-      if (state == 3 && context == 1) return -1;
-      return hidden_offsets[current] + (current == 4 ? 0 : context);
-    }
-    if (base == 4) return -1;
-    if (current == 1) {
-      if (state == 3 && context == 1) return -1;
-      return hidden_offsets[1] + (base == 3);
-    }
-    if (current == 2) {
-      if (context == 2) return base == 3 ? hidden_offsets[2] + 3 : -1;
-      int next_context = context == 1 && base == 0 ? 1 : context == 1 && base == 2 ? 2 : 0;
-      return hidden_offsets[2] + next_context;
-    }
-    if (context == 3) return base == 2 ? hidden_offsets[3] : -1;
-    int stop = (context == 1 && (base == 0 || base == 2)) || (context == 2 && base == 0);
-    return hidden_offsets[3] + stop;
-  }
-  if (current >= 10) return hidden_offsets[current] + (current == 12 ? 0 : context);
-  if (base == 4) return -1;
-  if (current == 9)
-    return hidden_offsets[9] + (base == 3 ? 1 : base == 1 ? 2 : 0);
-  if (current == 8) {
-    if (context == 3)
-      return base == 3 || base == 1 ? hidden_offsets[8] + 3 : -1;
-    if (context == 4) return base == 3 ? hidden_offsets[8] + 3 : -1;
-    int next_context = (context == 1 && (base == 3 || base == 1)) || (context == 2 && base == 3) ? 1 :
-                       context == 2 && base == 0 ? 2 : 0;
-    return hidden_offsets[8] + next_context;
-  }
-  if (context == 3) return base == 0 ? hidden_offsets[7] : -1;
-  if (context == 1 && base == 0) return -1;
-  return hidden_offsets[7] + (context == 2 && base == 3);
-}
-
 static int initial_allowed(int base, int hidden) {
-  return grammar_next(0, hidden_state[hidden], base) == hidden;
+  return !hidden ||
+         (base == 0 && hidden == hidden_offsets[1] + 0) ||
+         (base == 3 && hidden == hidden_offsets[9] + 0) ||
+         (base == 1 && hidden == hidden_offsets[9] + 1);
 }
 
 static int terminal_allowed(int hidden) {
   int state = hidden_state[hidden];
-  return !state || ((state == 3 || state == 7) && hidden_context[hidden] == 1);
+  return !state || ((state == 3 || state == 7) && hidden_context[hidden] == 2);
+}
+
+static int find_or_add_edge(int a, int b, int trans) {
+  for (int e = 0; e < ntrans; e++)
+    if (trans_a[e] == a && trans_b[e] == b && edge_trans[e] == trans)
+      return e;
+  if (ntrans >= STATES * STATES) anno_fail("Too many CRF transition edges");
+  int e = ntrans++;
+  trans_a[e] = a;
+  trans_b[e] = b;
+  edge_rev[e] = a >= 7 || b >= 7;
+  edge_kind[e] = boundary_kind(a, b);
+  edge_trans[e] = trans;
+  if (pair_to_edge[a][b] < 0) pair_to_edge[a][b] = e;
+  return e;
+}
+
+static void add_hidden_edge(int base, int previous, int current) {
+  if (current < 0) return;
+  if (hidden_edge_count[base] >= HIDDEN_STATES * 4) anno_fail("Too many grammar transitions");
+  int a = hidden_state[previous], b = hidden_state[current];
+  if (!allowed(a, b)) anno_fail("Invalid CRF state transition: %d -> %d", a, b);
+  int reverse = a >= 7 || b >= 7;
+  int trans = motif_transition_index(hidden_motif[previous], hidden_motif[current], reverse);
+  int edge = find_or_add_edge(a, b, trans);
+  hidden_edges[base][hidden_edge_count[base]++] =
+    (HiddenEdge){(uint8_t)previous, (uint8_t)current, (uint16_t)edge};
+}
+
+static void add_coding_edges_plus(int base, int previous, int target_state, int context) {
+  if (base == 4) return;
+  if (target_state == 1) {
+    add_hidden_edge(base, previous, hidden_offsets[1] + (base == 3 ? 2 : 1));
+    if (base == 3) add_hidden_edge(base, previous, hidden_offsets[1] + 3);
+    return;
+  }
+  if (target_state == 2) {
+    if (context == 0) {
+      if (base == 3) add_hidden_edge(base, previous, hidden_offsets[2] + 0);
+    } else if (context == 1) {
+      add_hidden_edge(base, previous, hidden_offsets[2] + 1);
+    } else if (context == 2) {
+      int next = base == 0 ? 2 : base == 2 ? 3 : 1;
+      add_hidden_edge(base, previous, hidden_offsets[2] + next);
+    } else if (context == 3) {
+      if (base == 0) add_hidden_edge(base, previous, hidden_offsets[2] + 4);
+      else if (base == 2) add_hidden_edge(base, previous, hidden_offsets[2] + 5);
+    }
+    return;
+  }
+  if (context == 0) {
+    if (base == 2) add_hidden_edge(base, previous, hidden_offsets[3] + 0);
+  } else if (context == 1) {
+    add_hidden_edge(base, previous, hidden_offsets[3] + 1);
+  } else if (context == 2) {
+    if (base != 0 && base != 2) add_hidden_edge(base, previous, hidden_offsets[3] + 1);
+  } else if (context == 3) {
+    if (base != 0) add_hidden_edge(base, previous, hidden_offsets[3] + 1);
+  } else if (context == 4) {
+    if (base == 0 || base == 2) add_hidden_edge(base, previous, hidden_offsets[3] + 2);
+  } else if (context == 5) {
+    if (base == 0) add_hidden_edge(base, previous, hidden_offsets[3] + 2);
+  }
+}
+
+static void add_coding_edges_minus(int base, int previous, int target_state, int context) {
+  if (base == 4) return;
+  if (target_state == 9) {
+    int next = base == 3 ? 3 : base == 1 ? 4 : 2;
+    add_hidden_edge(base, previous, hidden_offsets[9] + next);
+    if (base == 1) add_hidden_edge(base, previous, hidden_offsets[9] + 5);
+    return;
+  }
+  if (target_state == 8) {
+    if (context == 0) {
+      if (base == 3 || base == 1) add_hidden_edge(base, previous, hidden_offsets[8] + 0);
+    } else if (context == 1) {
+      if (base == 3) add_hidden_edge(base, previous, hidden_offsets[8] + 0);
+    } else if (context == 2) {
+      add_hidden_edge(base, previous, hidden_offsets[8] + 1);
+    } else if (context == 3) {
+      add_hidden_edge(base, previous, hidden_offsets[8] + (base == 3 || base == 1 ? 2 : 1));
+    } else if (context == 4) {
+      add_hidden_edge(base, previous, hidden_offsets[8] + (base == 3 ? 2 : 1));
+    } else if (context == 5) {
+      if (base == 0) add_hidden_edge(base, previous, hidden_offsets[8] + 3);
+    }
+    return;
+  }
+  if (context == 0) {
+    if (base == 0) add_hidden_edge(base, previous, hidden_offsets[7] + 0);
+  } else if (context == 1) {
+    add_hidden_edge(base, previous, hidden_offsets[7] + 1);
+  } else if (context == 2) {
+    if (base != 0) add_hidden_edge(base, previous, hidden_offsets[7] + 1);
+  } else if (context == 3) {
+    if (base == 3) add_hidden_edge(base, previous, hidden_offsets[7] + 2);
+  }
+}
+
+/* Prefix and motif classes carry start/stop/splice recognition without changing 13 observed states. */
+static void add_grammar_edges(int base, int previous) {
+  int state = hidden_state[previous];
+  int context = hidden_context[previous];
+  int sub = hidden_sub[previous];
+  if (!state) {
+    add_hidden_edge(base, previous, 0);
+    if (base == 0) add_hidden_edge(base, previous, hidden_offsets[1] + 0);
+    if (base == 3) add_hidden_edge(base, previous, hidden_offsets[9] + 0);
+    if (base == 1) add_hidden_edge(base, previous, hidden_offsets[9] + 1);
+    return;
+  }
+  if (state <= 3) {
+    if (state == 3 && context == 2) {
+      add_hidden_edge(base, previous, 0);
+      return;
+    }
+    int next_c = 1 + state % 3, next_i = 4 + state % 3;
+    add_coding_edges_plus(base, previous, next_c, next_c == 1 ? 0 : context);
+    add_hidden_edge(base, previous, hidden_offsets[next_i] + (next_i == 4 ? 0 : context));
+    return;
+  }
+  if (state <= 6) {
+    int nctx = hidden_counts[state] / 5;
+    int off = hidden_offsets[state] + context;
+    if (sub == 0) {
+      add_hidden_edge(base, previous, off + 1 * nctx);
+      add_hidden_edge(base, previous, off + 4 * nctx);
+    } else if (sub == 1) {
+      add_hidden_edge(base, previous, off + 2 * nctx);
+      add_hidden_edge(base, previous, off + 3 * nctx);
+      add_hidden_edge(base, previous, off + 4 * nctx);
+    } else if (sub == 2) {
+      add_hidden_edge(base, previous, off + 2 * nctx);
+      add_hidden_edge(base, previous, off + 3 * nctx);
+    } else if (sub == 3) {
+      add_hidden_edge(base, previous, off + 4 * nctx);
+    } else {
+      add_coding_edges_plus(base, previous, state - 3, context);
+    }
+    return;
+  }
+  if (state <= 9) {
+    if (state == 7 && context == 2) {
+      add_hidden_edge(base, previous, 0);
+      return;
+    }
+    int next_c = 7 + (state + 1) % 3, next_i = 10 + (state + 1) % 3;
+    add_coding_edges_minus(base, previous, next_c, next_c == 9 ? 0 : context);
+    add_hidden_edge(base, previous, hidden_offsets[next_i] + (next_i == 12 ? 0 : context));
+    return;
+  }
+  int nctx = hidden_counts[state] / 5;
+  int off = hidden_offsets[state] + context;
+  if (sub == 0) {
+    add_hidden_edge(base, previous, off + 1 * nctx);
+    add_hidden_edge(base, previous, off + 3 * nctx);
+    add_hidden_edge(base, previous, off + 4 * nctx);
+  } else if (sub == 1 || sub == 2) {
+    add_hidden_edge(base, previous, off + 2 * nctx);
+    add_hidden_edge(base, previous, off + 3 * nctx);
+  } else if (sub == 3) {
+    add_hidden_edge(base, previous, off + 4 * nctx);
+  } else {
+    add_coding_edges_minus(base, previous, state - 3, context);
+  }
 }
 
 void crf_init(void) {
+  static const uint8_t plus_coding_motifs[3][6] = {
+    {1, 2, 2, 3, 0, 0},
+    {1, 2, 2, 2, 3, 3},
+    {1, 2, 3, 0, 0, 0}
+  };
+  static const uint8_t minus_coding_motifs[3][6] = {
+    {3, 2, 1, 0, 0, 0},
+    {3, 2, 2, 1, 0, 0},
+    {3, 3, 2, 2, 2, 1}
+  };
+  static const uint8_t plus_intron_motifs[5] = {4, 4, 5, 6, 6};
+  static const uint8_t minus_intron_motifs[5] = {6, 6, 5, 4, 4};
+
   ntrans = 0;
   memset(pair_to_edge, -1, sizeof(pair_to_edge));
-  for (int a = 0; a < STATES; a++)
-    for (int b = 0; b < STATES; b++)
-      if (allowed(a, b)) {
-        edge_rev[ntrans] = a >= 7 || b >= 7;
-        edge_kind[ntrans] = boundary_kind(a, b);
-        pair_to_edge[a][b] = ntrans;
-        trans_a[ntrans] = a, trans_b[ntrans++] = b;
+  memset(hidden_state, 0, sizeof(hidden_state));
+  memset(hidden_context, 0, sizeof(hidden_context));
+  memset(hidden_motif, 0, sizeof(hidden_motif));
+  memset(hidden_sub, 0, sizeof(hidden_sub));
+
+  for (int state = 1; state < STATES; state++) {
+    int off = hidden_offsets[state], cnt = hidden_counts[state];
+    if (state <= 3) {
+      for (int c = 0; c < cnt; c++) {
+        int h = off + c;
+        hidden_state[h] = (uint8_t)state;
+        hidden_context[h] = (uint8_t)c;
+        hidden_motif[h] = plus_coding_motifs[state - 1][c];
       }
-  for (int state = 0; state < STATES; state++)
-    for (int context = 0; context < hidden_counts[state]; context++) {
-      int hidden = hidden_offsets[state] + context;
-      hidden_state[hidden] = (uint8_t)state;
-      hidden_context[hidden] = (uint8_t)context;
+    } else if (state <= 6) {
+      int nctx = cnt / 5;
+      for (int sub = 0; sub < 5; sub++)
+        for (int c = 0; c < nctx; c++) {
+          int h = off + sub * nctx + c;
+          hidden_state[h] = (uint8_t)state;
+          hidden_context[h] = (uint8_t)c;
+          hidden_sub[h] = (uint8_t)sub;
+          hidden_motif[h] = plus_intron_motifs[sub];
+        }
+    } else if (state <= 9) {
+      for (int c = 0; c < cnt; c++) {
+        int h = off + c;
+        hidden_state[h] = (uint8_t)state;
+        hidden_context[h] = (uint8_t)c;
+        hidden_motif[h] = minus_coding_motifs[state - 7][c];
+      }
+    } else {
+      int nctx = cnt / 5;
+      for (int sub = 0; sub < 5; sub++)
+        for (int c = 0; c < nctx; c++) {
+          int h = off + sub * nctx + c;
+          hidden_state[h] = (uint8_t)state;
+          hidden_context[h] = (uint8_t)c;
+          hidden_sub[h] = (uint8_t)sub;
+          hidden_motif[h] = minus_intron_motifs[sub];
+        }
     }
+  }
+
   memset(hidden_edge_count, 0, sizeof(hidden_edge_count));
   for (int base = 0; base < KNUC; base++)
     for (int previous = 0; previous < HIDDEN_STATES; previous++)
-      for (int edge = 0; edge < ntrans; edge++) {
-        if (trans_a[edge] != hidden_state[previous]) continue;
-        int current = grammar_next(previous, trans_b[edge], base);
-        if (current < 0) continue;
-        if (hidden_edge_count[base] >= HIDDEN_STATES * 4) anno_fail("Too many grammar transitions");
-        hidden_edges[base][hidden_edge_count[base]++] = (HiddenEdge){(uint8_t)previous, (uint8_t)current, (uint16_t)edge};
-      }
+      add_grammar_edges(base, previous);
+
   for (int k = 0; k < 16; k++)
     rev_k2[k] = (uint8_t)(((3 - (k & 3)) << 2) | (3 - ((k >> 2) & 3)));
   rev_k2[16] = 16;
@@ -305,12 +501,6 @@ static void emission_accumulate(double *values, const Site *site, int state, dou
   for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
     values[emission_index(site, layer, state)] += value;
 }
-
-typedef struct {
-  Site *sites;
-  double *psi, *log_norm, *log_alpha;
-  int capacity;
-} Work;
 
 typedef struct {
   float power[WAVE_COUNT];
@@ -435,7 +625,7 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
 
   for (int edge = 0; edge < ntrans; edge++) {
     int reverse = edge_rev[edge], kind = edge_kind[edge];
-    double score = w[transition_index(trans_a[edge], trans_b[edge])];
+    double score = w[edge_trans[edge]];
     if (kind >= 0) score += b_score[reverse][kind];
     double p = score + emissions[trans_b[edge]];
     if (!isfinite(p))
@@ -445,15 +635,67 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
   return site;
 }
 
+static int path_edge(const uint8_t *y, int length, int position) {
+  int a = y[position - 1], b = y[position];
+  int trans = motif_transition_try(motif_at(y, length, position - 1),
+                                   motif_at(y, length, position), a >= 7 || b >= 7);
+  if (trans >= 0)
+    for (int e = 0; e < ntrans; e++)
+      if (trans_a[e] == a && trans_b[e] == b && edge_trans[e] == trans)
+        return e;
+  return pair_to_edge[a][b];
+}
+
+static int gold_initial_hidden(int base, int state, int length) {
+  for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+    if (hidden_state[hidden] == state && initial_allowed(base, hidden) &&
+        (length > 1 || terminal_allowed(hidden)))
+      return hidden;
+  return -1;
+}
+
+static int gold_step_edge(int previous_hidden, int base, const uint8_t *y,
+                          int length, int position, int *next_hidden) {
+  int state = y[position], last = position == length - 1;
+  int motif = motif_at(y, length, position);
+  const HiddenEdge *edges = hidden_edges[base];
+  int edge_count = hidden_edge_count[base];
+  for (int e = 0; e < edge_count; e++) {
+    const HiddenEdge *step = edges + e;
+    if (step->previous != previous_hidden || trans_b[step->transition] != state)
+      continue;
+    int h = step->current;
+    if (last && !terminal_allowed(h)) continue;
+    if ((state == 1 || state == 9) && hidden_motif[h] != motif) continue;
+    if ((state >= 4 && state <= 6) || state >= 10) {
+      if (hidden_motif[h] != motif) continue;
+      if (hidden_sub[h] >= 3 && (hidden_sub[h] == 4) != (last || y[position + 1] != state))
+        continue;
+    }
+    if (next_hidden) *next_hidden = h;
+    return step->transition;
+  }
+  return -1;
+}
+
 static int gold_path_valid(const Contig *c) {
-  int hidden = 0;
-  for (int position = 0; position < c->length; position++) {
+  const uint8_t *y = c->label + c->offset;
+  int b0 = base_index(c->seq[c->offset]);
+  int hidden = gold_initial_hidden(b0 < 0 ? 4 : b0, y[0], c->length);
+  if (hidden < 0) return 0;
+  for (int position = 1; position < c->length; position++) {
     int base = base_index(c->seq[c->offset + position]);
-    hidden = grammar_next(hidden, c->label[c->offset + position], base < 0 ? 4 : base);
-    if (hidden < 0) return 0;
+    if (gold_step_edge(hidden, base < 0 ? 4 : base, y, c->length, position, &hidden) < 0)
+      return 0;
   }
   return terminal_allowed(hidden);
 }
+
+typedef struct {
+  Site *sites;
+  double *psi, *log_norm, *log_alpha;
+  int capacity;
+} Work;
 
 static void work_ensure(Work *k, int length) {
   if (length <= k->capacity) return;
@@ -501,13 +743,14 @@ static double contig_gradient(const double *w, const Contig *c,
   work_ensure(k, c->length);
   SiteStream stream;
   site_stream_init(&stream, c, 0);
+  const uint8_t *gold_y = c->label + c->offset;
   double logz = 0, gold_score = 0;
   for (int position = 0; position < c->length; position++) {
     double emissions[STATES];
     double *psi = k->psi + (size_t)position * ntrans;
     Site site = site_scores_stream(w, &stream, position, emissions, psi);
     k->sites[position] = site;
-    int gold_state = c->label[c->offset + position];
+    int gold_state = gold_y[position];
     gold_score += emissions[gold_state];
 
     double *L = k->log_alpha + (size_t)position * HIDDEN_STATES;
@@ -517,8 +760,7 @@ static double contig_gradient(const double *w, const Contig *c,
                     (c->length > 1 || terminal_allowed(hidden))
           ? emissions[hidden_state[hidden]] : -INFINITY;
     } else {
-      int prev_gold = c->label[c->offset + position - 1];
-      int gold_edge = pair_to_edge[prev_gold][gold_state];
+      int gold_edge = path_edge(gold_y, c->length, position);
       if (gold_edge < 0) anno_fail("Invalid transition in validated CRF training path");
       gold_score += psi[gold_edge] - emissions[gold_state];
 
@@ -556,7 +798,7 @@ static double contig_gradient(const double *w, const Contig *c,
   for (int position = c->length - 1; position >= 0; position--) {
     const Site *site = k->sites + position;
     const double *L = k->log_alpha + (size_t)position * HIDDEN_STATES;
-    int state = c->label[c->offset + position];
+    int state = gold_y[position];
 
     double state_marginals[STATES] = {0};
     for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
@@ -571,8 +813,7 @@ static double contig_gradient(const double *w, const Contig *c,
       const double *psi = k->psi + (size_t)position * ntrans;
       double log_norm = k->log_norm[position];
       int last = position == c->length - 1;
-      int previous_state = c->label[c->offset + position - 1];
-      int gold_edge = pair_to_edge[previous_state][state];
+      int gold_edge = path_edge(gold_y, c->length, position);
 
       double edge_marginals[STATES * STATES] = {0};
       double B_prev[HIDDEN_STATES] = {0};
@@ -599,7 +840,7 @@ static double contig_gradient(const double *w, const Contig *c,
       for (int edge = 0; edge < ntrans; edge++) {
         double m = edge_marginals[edge];
         if (m != 0) {
-          gradient[transition_index(trans_a[edge], trans_b[edge])] -= m;
+          gradient[edge_trans[edge]] -= m;
           int reverse = edge_rev[edge], kind = edge_kind[edge];
           if (kind >= 0) {
             b_coeff[kind][reverse] -= m;
@@ -803,15 +1044,17 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
     Contig c = *windows[w].contig;
     c.offset = windows[w].start;
     c.length = windows[w].length;
+    const uint8_t *y = c.label + c.offset;
     for (int i = 0; i < c.length; i++) {
       Site site = site_at(&c, i);
-      int state = c.label[c.offset + i];
+      int state = y[i];
       for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
         feature_observe(scale, freq, emission_index(&site, layer, state), 1);
       if (!i) continue;
-      int previous = c.label[c.offset + i - 1];
-      feature_observe(scale, freq, transition_index(previous, state), 1);
-      int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
+      int edge = path_edge(y, c.length, i);
+      if (edge < 0) anno_fail("Invalid transition in validated CRF training path");
+      feature_observe(scale, freq, edge_trans[edge], 1);
+      int reverse = edge_rev[edge], kind = edge_kind[edge];
       if (kind >= 0) {
         for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
           feature_observe(scale, freq, boundary_kmer_index(&site, reverse, kind, offset), 1);
@@ -1141,8 +1384,13 @@ void crf_save_weights_text(const char *path, const double *w) {
     "5ss", "3ss", "start_codon", "stop_codon"
   };
   static const char *const transition_names[TRANSITION_FEATURES] = {
-    "intergenic->intergenic", "intergenic->CDS", "CDS->intergenic", "CDS->CDS",
-    "CDS->intron", "intron->CDS", "intron->intron"
+    "intergenic->intergenic", "intergenic->start_codon",
+    "start_codon->start_codon", "start_codon->CDS", "start_codon->stop_codon", "start_codon->5ss",
+    "CDS->CDS", "CDS->stop_codon", "CDS->5ss",
+    "stop_codon->stop_codon", "stop_codon->intergenic", "stop_codon->5ss",
+    "5ss->5ss", "5ss->intron", "5ss->3ss",
+    "intron->intron", "intron->3ss",
+    "3ss->3ss", "3ss->start_codon", "3ss->CDS", "3ss->stop_codon"
   };
 
   FILE *file = fopen(path, "w");

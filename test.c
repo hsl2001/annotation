@@ -196,33 +196,13 @@ typedef struct {
 static int bf_path_valid_active(const Contig *c, const uint8_t *y) {
   int T = c->length;
   int b0 = base_index(c->seq[c->offset]);
-  if (b0 < 0) b0 = 4;
-  int current_hidden = -1;
-  for (int h = 0; h < HIDDEN_STATES; h++) {
-    if (hidden_state[h] == y[0] && initial_allowed(b0, h) &&
-        (T > 1 || terminal_allowed(h))) {
-      current_hidden = h;
-      break;
-    }
-  }
+  int current_hidden = gold_initial_hidden(b0 < 0 ? 4 : b0, y[0], T);
   if (current_hidden < 0) return 0;
 
   for (int t = 1; t < T; t++) {
     int base = base_index(c->seq[c->offset + t]);
-    if (base < 0) base = 4;
-    const HiddenEdge *edges = hidden_edges[base];
-    int edge_count = hidden_edge_count[base];
-    int next_hidden = -1;
-    for (int e = 0; e < edge_count; e++) {
-      if (edges[e].previous == current_hidden &&
-          trans_b[edges[e].transition] == y[t]) {
-        if (t < T - 1 || terminal_allowed(edges[e].current))
-          next_hidden = edges[e].current;
-        break;
-      }
-    }
-    if (next_hidden < 0) return 0;
-    current_hidden = next_hidden;
+    if (gold_step_edge(current_hidden, base < 0 ? 4 : base, y, T, t, &current_hidden) < 0)
+      return 0;
   }
   return terminal_allowed(current_hidden);
 }
@@ -243,19 +223,11 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
     }
 
     if (t > 0) {
-      int prev = y[t - 1];
-      int edge = pair_to_edge[prev][st];
+      int edge = path_edge(y, c->length, t);
+      if (edge < 0) anno_fail("Invalid transition in brute-force CRF path");
       int rev = edge_rev[edge];
       int kind = edge_kind[edge];
-      int a = prev == 0 ? 0 : (prev <= 3 || (prev >= 7 && prev <= 9)) ? 1 : 2;
-      int b = st == 0 ? 0 : (st <= 3 || (st >= 7 && st <= 9)) ? 1 : 2;
-      if (rev) {
-        int swap = a;
-        a = b;
-        b = swap;
-      }
-      const int transition_ids[3][3] = {{0, 1, -1}, {2, 3, 4}, {-1, 5, 6}};
-      int transition = OFF_TRANSITION + transition_ids[a][b];
+      int transition = edge_trans[edge];
       total_score += w[transition];
       if (feat_accum) feat_accum[transition] += scale;
       if (kind >= 0) {
@@ -451,14 +423,14 @@ static void setup_k2_binary_crf(void) {
   ntrans = 0;
   memset(pair_to_edge, -1, sizeof(pair_to_edge));
 
-  const int pairs[6][4] = {
-    /* from, to, rev, kind */
-    {0, 0, 0, 0},
-    {0, 3, 0, 2},
-    {1, 0, 0, 3},
-    {1, 3, 0, 1},
-    {3, 0, 0, 3},
-    {3, 3, 0, 1},
+  const int pairs[6][5] = {
+    /* from, to, rev, kind, trans */
+    {0, 0, 0, 0, OFF_TRANSITION + 0},
+    {0, 3, 0, 2, OFF_TRANSITION + 1},
+    {1, 0, 0, 3, OFF_TRANSITION + 10},
+    {1, 3, 0, 1, OFF_TRANSITION + 6},
+    {3, 0, 0, 3, OFF_TRANSITION + 10},
+    {3, 3, 0, 1, OFF_TRANSITION + 6},
   };
   for (int i = 0; i < 6; i++) {
     int a = pairs[i][0], b = pairs[i][1];
@@ -467,20 +439,21 @@ static void setup_k2_binary_crf(void) {
     trans_b[ntrans] = b;
     edge_rev[ntrans] = pairs[i][2];
     edge_kind[ntrans] = pairs[i][3];
+    edge_trans[ntrans] = pairs[i][4];
     ntrans++;
   }
 
+  int h_init = hidden_offsets[1];
+  int h_term = hidden_offsets[3] + 2;
   memset(hidden_edge_count, 0, sizeof(hidden_edge_count));
   for (int base = 0; base < KNUC; base++) {
     int c = 0;
-    /* From t=0 states {h=0 (st 0), h=3 (st 1)} to t>=1 states {h=0 (st 0), h=9 (st 3)} */
     hidden_edges[base][c++] = (HiddenEdge){0, 0, (uint16_t)pair_to_edge[0][0]};
-    hidden_edges[base][c++] = (HiddenEdge){0, 9, (uint16_t)pair_to_edge[0][3]};
-    hidden_edges[base][c++] = (HiddenEdge){3, 0, (uint16_t)pair_to_edge[1][0]};
-    hidden_edges[base][c++] = (HiddenEdge){3, 9, (uint16_t)pair_to_edge[1][3]};
-    /* From t>=1 state h=9 (st 3) to {h=0 (st 0), h=9 (st 3)} */
-    hidden_edges[base][c++] = (HiddenEdge){9, 0, (uint16_t)pair_to_edge[3][0]};
-    hidden_edges[base][c++] = (HiddenEdge){9, 9, (uint16_t)pair_to_edge[3][3]};
+    hidden_edges[base][c++] = (HiddenEdge){0, (uint8_t)h_term, (uint16_t)pair_to_edge[0][3]};
+    hidden_edges[base][c++] = (HiddenEdge){(uint8_t)h_init, 0, (uint16_t)pair_to_edge[1][0]};
+    hidden_edges[base][c++] = (HiddenEdge){(uint8_t)h_init, (uint8_t)h_term, (uint16_t)pair_to_edge[1][3]};
+    hidden_edges[base][c++] = (HiddenEdge){(uint8_t)h_term, 0, (uint16_t)pair_to_edge[3][0]};
+    hidden_edges[base][c++] = (HiddenEdge){(uint8_t)h_term, (uint8_t)h_term, (uint16_t)pair_to_edge[3][3]};
     hidden_edge_count[base] = c;
   }
 }
@@ -586,7 +559,9 @@ static void test_crf_phase_independent_transitions(void) {
 
   const char *seq = "AAATGTTGTAAA";
   const uint8_t gold[] = {0, 0, 1, 2, 3, 4, 4, 4, 1, 2, 3, 0};
-  const double counts[TRANSITION_FEATURES] = {1, 1, 1, 4, 1, 1, 2};
+  const double counts[TRANSITION_FEATURES] = {
+    1, 1, 2, 0, 0, 1, 0, 0, 0, 2, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1
+  };
   int length = (int)strlen(seq);
   char reverse[sizeof(gold) + 1];
   uint8_t reverse_gold[sizeof(gold)];
@@ -606,11 +581,8 @@ static void test_crf_phase_independent_transitions(void) {
     site_scores_stream(w, &stream, 0, emissions, psi);
     int seen[TRANSITION_FEATURES] = {0};
     for (int edge = 0; edge < ntrans; edge++) {
-      int a = trans_a[edge], b = trans_b[edge], kind = edge_kind[edge];
-      const int boundary_ids[4] = {4, 5, 1, 2};
-      int id = kind >= 0 ? boundary_ids[kind] : !a ? 0 :
-               (a <= 3 || (a >= 7 && a <= 9)) ? 3 : 6;
-      TEST_ASSERT_INT_EQ(OFF_TRANSITION + id, transition_index(a, b));
+      int id = edge_trans[edge] - OFF_TRANSITION;
+      TEST_ASSERT(id >= 0 && id < TRANSITION_FEATURES);
       TEST_ASSERT_DOUBLE_WITHIN(0, w[OFF_TRANSITION + id], psi[edge]);
       seen[id]++;
     }
@@ -651,6 +623,51 @@ static void test_crf_phase_independent_transitions(void) {
                              bf_score_and_accumulate_features(w, &c, path, 0, NULL));
     work_free(&work);
     free_test_contig(&c);
+  }
+
+  const char *seq2 = "ATGAAACCCGGGAAATAA";
+  const uint8_t gold2[] = {1, 2, 3, 1, 2, 3, 4, 4, 4, 4, 4, 4, 1, 2, 3, 1, 2, 3};
+  const double counts2[TRANSITION_FEATURES] = {
+    0, 0, 2, 1, 0, 0, 4, 1, 1, 2, 0, 0, 1, 1, 0, 1, 1, 1, 0, 1, 0
+  };
+  int length2 = (int)strlen(seq2);
+  char reverse2[sizeof(gold2) + 1];
+  uint8_t reverse_gold2[sizeof(gold2)];
+  for (int i = 0; i < length2; i++) {
+    reverse2[i] = "TGCA"[base_index(seq2[length2 - 1 - i])];
+    int st = gold2[length2 - 1 - i];
+    reverse_gold2[i] = st == 0 ? 0 : st <= 3 ? st + 6 : 10 + (st - 2) % 3;
+  }
+  reverse2[length2] = '\0';
+
+  for (int rev = 0; rev < 2; rev++) {
+    Contig c2 = make_test_contig(rev ? reverse2 : seq2, 0, length2, rev ? reverse_gold2 : gold2);
+    TEST_ASSERT(gold_path_valid(&c2));
+    CrfWindow window2 = {&c2, 0, length2};
+    double scale2[WEIGHTS], freq2[WEIGHTS], gold_features2[WEIGHTS] = {0};
+    feature_counts(&window2, 1, scale2, freq2);
+    bf_score_and_accumulate_features(w, &c2, c2.label, 1, gold_features2);
+    for (int f = 0; f < TRANSITION_FEATURES; f++) {
+      int idx = OFF_TRANSITION + f;
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], scale2[idx]);
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], freq2[idx]);
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], gold_features2[idx]);
+    }
+    Work work2 = {0};
+    double gradient2[WEIGHTS] = {0};
+    contig_gradient(w, &c2, &work2, gradient2);
+    for (int f = 0; f < TRANSITION_FEATURES; f++) {
+      int idx = OFF_TRANSITION + f;
+      double original = w[idx], dummy[WEIGHTS] = {0};
+      w[idx] = original + 1e-6;
+      double plus = contig_gradient(w, &c2, &work2, dummy);
+      w[idx] = original - 1e-6;
+      double minus = contig_gradient(w, &c2, &work2, dummy);
+      w[idx] = original;
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7, gradient2[idx], (plus - minus) / 2e-6);
+    }
+    work_free(&work2);
+    free_test_contig(&c2);
   }
 
   free(w);
