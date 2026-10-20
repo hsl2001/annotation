@@ -17,12 +17,12 @@ enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
   STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
-  K2 = 17, K3 = 65, K6 = 4097, K9 = 262145, KNUC = 5, EMIT_KMER_LAYERS = 3,
+  K2 = 17, K3 = 65, KNUC = 5, EMIT_KMER_LAYERS = 1,
   BOUNDARY_PWM_FROM = -24, BOUNDARY_PWM_COUNT = 33,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0]),
-  OFF_E3 = 0, OFF_E6 = OFF_E3 + EMIT_STATES * K3, OFF_E9 = OFF_E6 + EMIT_STATES * K6,
-  OFF_SPLICE_START_STOP = OFF_E9 + EMIT_STATES * K9,
+  OFF_E3 = 0,
+  OFF_SPLICE_START_STOP = OFF_E3 + EMIT_STATES * K3,
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   OFF_PWM = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
@@ -45,9 +45,9 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <stdlib.h>
 #include <string.h>
 
-static const int emit_kmer_sizes[EMIT_KMER_LAYERS] = {3, 6, 9};
-static const int emit_kmer_offsets[EMIT_KMER_LAYERS] = {OFF_E3, OFF_E6, OFF_E9};
-static const int emit_kmer_counts[EMIT_KMER_LAYERS] = {K3, K6, K9};
+static const int emit_kmer_sizes[EMIT_KMER_LAYERS] = {3};
+static const int emit_kmer_offsets[EMIT_KMER_LAYERS] = {OFF_E3};
+static const int emit_kmer_counts[EMIT_KMER_LAYERS] = {K3};
 
 typedef struct {
   uint32_t kmer_emit[EMIT_KMER_LAYERS][2];
@@ -827,9 +827,7 @@ static const struct {
   const char *name;
   int from, to;
 } feature_groups[] = {
-  {"emit_k3", OFF_E3, OFF_E6},
-  {"emit_k6", OFF_E6, OFF_E9},
-  {"emit_k9", OFF_E9, OFF_SPLICE_START_STOP},
+  {"emit_k3", OFF_E3, OFF_SPLICE_START_STOP},
   {"boundary_k2", OFF_SPLICE_START_STOP, OFF_BP},
   {"boundary_cwt_power", OFF_BP, OFF_BD},
   {"boundary_cwt_deriv", OFF_BD, OFF_PWM},
@@ -1124,7 +1122,7 @@ void crf_save_weights_text(const char *path, const double *w) {
   if (!file) anno_fail("Cannot write weights text: %s", path);
   fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
 
-  char kbuf[10];
+  char kbuf[4];
   for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
     int size = emit_kmer_sizes[layer];
     for (int s = 0; s < EMIT_STATES; s++)

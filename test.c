@@ -723,14 +723,13 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
 
   /* Verify finite differences against dp_grad across active emission, boundary_k2, CWT power, and CWT deriv weights */
   const double eps = 1e-6;
-  int checked_groups[6] = {0};
+  int checked_groups[5] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
-    int group = (f < OFF_E9) ? 0 :
-                (f < OFF_SPLICE_START_STOP) ? 4 :
+    int group = (f < OFF_SPLICE_START_STOP) ? 0 :
                 (f < OFF_BP) ? 1 :
                 (f < OFF_BD) ? 2 :
-                (f < OFF_PWM) ? 3 : 5;
+                (f < OFF_PWM) ? 3 : 4;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -747,7 +746,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     double fd = (ll_p - ll_m) / (2.0 * eps);
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd, dp_grad[f]);
   }
-  for (int g = 0; g < 6; g++) TEST_ASSERT(checked_groups[g] > 0);
+  for (int g = 0; g < 5; g++) TEST_ASSERT(checked_groups[g] > 0);
 
   /* Case B: Minus-strand sequence with reverse-complement stop ("TTA"), intron (10..12), and start ("CAT") */
   const char *minus_genome =
@@ -932,7 +931,7 @@ static void test_crf_tied_optimal_paths(void) {
   for (int t = 0; t < 6; t++) TEST_ASSERT_INT_EQ(0, vpath[t]);
 
   /* Now tie two non-zero intron paths in "ATGAAATAA" while penalizing state 0 */
-  for (int k = 0; k < K6; k++) w[OFF_E6 + 0 * K6 + k] = -10.0;
+  for (int k = 0; k < K3; k++) w[OFF_E3 + 0 * K3 + k] = -10.0;
   /* Make intron states 4, 5, 6 and CDS states 1, 2, 3 have score 0 so multiple coding/intron paths tie */
   Contig c9 = make_test_contig("ATGAAATAA", 0, 9, NULL);
   BruteForceCrf bf9;
@@ -954,11 +953,11 @@ static void test_crf_forbidden_transitions(void) {
   crf_init();
   double *w = anno_alloc(WEIGHTS, sizeof(double));
   /* Strongly reward CDS states 1, 2, 3 and penalize intergenic 0 */
-  for (int k = 0; k < K6; k++) {
-    w[OFF_E6 + 0 * K6 + k] = -5.0;
-    w[OFF_E6 + 1 * K6 + k] = 20.0;
-    w[OFF_E6 + 2 * K6 + k] = 20.0;
-    w[OFF_E6 + 3 * K6 + k] = 20.0;
+  for (int k = 0; k < K3; k++) {
+    w[OFF_E3 + 0 * K3 + k] = -5.0;
+    w[OFF_E3 + 1 * K3 + k] = 20.0;
+    w[OFF_E3 + 2 * K3 + k] = 20.0;
+    w[OFF_E3 + 3 * K3 + k] = 20.0;
   }
 
   /* 1. Sequence with in-frame stop codon "ATGTAGTAA":
@@ -1017,7 +1016,7 @@ static void test_crf_no_valid_path_and_nonfinite(void) {
   /* Restore grammar and test non-finite weights (NaN and -INFINITY) */
   crf_init();
   Site s0 = site_at(&c, 0);
-  w[emission_index(&s0, 1, 0)] = NAN;
+  w[emission_index(&s0, 0, 0)] = NAN;
   TEST_ASSERT_FAILS(contig_gradient(w, &c, &wk, grad));
   TEST_ASSERT_FAILS(crf_decode(w, &c, path));
   work_free(&wk);
@@ -1080,27 +1079,27 @@ static void test_crf_shift_invariance(void) {
   double *w2 = anno_alloc(WEIGHTS, sizeof(double));
   for (int i = 0; i < WEIGHTS; i++) w1[i] = w2[i] = rng_uniform(-0.5, 0.5);
 
-  /* Keep all forward and reverse-complement 6-mer contexts unique so shared emission
+  /* Keep all forward and reverse-complement 3-mer contexts unique so shared emission
      parameters do not couple the position-specific score shifts. */
   const char *seq = "CAGGAACTTGCGTAC";
   const uint8_t gold[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
   Contig c = make_test_contig(seq, 3, 9, gold);
 
-  /* Verify that all 9 positions have distinct forward & reverse 6-mer codes */
+  /* Verify that all 9 positions have distinct forward & reverse 3-mer codes */
   double shift_sum = 0.0;
   for (int t = 0; t < c.length; t++) {
     Site st = site_at(&c, t);
-    TEST_ASSERT(st.kmer_emit[1][0] < 4096);
-    TEST_ASSERT(st.kmer_emit[1][1] < 4096);
+    TEST_ASSERT(st.kmer_emit[0][0] < 64);
+    TEST_ASSERT(st.kmer_emit[0][1] < 64);
     for (int previous = 0; previous < t; previous++) {
       Site prior = site_at(&c, previous);
-      TEST_ASSERT(st.kmer_emit[1][0] != prior.kmer_emit[1][0]);
-      TEST_ASSERT(st.kmer_emit[1][1] != prior.kmer_emit[1][1]);
+      TEST_ASSERT(st.kmer_emit[0][0] != prior.kmer_emit[0][0]);
+      TEST_ASSERT(st.kmer_emit[0][1] != prior.kmer_emit[0][1]);
     }
     double ct = (t - 4) * 3.25 + 1.1;
     shift_sum += ct;
     for (int state = 0; state < STATES; state++)
-      w2[emission_index(&st, 1, state)] += ct;
+      w2[emission_index(&st, 0, state)] += ct;
   }
 
   double logz1 = 0.0, logz2 = 0.0;
@@ -2243,19 +2242,19 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   double *w_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
   crf_train(&c, 1, w_lbfgs, 60, 1);
 
-  /* Inactive features (unseen on the gold path) stay exactly zero; k9 emissions are learned */
+  /* Inactive features (unseen on the gold path) stay exactly zero; k3 emissions are learned */
   double *count = anno_alloc(WEIGHTS, sizeof(double));
   double *freq = anno_alloc(WEIGHTS, sizeof(double));
   feature_counts(windows, win_count, count, freq);
   MaskedObjective masked = {.objective = &obj, .freq = freq};
-  int active_k9 = 0, nonzero_k9 = 0;
+  int active_k3 = 0, nonzero_k3 = 0;
   for (int f = 0; f < WEIGHTS; f++) {
     if (!feature_active(freq[f])) TEST_ASSERT(w_lbfgs[f] == 0.0);
-    else if (f >= OFF_E9 && f < OFF_SPLICE_START_STOP)
-      active_k9++, nonzero_k9 += w_lbfgs[f] != 0.0;
+    else if (f >= OFF_E3 && f < OFF_SPLICE_START_STOP)
+      active_k3++, nonzero_k3 += w_lbfgs[f] != 0.0;
   }
-  TEST_ASSERT_INT_EQ(9, active_k9);
-  TEST_ASSERT_INT_EQ(9, nonzero_k9);
+  TEST_ASSERT_INT_EQ(9, active_k3);
+  TEST_ASSERT_INT_EQ(9, nonzero_k3);
 
   double *grad_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
   double loss_lbfgs = masked_objective(w_lbfgs, grad_lbfgs, &masked);
