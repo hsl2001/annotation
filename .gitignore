@@ -3,6 +3,7 @@
 gffcmp*
 gffcompare
 *.fa*
+*.pt
 subset*
 Col-CC
 control*
@@ -11,7 +12,8 @@ control*
 __pycache__/
 regions*
 anno
-annevo/
+!annevo/*.gff3
+!augustus/*.gff3
 tmp*
 *plots-*
 !truth*
