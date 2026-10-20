@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Protein gene-level and gffcompare CDS exon-level accuracy."""
+"""Protein gene-level and gffcompare CDS exon/locus-level accuracy."""
 
 import argparse
 from collections import defaultdict
@@ -14,7 +14,6 @@ import sys
 import tempfile
 
 import numpy as np
-
 
 BASE_TO_INT = np.full(256, 4, dtype=np.uint8)
 for _ch, _val in zip(b"ACGTacgt", (0, 1, 2, 3, 0, 1, 2, 3)):
@@ -303,21 +302,28 @@ def filtered_gff(path, genome, output, longest_only=False, validate=None, transc
                 )
     return len(transcripts)
 
-
 def parse_gffcompare_stats(path):
-    pattern = re.compile(
-        r"^\s*Exon level:\s*"
+    level_pattern = re.compile(
+        r"^\s*(Exon|Locus) level:\s*"
         r"([0-9.]+)\s*\|\s*([0-9.]+)"
     )
+    matching_loci_pattern = re.compile(r"^\s*Matching loci:\s*(\d+)\s*$")
+    levels = {}
+    matching_loci = None
     with open(path) as stream:
         for line in stream:
-            match = pattern.match(line)
-            if not match:
+            match = level_pattern.match(line)
+            if match:
+                level = match.group(1).lower()
+                recall, precision = float(match.group(2)) / 100, float(match.group(3)) / 100
+                f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+                levels[level] = (precision, recall, f1)
                 continue
-            recall, precision = float(match.group(1)) / 100, float(match.group(2)) / 100
-            f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-            return {"exon": (precision, recall, f1)}
-    raise ValueError(f"could not parse gffcompare exon statistics: {path}")
+            match = matching_loci_pattern.match(line)
+            if match:
+                matching_loci = int(match.group(1))
+    return {"exon": levels["exon"], "locus": levels["locus"],
+            "matching_loci": matching_loci}
 
 
 def run_gffcompare(reference, query, workdir, label):
@@ -677,7 +683,9 @@ def gene_level(reference_gff, query_gff, genome, workdir, *, bitscore, evalue, c
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Protein gene-level and gffcompare CDS exon-level accuracy")
+    parser = argparse.ArgumentParser(
+        description="Protein gene-level and gffcompare CDS exon/locus-level accuracy"
+    )
     parser.add_argument("-r", "--reference", required=True, help="reference GFF3/GTF(.gz)")
     parser.add_argument("-q", "--query", required=True, help="query GFF3/GTF(.gz)")
     parser.add_argument("-g", "--genome", required=True, help="genome FASTA(.gz)")
@@ -720,8 +728,15 @@ def main():
         query_count = filtered_gff(args.query, genome, query_cds,
                                    validate=False, transcripts=query_transcripts)
         exon_gff = scores(0, query_count, reference_count)
+        locus_gff = scores(0, query_count, reference_count)
+        matching_loci = 0
         if reference_count and query_count:
-            exon_gff = run_gffcompare(reference_longest, query_cds, workdir, "gffcompare_exon")["exon"]
+            gffcompare_stats = run_gffcompare(
+                reference_longest, query_cds, workdir, "gffcompare_exon"
+            )
+            exon_gff = gffcompare_stats["exon"]
+            locus_gff = gffcompare_stats["locus"]
+            matching_loci = gffcompare_stats["matching_loci"]
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     finally:
@@ -729,8 +744,12 @@ def main():
             shutil.rmtree(workdir, ignore_errors=True)
     print(f"gene-level (protein): F1={gene[2]:.4%} precision={gene[0]:.4%} recall={gene[1]:.4%}")
     print(f"  genes TP={counts[0]:,} P(reference)={counts[1]:,} PP(predicted)={counts[2]:,}")
-    print(f"gffcompare CDS exon-level: F1={exon_gff[2]:.2%} precision={exon_gff[0]:.1%} recall={exon_gff[1]:.1%}")
-    print(f"  filtered transcripts: reference={reference_count:,} query={query_count:,}")
+    print(f"gffcompare CDS-level: F1={exon_gff[2]:.2%} precision={exon_gff[0]:.1%} recall={exon_gff[1]:.1%}")
+    print(
+        "gffcompare locus-level: "
+        f"F1={locus_gff[2]:.2%} precision={locus_gff[0]:.1%} recall={locus_gff[1]:.1%}"
+    )
+    print(f"  filtered transcripts: TP={matching_loci:,} reference={reference_count:,} query={query_count:,}")
     return 0
 
 
