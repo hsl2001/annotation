@@ -3,14 +3,21 @@ CFLAGS = -O3 -std=c11 -Wall -Wextra -pthread
 LIBS = -lz -lm
 
 PROGRAMS = anno
+TEST_PROGRAM = test-runner
 HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
 
-.PHONY: all clean
+.PHONY: all clean test
 
 all: $(PROGRAMS)
 
 $(PROGRAMS): %: %.c $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
+$(TEST_PROGRAM): test.c $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+test: $(TEST_PROGRAM)
+	./$(TEST_PROGRAM)
+
 clean:
-	rm -f *.o $(PROGRAMS)
+	rm -f *.o $(PROGRAMS) $(TEST_PROGRAM)

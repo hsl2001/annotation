@@ -62,6 +62,20 @@ const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #define CWT_IMPLEMENTATION
 #include "cwt.h"
 
+static void test_cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
+                               int threads, double *features, float *complex_values,
+                               float *powers) {
+  size_t value_count = (size_t)length * CWT_CHANNELS;
+  float *values = complex_values;
+  if (features && !values) values = anno_alloc(value_count, sizeof(*values));
+  cwt_transform(wavelets, sequence, length, threads, values, powers);
+  if (features)
+    for (size_t i = 0; i < value_count; i++) features[i] = values[i];
+  if (features && !complex_values) free(values);
+}
+
+#define cwt_transform test_cwt_transform
+
 /* =========================================================================
  * Lightweight Unity-style Test Harness
  * ========================================================================= */
@@ -985,9 +999,9 @@ static void test_crf_shift_invariance(void) {
   double *w2 = anno_alloc(WEIGHTS, sizeof(double));
   for (int i = 0; i < WEIGHTS; i++) w1[i] = w2[i] = rng_uniform(-0.5, 0.5);
 
-  /* Use a sequence with 1-bp flanks so all 9 centered 3-mers at t=0..8
-     (GAT, ATG, TGT, GTC, TCA, CAT, ATA, TAA, AAC) are in-bounds and distinct. */
-  const char *seq = "GATGTCATAAC";
+  /* Keep all forward and reverse-complement 3-mer contexts unique so shared emission
+     parameters do not couple the position-specific score shifts. */
+  const char *seq = "GGAACTTGCGT";
   const uint8_t gold[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
   Contig c = make_test_contig(seq, 1, 9, gold);
 
@@ -1139,8 +1153,8 @@ static void cwt_direct_reference(const Wavelets *wavelets, const char *seq, int 
       double re = creal(sum), im = cimag(sum);
       size_t feat_idx = (size_t)pos * CWT_CHANNELS + 2 * (size_t)sc;
       if (features) {
-        features[feat_idx] = re;
-        features[feat_idx + 1] = im;
+        features[feat_idx] = (double)(float)re;
+        features[feat_idx + 1] = (double)(float)im;
       }
       if (complex_values) {
         complex_values[feat_idx] = (float)re;
@@ -1201,11 +1215,11 @@ static void test_cwt_linearity(void) {
     seq_x[i] = (i < len / 2) ? b : 'N';
     seq_y[i] = (i >= len / 2) ? b : 'N';
     seq_xy[i] = b;
-    /* In cwt_base_signal: A=(1+i)/sqrt(2), C=(1-i)/sqrt(2), G=(-1-i)/sqrt(2), T=(-1+i)/sqrt(2).
+    /* In cwt_base_signal: A=(1+i)/sqrt(2), C=(-1+i)/sqrt(2), G=(-1-i)/sqrt(2), T=(1-i)/sqrt(2).
        Swapping A<->G and C<->T multiplies signal by -1.
-       Rotating A->T->G->C->A multiplies signal by +i. */
+       Rotating A->C->G->T->A multiplies signal by +i. */
     seq_neg[i] = (b == 'A') ? 'G' : (b == 'G') ? 'A' : (b == 'C') ? 'T' : 'C';
-    seq_rot[i] = (b == 'A') ? 'T' : (b == 'T') ? 'G' : (b == 'G') ? 'C' : 'A';
+    seq_rot[i] = (b == 'A') ? 'C' : (b == 'C') ? 'G' : (b == 'G') ? 'T' : 'A';
   }
   seq_x[len] = seq_y[len] = seq_xy[len] = seq_neg[len] = seq_rot[len] = '\0';
 
@@ -1226,16 +1240,16 @@ static void test_cwt_linearity(void) {
 
   for (int i = 0; i < len * CWT_CHANNELS; i++) {
     /* Additivity: W(x + y) = W(x) + W(y) */
-    TEST_ASSERT_DOUBLE_WITHIN(1e-12, fx[i] + fy[i], fxy[i]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, fx[i] + fy[i], fxy[i]);
     /* Homogeneity by -1: W(-z) = -W(z) */
-    TEST_ASSERT_DOUBLE_WITHIN(1e-12, -fxy[i], fneg[i]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, -fxy[i], fneg[i]);
   }
   /* Homogeneity by +i: W(i * z) = i * W(z) => Re' = -Im, Im' = Re */
   for (int pos = 0; pos < len; pos++) {
     for (int sc = 0; sc < WAVE_COUNT; sc++) {
       size_t idx = (size_t)pos * CWT_CHANNELS + 2 * (size_t)sc;
-      TEST_ASSERT_DOUBLE_WITHIN(1e-12, -fxy[idx + 1], frot[idx]);
-      TEST_ASSERT_DOUBLE_WITHIN(1e-12, fxy[idx], frot[idx + 1]);
+      TEST_ASSERT_DOUBLE_WITHIN(1e-6, -fxy[idx + 1], frot[idx]);
+      TEST_ASSERT_DOUBLE_WITHIN(1e-6, fxy[idx], frot[idx + 1]);
       TEST_ASSERT_DOUBLE_WITHIN(1e-6, pxy[pos * WAVE_COUNT + sc], pneg[pos * WAVE_COUNT + sc]);
       TEST_ASSERT_DOUBLE_WITHIN(1e-6, pxy[pos * WAVE_COUNT + sc], prot[pos * WAVE_COUNT + sc]);
     }
@@ -1289,8 +1303,8 @@ static void test_cwt_center_impulse(void) {
           ((double)d - 0.5) / dilation, ((double)d + 0.5) / dilation);
         kernel_sum += k_val;
         double complex expected = base_a * k_val;
-        TEST_ASSERT_DOUBLE_WITHIN(1e-12, creal(expected), actual_re);
-        TEST_ASSERT_DOUBLE_WITHIN(1e-12, cimag(expected), actual_im);
+        TEST_ASSERT_DOUBLE_WITHIN(1e-6, creal(expected), actual_re);
+        TEST_ASSERT_DOUBLE_WITHIN(1e-6, cimag(expected), actual_im);
 
         /* Check conjugate symmetry of Morlet kernel: k(-d) == conj(k(d)) */
         double complex k_neg = wavelets.kernel[sc][radius - d];
@@ -1335,8 +1349,8 @@ static void test_cwt_boundary_impulses(void) {
   cwt_direct_reference(&wavelets, seq_end, len, ref_end, NULL, NULL);
 
   for (int i = 0; i < len * CWT_CHANNELS; i++) {
-    TEST_ASSERT_DOUBLE_WITHIN(1e-12, ref_start[i], f_start[i]);
-    TEST_ASSERT_DOUBLE_WITHIN(1e-12, ref_end[i], f_end[i]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, ref_start[i], f_start[i]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, ref_end[i], f_end[i]);
   }
 
   /* Verify no circular convolution wrap-around: impulse at 0 must be 0 at len-1 and vice versa */
@@ -1393,7 +1407,7 @@ static void test_cwt_direct_vs_fft_and_window_boundaries(void) {
     cwt_direct_reference(&wavelets, seq, L, ref_feat, ref_cval, ref_pow);
 
     for (int i = 0; i < L * CWT_CHANNELS; i++) {
-      TEST_ASSERT_DOUBLE_WITHIN(1e-11, ref_feat[i], fft_feat[i]);
+      TEST_ASSERT_DOUBLE_WITHIN(1e-5, ref_feat[i], fft_feat[i]);
       TEST_ASSERT_DOUBLE_WITHIN(1e-5, ref_cval[i], fft_cval[i]);
     }
     for (int i = 0; i < L * WAVE_COUNT; i++)
@@ -1444,16 +1458,16 @@ static void test_cwt_sinusoid_scale_response(void) {
   Wavelets wavelets;
   wavelets_init(&wavelets);
 
-  /* In cwt_base_signal, A -> T -> G -> C has phase step +pi/2 per base (period 4, omega = pi/2).
-     A -> A -> T -> T -> G -> G -> C -> C has period 8 (omega = pi/4).
+  /* In cwt_base_signal, A -> C -> G -> T has phase step +pi/2 per base (period 4, omega = pi/2).
+     A -> C -> C -> G -> T -> T has period 6 (omega ~= pi/3).
      For Morlet wavelet with omega_0 = 6.0, effective angular frequency at scale s is ~ 6.0 / s:
      - scale 4 has peak frequency 6/4 = 1.50 rad/sample (closest to period 4: pi/2 ~= 1.571)
      - scale 6 has peak frequency 6/6 = 1.00 rad/sample (closer to longer periods: period 6, pi/3 ~= 1.047)
-     Test a period-4 sequence ("ATGCAGTC..." -> "ATCGATCG...") vs a period-6 sequence ("AATTGGCCTTGG..."). */
+     Test period-4 and period-6 sequences in the matching positive-frequency direction. */
   const int len = 240;
   char seq_p4[241], seq_p6[241];
-  const char pat4[4] = {'A', 'T', 'G', 'C'};
-  const char pat6[6] = {'A', 'T', 'T', 'G', 'C', 'C'};
+  const char pat4[4] = {'A', 'C', 'G', 'T'};
+  const char pat6[6] = {'A', 'C', 'C', 'G', 'T', 'T'};
   for (int i = 0; i < len; i++) {
     seq_p4[i] = pat4[i % 4];
     seq_p6[i] = pat6[i % 6];
