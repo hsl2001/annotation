@@ -329,7 +329,7 @@ def parse_gffcompare_stats(path):
 def run_gffcompare(reference, query, workdir, label):
     prefix = workdir / label
     subprocess.run(
-        ["gffcompare", "--no-exon-merge", "--strict-match", "-e", "0",
+        ["gffcompare", "--no-exon-merge", "--strict-match", "-e", "3", "-T",
          "-r", str(reference), "-o", str(prefix), str(query)],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
