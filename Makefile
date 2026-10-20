@@ -17,7 +17,7 @@ $(TEST_PROGRAM): test.c $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
 
 test: $(TEST_PROGRAM)
-	./$(TEST_PROGRAM)
+	ulimit -s unlimited && ./$(TEST_PROGRAM)
 
 clean:
 	rm -f *.o $(PROGRAMS) $(TEST_PROGRAM)

@@ -235,12 +235,12 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
   for (int t = 0; t < c->length; t++) {
     Site site = site_at(c, t);
     int st = y[t];
-    int e_idx = emission_index(&site, st);
-    total_score += w[e_idx];
-    if (feat_accum) feat_accum[e_idx] += scale;
-    int backoff_idx = OFF_E3 + emit_state(st) * K3 + site.k3_emit[st >= 7];
-    total_score += w[backoff_idx];
-    if (feat_accum) feat_accum[backoff_idx] += scale;
+    for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
+      int e_idx = emit_kmer_offsets[layer] + emit_state(st) * emit_kmer_counts[layer] +
+                  (int)site.kmer_emit[layer][st >= 7];
+      total_score += w[e_idx];
+      if (feat_accum) feat_accum[e_idx] += scale;
+    }
 
     if (t > 0) {
       int prev = y[t - 1];
@@ -371,6 +371,11 @@ static void bf_crf_solve(const double *w, const Contig *c, BruteForceCrf *out,
     }
     bf_score_and_accumulate_features(w, c, out->paths[m], p, out->expected_features);
   }
+}
+
+static void feature_scales(const CrfWindow *windows, size_t count, double *scale) {
+  feature_counts(windows, count, scale, NULL);
+  counts_to_scales(scale);
 }
 
 /* Extract forward-backward logZ, node marginals, and edge marginals from crf.h's DP tables. */
@@ -511,8 +516,13 @@ static void test_crf_context_coordinates_and_stream(void) {
       Site expected = site_at(&c, i);
       TEST_ASSERT_INT_EQ(expected.nuc, actual.nuc);
       for (int rev = 0; rev < 2; rev++) {
-        TEST_ASSERT_INT_EQ(expected.k6_emit[rev], actual.k6_emit[rev]);
-        TEST_ASSERT_INT_EQ(expected.k3_emit[rev], actual.k3_emit[rev]);
+        for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
+          int size = emit_kmer_sizes[layer];
+          int from = c.offset + i - (rev ? size / 2 : (size - 1) / 2);
+          TEST_ASSERT_INT_EQ(kmer(seq, c.genome_length, from, size, rev),
+                             (int)actual.kmer_emit[layer][rev]);
+          TEST_ASSERT_INT_EQ(expected.kmer_emit[layer][rev], actual.kmer_emit[layer][rev]);
+        }
         for (int off = 0; off < BOUNDARY_KMER_COUNT; off++)
           TEST_ASSERT_INT_EQ(expected.boundary_k2[rev][off], actual.boundary_k2[rev][off]);
         for (int off = 0; off < BOUNDARY_PWM_COUNT; off++) {
@@ -548,8 +558,8 @@ static void test_crf_reverse_complement_emissions(void) {
   for (int i = 0; i < length; i++) {
     Site a = site_at(&forward, i);
     Site b = site_at(&backward, length - i - 1);
-    TEST_ASSERT_INT_EQ(a.k6_emit[0], b.k6_emit[1]);
-    TEST_ASSERT_INT_EQ(a.k3_emit[0], b.k3_emit[1]);
+    for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
+      TEST_ASSERT_INT_EQ(a.kmer_emit[layer][0], b.kmer_emit[layer][1]);
     for (int st = 1; st <= 3; st++)
       TEST_ASSERT_DOUBLE_WITHIN(0, emission_score(w, &a, st), emission_score(w, &b, st + 6));
   }
@@ -716,11 +726,11 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
   int checked_groups[6] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
-    int group = (f < OFF_SPLICE_START_STOP) ? 0 :
+    int group = (f < OFF_E9) ? 0 :
+                (f < OFF_SPLICE_START_STOP) ? 4 :
                 (f < OFF_BP) ? 1 :
                 (f < OFF_BD) ? 2 :
-                (f < OFF_E3) ? 3 :
-                (f < OFF_PWM) ? 4 : 5;
+                (f < OFF_PWM) ? 3 : 5;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -822,7 +832,7 @@ static void test_crf_length_one(void) {
   for (int i = 0; i < WEIGHTS; i++) {
     w1[i] = rng_uniform(-1.0, 1.0);
     /* w2 has identical emission weights, but wildly different transition/boundary weights */
-    w2[i] = (i < OFF_SPLICE_START_STOP || (i >= OFF_E3 && i < OFF_PWM))
+    w2[i] = i < OFF_SPLICE_START_STOP
       ? w1[i] : rng_uniform(-50.0, 50.0);
   }
 
@@ -1007,7 +1017,7 @@ static void test_crf_no_valid_path_and_nonfinite(void) {
   /* Restore grammar and test non-finite weights (NaN and -INFINITY) */
   crf_init();
   Site s0 = site_at(&c, 0);
-  w[emission_index(&s0, 0)] = NAN;
+  w[emission_index(&s0, 1, 0)] = NAN;
   TEST_ASSERT_FAILS(contig_gradient(w, &c, &wk, grad));
   TEST_ASSERT_FAILS(crf_decode(w, &c, path));
   work_free(&wk);
@@ -1080,17 +1090,17 @@ static void test_crf_shift_invariance(void) {
   double shift_sum = 0.0;
   for (int t = 0; t < c.length; t++) {
     Site st = site_at(&c, t);
-    TEST_ASSERT(st.k6_emit[0] < 4096);
-    TEST_ASSERT(st.k6_emit[1] < 4096);
+    TEST_ASSERT(st.kmer_emit[1][0] < 4096);
+    TEST_ASSERT(st.kmer_emit[1][1] < 4096);
     for (int previous = 0; previous < t; previous++) {
       Site prior = site_at(&c, previous);
-      TEST_ASSERT(st.k6_emit[0] != prior.k6_emit[0]);
-      TEST_ASSERT(st.k6_emit[1] != prior.k6_emit[1]);
+      TEST_ASSERT(st.kmer_emit[1][0] != prior.kmer_emit[1][0]);
+      TEST_ASSERT(st.kmer_emit[1][1] != prior.kmer_emit[1][1]);
     }
     double ct = (t - 4) * 3.25 + 1.1;
     shift_sum += ct;
     for (int state = 0; state < STATES; state++)
-      w2[emission_index(&st, state)] += ct;
+      w2[emission_index(&st, 1, state)] += ct;
   }
 
   double logz1 = 0.0, logz2 = 0.0;
@@ -1763,12 +1773,12 @@ static void test_lbfgs_crf_directional_derivatives(void) {
         if (err_reg < best_reg_err) best_reg_err = err_reg;
       }
       TEST_ASSERT_DOUBLE_WITHIN(1e-8, 0.0, best_unreg_err);
-      TEST_ASSERT_DOUBLE_WITHIN(1e-7, 0.0, best_reg_err);
+      /* The L2 term sums over every weight, so roundoff scales with the objective. */
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7 * fmax(1.0, fabs(loss1)), 0.0, best_reg_err);
     }
 
     /* 3. Check scaled objective directional derivative across step sizes */
     double loss_scaled = crf_scaled_objective(theta, grad_repeat, &obj);
-    (void)loss_scaled;
     double dir_scaled = 0.0;
     for (int f = 0; f < WEIGHTS; f++)
       dir_scaled += grad_repeat[f] * dir[f];
@@ -1784,7 +1794,7 @@ static void test_lbfgs_crf_directional_derivatives(void) {
       double err_scaled = fabs((sp - sm) / (2.0 * h) - dir_scaled);
       if (err_scaled < best_scaled_err) best_scaled_err = err_scaled;
     }
-    TEST_ASSERT_DOUBLE_WITHIN(1e-8, 0.0, best_scaled_err);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-8 * fmax(1.0, fabs(loss_scaled)), 0.0, best_scaled_err);
 
     work_free(&wk);
   }
@@ -2178,6 +2188,20 @@ static double reference_gd_optimize(size_t n, double *x, lbfgs_evaluate evaluate
   return f;
 }
 
+/* crf_objective restricted to the active feature set that crf_train optimizes. */
+typedef struct {
+  CrfObjective *objective;
+  const double *freq;
+} MaskedObjective;
+
+static double masked_objective(const double *w, double *gradient, void *context) {
+  MaskedObjective *masked = context;
+  double loss = crf_objective(w, gradient, masked->objective);
+  for (int f = 0; f < WEIGHTS; f++)
+    if (!feature_active(masked->freq[f])) gradient[f] = 0;
+  return loss;
+}
+
 static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void) {
   crf_init();
 
@@ -2219,8 +2243,22 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   double *w_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
   crf_train(&c, 1, w_lbfgs, 60, 1);
 
+  /* Inactive features (unseen on the gold path) stay exactly zero; k9 emissions are learned */
+  double *count = anno_alloc(WEIGHTS, sizeof(double));
+  double *freq = anno_alloc(WEIGHTS, sizeof(double));
+  feature_counts(windows, win_count, count, freq);
+  MaskedObjective masked = {.objective = &obj, .freq = freq};
+  int active_k9 = 0, nonzero_k9 = 0;
+  for (int f = 0; f < WEIGHTS; f++) {
+    if (!feature_active(freq[f])) TEST_ASSERT(w_lbfgs[f] == 0.0);
+    else if (f >= OFF_E9 && f < OFF_SPLICE_START_STOP)
+      active_k9++, nonzero_k9 += w_lbfgs[f] != 0.0;
+  }
+  TEST_ASSERT_INT_EQ(9, active_k9);
+  TEST_ASSERT_INT_EQ(9, nonzero_k9);
+
   double *grad_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
-  double loss_lbfgs = crf_objective(w_lbfgs, grad_lbfgs, &obj);
+  double loss_lbfgs = masked_objective(w_lbfgs, grad_lbfgs, &masked);
   TEST_ASSERT(loss_lbfgs < loss0);
   TEST_ASSERT(lbfgs_norm(WEIGHTS, grad_lbfgs) < 1e-4);
 
@@ -2228,8 +2266,8 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
      final objective value, gradient norm, and predicted posterior path probabilities */
   double *w_ref = anno_alloc(WEIGHTS, sizeof(double));
   double *grad_ref = anno_alloc(WEIGHTS, sizeof(double));
-  double loss_ref = reference_gd_optimize(WEIGHTS, w_ref, crf_objective, &obj, 400);
-  loss_ref = crf_objective(w_ref, grad_ref, &obj);
+  double loss_ref = reference_gd_optimize(WEIGHTS, w_ref, masked_objective, &masked, 400);
+  loss_ref = masked_objective(w_ref, grad_ref, &masked);
 
   TEST_ASSERT_DOUBLE_WITHIN(1e-6, loss_ref, loss_lbfgs);
   TEST_ASSERT(lbfgs_norm(WEIGHTS, grad_ref) < 1e-4);
@@ -2254,6 +2292,8 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   free(grad_lbfgs);
   free(w_ref);
   free(grad_ref);
+  free(count);
+  free(freq);
   free_test_contig(&c);
 }
 
@@ -2311,8 +2351,9 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
   crf_train(contigs_1t, 2, w_1t, 50, 1);
   crf_train(contigs_4t, 2, w_2t, 50, 2);
 
+  /* CWT inputs differ by up to 1e-7 between thread counts, so trained weights differ slightly. */
   for (int f = 0; f < WEIGHTS; f++)
-    TEST_ASSERT_DOUBLE_WITHIN(1e-9, w_1t[f], w_2t[f]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-8, w_1t[f], w_2t[f]);
 
   for (int i = 0; i < 2; i++) {
     uint8_t path_1t[9] = {0}, path_2t[9] = {0};

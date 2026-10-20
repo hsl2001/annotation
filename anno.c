@@ -262,28 +262,41 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
   }
 }
 
+typedef struct {
+  uint32_t index;
+  float weight;
+} ModelEntry;
+
 static void save_model(const char *path, const double *w) {
-  float *values = anno_alloc(WEIGHTS, sizeof(*values));
-  for (int i = 0; i < WEIGHTS; i++) values[i] = (float)w[i];
+  ModelEntry *entries = anno_alloc(WEIGHTS, sizeof(*entries));
+  uint32_t header[2] = {WEIGHTS, 0};
+  for (int i = 0; i < WEIGHTS; i++)
+    if ((float)w[i]) entries[header[1]++] = (ModelEntry){(uint32_t)i, (float)w[i]};
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fclose(file))
+  if (!file || fwrite(header, sizeof(*header), 2, file) != 2 ||
+      fwrite(entries, sizeof(*entries), header[1], file) != header[1] || fclose(file))
     anno_fail("Cannot write model: %s", path);
-  free(values);
+  free(entries);
   crf_save_weights_text("anno.weights.txt", w);
 }
 
 static void load_model(const char *path, double *w) {
-  float *values = anno_alloc(WEIGHTS, sizeof(*values));
+  uint32_t header[2];
   FILE *file = fopen(path, "rb");
-  if (!file || fread(values, sizeof(*values), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF)
-    anno_fail("Cannot read model: %s (expected %d weights; older feature layouts require retraining)",
-              path, WEIGHTS);
+  if (!file || fread(header, sizeof(*header), 2, file) != 2 || header[0] != WEIGHTS ||
+      header[1] > WEIGHTS)
+    anno_fail("Cannot read model: %s (expected %d-weight feature layout)", path, WEIGHTS);
+  ModelEntry *entries = anno_alloc(header[1], sizeof(*entries));
+  if (fread(entries, sizeof(*entries), header[1], file) != header[1] || fgetc(file) != EOF)
+    anno_fail("Truncated or oversized model: %s", path);
   fclose(file);
-  for (int i = 0; i < WEIGHTS; i++) {
-    w[i] = values[i];
-    if (!isfinite(w[i])) anno_fail("Non-finite model weight: %s", path);
+  memset(w, 0, WEIGHTS * sizeof(*w));
+  for (uint32_t i = 0; i < header[1]; i++) {
+    if (entries[i].index >= WEIGHTS) anno_fail("Model weight index out of range: %s", path);
+    if (!isfinite(entries[i].weight)) anno_fail("Non-finite model weight: %s", path);
+    w[entries[i].index] = entries[i].weight;
   }
-  free(values);
+  free(entries);
 }
 
 static FILE *create_in(const char *directory, const char *name) {

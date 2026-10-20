@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #define CRF_L2_C2 1.0
+#define CRF_MIN_FREQ 1
 
 /* Linear-chain CRF decoded jointly for both strands with strand-shared emissions.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
@@ -16,15 +17,15 @@ enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
   STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
-  K2 = 17, K3 = 65, K6 = 4097, KNUC = 5,
+  K2 = 17, K3 = 65, K6 = 4097, K9 = 262145, KNUC = 5, EMIT_KMER_LAYERS = 3,
   BOUNDARY_PWM_FROM = -24, BOUNDARY_PWM_COUNT = 33,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0]),
-  OFF_E6 = 0, OFF_SPLICE_START_STOP = OFF_E6 + EMIT_STATES * K6,
+  OFF_E3 = 0, OFF_E6 = OFF_E3 + EMIT_STATES * K3, OFF_E9 = OFF_E6 + EMIT_STATES * K6,
+  OFF_SPLICE_START_STOP = OFF_E9 + EMIT_STATES * K9,
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
-  OFF_E3 = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
-  OFF_PWM = OFF_E3 + EMIT_STATES * K3,
+  OFF_PWM = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
   WEIGHTS = OFF_PWM + 4 * BOUNDARY_PWM_COUNT * KNUC
 };
 
@@ -44,9 +45,13 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <stdlib.h>
 #include <string.h>
 
+static const int emit_kmer_sizes[EMIT_KMER_LAYERS] = {3, 6, 9};
+static const int emit_kmer_offsets[EMIT_KMER_LAYERS] = {OFF_E3, OFF_E6, OFF_E9};
+static const int emit_kmer_counts[EMIT_KMER_LAYERS] = {K3, K6, K9};
+
 typedef struct {
-  uint16_t k6_emit[2];
-  uint8_t k3_emit[2], boundary_nuc[2][BOUNDARY_PWM_COUNT];
+  uint32_t kmer_emit[EMIT_KMER_LAYERS][2];
+  uint8_t boundary_nuc[2][BOUNDARY_PWM_COUNT];
   uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
 } Site;
 
@@ -60,7 +65,6 @@ typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
 static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
 static int hidden_edge_count[KNUC];
 static uint8_t rev_k2[K2];
-static uint16_t rev_k6[K6];
 
 static int kmer(const char *seq, int length, int from, int size, int reverse) {
   int code = 0;
@@ -75,7 +79,11 @@ static int kmer(const char *seq, int length, int from, int size, int reverse) {
 
 static void site_context(const Contig *c, int position, Site *site) {
   for (int rev = 0; rev < 2; rev++) {
-    site->k3_emit[rev] = (uint8_t)kmer(c->seq, c->genome_length, position - 1, 3, rev);
+    for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
+      int size = emit_kmer_sizes[layer];
+      site->kmer_emit[layer][rev] = (uint32_t)kmer(
+        c->seq, c->genome_length, position - (rev ? size / 2 : (size - 1) / 2), size, rev);
+    }
     for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++) {
       int displacement = BOUNDARY_PWM_FROM + offset;
       int g = rev ? position - displacement - 1 : position + displacement;
@@ -88,11 +96,7 @@ static void site_context(const Contig *c, int position, Site *site) {
 static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
-  Site s = {
-    .k6_emit = {kmer(c->seq, c->genome_length, position - 2, 6, 0),
-                kmer(c->seq, c->genome_length, position - 3, 6, 1)},
-    .nuc = base < 0 ? 4 : base
-  };
+  Site s = {.nuc = base < 0 ? 4 : base};
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
     int displacement = boundary_kmer_offsets[offset];
     s.boundary_k2[0][offset] = kmer(c->seq, c->genome_length, position + displacement, 2, 0);
@@ -259,15 +263,6 @@ void crf_init(void) {
   for (int k = 0; k < 16; k++)
     rev_k2[k] = (uint8_t)(((3 - (k & 3)) << 2) | (3 - ((k >> 2) & 3)));
   rev_k2[16] = 16;
-  for (int k = 0; k < 4096; k++) {
-    int r = 0, tmp = k;
-    for (int i = 0; i < 6; i++) {
-      r = (r << 2) | (3 - (tmp & 3));
-      tmp >>= 2;
-    }
-    rev_k6[k] = (uint16_t)r;
-  }
-  rev_k6[4096] = 4096;
 }
 
 static int emit_state(int state) {
@@ -275,21 +270,21 @@ static int emit_state(int state) {
   return state <= 9 ? state - 6 : 4 + (state - 9) % 3;
 }
 
-static int emission_index(const Site *site, int state) {
-  return OFF_E6 + emit_state(state) * K6 + site->k6_emit[state >= 7];
-}
-
-static int emission_backoff_index(const Site *site, int state) {
-  return OFF_E3 + emit_state(state) * K3 + site->k3_emit[state >= 7];
+static int emission_index(const Site *site, int layer, int state) {
+  return emit_kmer_offsets[layer] + emit_state(state) * emit_kmer_counts[layer] +
+         (int)site->kmer_emit[layer][state >= 7];
 }
 
 static double emission_score(const double *w, const Site *site, int state) {
-  return w[emission_index(site, state)] + w[emission_backoff_index(site, state)];
+  double score = 0;
+  for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
+    score += w[emission_index(site, layer, state)];
+  return score;
 }
 
 static void emission_accumulate(double *values, const Site *site, int state, double value) {
-  values[emission_index(site, state)] += value;
-  values[emission_backoff_index(site, state)] += value;
+  for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
+    values[emission_index(site, layer, state)] += value;
 }
 
 typedef struct {
@@ -308,8 +303,6 @@ typedef struct {
   uint8_t nuc_ring[64];
   uint8_t k2_ring[64];
   CwtCached cwt_ring[64];
-  uint16_t k6_fwd;
-  int k6_valid_run;
 } SiteStream;
 
 static inline void site_stream_fill_cwt(SiteStream *s, int g) {
@@ -352,17 +345,6 @@ static void site_stream_init(SiteStream *s, const Contig *c, int start_position)
     uint8_t b0 = s->nuc_ring[g & 63], b1 = s->nuc_ring[(g + 1) & 63];
     s->k2_ring[g & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
   }
-  s->k6_fwd = 0;
-  s->k6_valid_run = 0;
-  for (int g = g_start - 3; g <= g_start + 2; g++) {
-    uint8_t b = s->nuc_ring[g & 63];
-    if (b < 4) {
-      s->k6_fwd = (uint16_t)(((s->k6_fwd << 2) | b) & 4095);
-      s->k6_valid_run++;
-    } else {
-      s->k6_valid_run = 0;
-    }
-  }
   for (int g = g_start - 27; g <= g_start + 25; g++)
     site_stream_fill_cwt(s, g);
 }
@@ -379,21 +361,10 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
   uint8_t b0 = s->nuc_ring[g_k2 & 63], b1 = s->nuc_ring[(g_k2 + 1) & 63];
   s->k2_ring[g_k2 & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
 
-  uint16_t reverse_k6 = rev_k6[s->k6_valid_run >= 6 ? s->k6_fwd : 4096];
-  uint8_t b_k6 = s->nuc_ring[(g0 + 3) & 63];
-  if (b_k6 < 4) {
-    s->k6_fwd = (uint16_t)(((s->k6_fwd << 2) | b_k6) & 4095);
-    s->k6_valid_run++;
-  } else {
-    s->k6_valid_run = 0;
-  }
   site_stream_fill_cwt(s, g0 + 26);
 
   Site site;
   site.nuc = s->nuc_ring[g0 & 63];
-  uint16_t k6 = s->k6_valid_run >= 6 ? s->k6_fwd : 4096;
-  site.k6_emit[0] = k6;
-  site.k6_emit[1] = reverse_k6;
   site_context(c, g0, &site);
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
     uint8_t k2f = s->k2_ring[(g0 + boundary_kmer_offsets[offset]) & 63];
@@ -799,9 +770,14 @@ static double crf_scaled_objective(const double *v, double *gradient, void *cont
   return loss;
 }
 
-/* scale_f = 1 / sqrt(max(1, sum of squared gold-path values of feature f)). */
-static void feature_scales(const CrfWindow *windows, size_t count, double *scale) {
+static inline void feature_observe(double *scale, double *freq, int f, double value) {
+  scale[f] += value * value;
+  if (freq && value != 0) freq[f] += 1;
+}
+
+static void feature_counts(const CrfWindow *windows, size_t count, double *scale, double *freq) {
   memset(scale, 0, WEIGHTS * sizeof(*scale));
+  if (freq) memset(freq, 0, WEIGHTS * sizeof(*freq));
   for (size_t w = 0; w < count; w++) {
     Contig c = *windows[w].contig;
     c.offset = windows[w].start;
@@ -809,16 +785,16 @@ static void feature_scales(const CrfWindow *windows, size_t count, double *scale
     for (int i = 0; i < c.length; i++) {
       Site site = site_at(&c, i);
       int state = c.label[c.offset + i];
-      scale[emission_index(&site, state)] += 1;
-      scale[emission_backoff_index(&site, state)] += 1;
+      for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
+        feature_observe(scale, freq, emission_index(&site, layer, state), 1);
       if (!i) continue;
       int previous = c.label[c.offset + i - 1];
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
       if (kind >= 0) {
         for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
-          scale[boundary_kmer_index(&site, reverse, kind, offset)] += 1;
+          feature_observe(scale, freq, boundary_kmer_index(&site, reverse, kind, offset), 1);
         for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++)
-          scale[boundary_pwm_index(&site, reverse, kind, offset)] += 1;
+          feature_observe(scale, freq, boundary_pwm_index(&site, reverse, kind, offset), 1);
         if (kind == 1) {
           int genome_position = c.offset + i;
           for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
@@ -827,17 +803,58 @@ static void feature_scales(const CrfWindow *windows, size_t count, double *scale
             boundary_cwt_at(&c, genome_position, reverse, offset, power, derivative);
             int base = offset * WAVE_COUNT;
             for (int k = 0; k < WAVE_COUNT; k++) {
-              scale[OFF_BP + base + k] += (double)power[k] * power[k];
+              feature_observe(scale, freq, OFF_BP + base + k, power[k]);
               for (int slot = 0; slot < DERIV_COUNT; slot++)
-                scale[derivative_index(slot, offset, k)] +=
-                  derivative[slot][k] * derivative[slot][k];
+                feature_observe(scale, freq, derivative_index(slot, offset, k),
+                                derivative[slot][k]);
             }
           }
         }
       }
     }
   }
+}
+
+static void counts_to_scales(double *scale) {
   for (int f = 0; f < WEIGHTS; f++) scale[f] = 1 / sqrt(fmax(scale[f], 1));
+}
+
+static int feature_active(double freq) {
+  return freq >= CRF_MIN_FREQ;
+}
+
+static const struct {
+  const char *name;
+  int from, to;
+} feature_groups[] = {
+  {"emit_k3", OFF_E3, OFF_E6},
+  {"emit_k6", OFF_E6, OFF_E9},
+  {"emit_k9", OFF_E9, OFF_SPLICE_START_STOP},
+  {"boundary_k2", OFF_SPLICE_START_STOP, OFF_BP},
+  {"boundary_cwt_power", OFF_BP, OFF_BD},
+  {"boundary_cwt_deriv", OFF_BD, OFF_PWM},
+  {"boundary_pwm", OFF_PWM, WEIGHTS}
+};
+enum { FEATURE_GROUPS = sizeof(feature_groups) / sizeof(feature_groups[0]) };
+
+typedef struct {
+  CrfObjective *inner;
+  int *index, count;
+  double *v, *gradient;
+} CrfActive;
+
+static double crf_active_objective(const double *x, double *gradient, void *context) {
+  CrfActive *active = context;
+  for (int i = 0; i < active->count; i++) active->v[active->index[i]] = x[i];
+  double loss = crf_scaled_objective(active->v, active->gradient, active->inner);
+  for (int i = 0; i < active->count; i++) gradient[i] = active->gradient[active->index[i]];
+  return loss;
+}
+
+static void crf_active_progress(void *context, int iteration, double objective, double step,
+                                int line_search_trials, size_t n, const double *gradient) {
+  crf_progress(((CrfActive *)context)->inner, iteration, objective, step, line_search_trials,
+               n, gradient);
 }
 
 void crf_train(Contig *contigs, int count, double *w, int iterations, int threads) {
@@ -865,12 +882,34 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   int completed = 0;
   objective.scale = anno_alloc(WEIGHTS, sizeof(*objective.scale));
   objective.weights = anno_alloc(WEIGHTS, sizeof(*objective.weights));
-  feature_scales(windows, window_count, objective.scale);
-  for (int f = 0; f < WEIGHTS; f++)
-    w[f] /= objective.scale[f];
-  LbfgsStatus status = lbfgs_minimize(WEIGHTS, w, crf_scaled_objective, crf_progress, &objective,
-                                      iterations, &completed);
-  for (int f = 0; f < WEIGHTS; f++) w[f] *= objective.scale[f];
+  double *freq = anno_alloc(WEIGHTS, sizeof(*freq));
+  feature_counts(windows, window_count, objective.scale, freq);
+  CrfActive active = {
+    .inner = &objective,
+    .index = anno_alloc(WEIGHTS, sizeof(*active.index)),
+    .v = anno_alloc(WEIGHTS, sizeof(*active.v)),
+    .gradient = anno_alloc(WEIGHTS, sizeof(*active.gradient))
+  };
+  fprintf(stderr, "Active features (min frequency %d):", CRF_MIN_FREQ);
+  for (int g = 0; g < FEATURE_GROUPS; g++) {
+    int group_active = 0;
+    for (int f = feature_groups[g].from; f < feature_groups[g].to; f++)
+      if (feature_active(freq[f])) active.index[active.count++] = f, group_active++;
+    fprintf(stderr, " %s %d/%d", feature_groups[g].name, group_active,
+            feature_groups[g].to - feature_groups[g].from);
+  }
+  fprintf(stderr, ", total %d/%d\n", active.count, WEIGHTS);
+  free(freq);
+  counts_to_scales(objective.scale);
+  double *x = anno_alloc((size_t)active.count, sizeof(*x));
+  for (int i = 0; i < active.count; i++)
+    x[i] = w[active.index[i]] / objective.scale[active.index[i]];
+  LbfgsStatus status = lbfgs_minimize((size_t)active.count, x, crf_active_objective,
+                                      crf_active_progress, &active, iterations, &completed);
+  memset(w, 0, WEIGHTS * sizeof(*w));
+  for (int i = 0; i < active.count; i++)
+    w[active.index[i]] = x[i] * objective.scale[active.index[i]];
+  free(x), free(active.index), free(active.v), free(active.gradient);
   free(objective.scale), free(objective.weights);
   for (int t = 0; t < objective.train.threads; t++) {
     work_free(&objective.workers[t].work);
@@ -1085,58 +1124,48 @@ void crf_save_weights_text(const char *path, const double *w) {
   if (!file) anno_fail("Cannot write weights text: %s", path);
   fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
 
-  char kbuf[7];
-  for (int s = 0; s < EMIT_STATES; s++) {
-    for (int k = 0; k < K6; k++) {
-      int idx = OFF_E6 + s * K6 + k;
-      format_kmer(k, 6, kbuf);
-      fprintf(file, "%d\temit_k6\t%s\tk6=%s\t%.9g\n",
-              idx, state_names[s], kbuf, (float)w[idx]);
-    }
+  char kbuf[10];
+  for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
+    int size = emit_kmer_sizes[layer];
+    for (int s = 0; s < EMIT_STATES; s++)
+      for (int k = 0; k < emit_kmer_counts[layer]; k++) {
+        int idx = emit_kmer_offsets[layer] + s * emit_kmer_counts[layer] + k;
+        if (!(float)w[idx]) continue;
+        format_kmer(k, size, kbuf);
+        fprintf(file, "%d\temit_k%d\t%s\tk%d=%s\t%.9g\n",
+                idx, size, state_names[s], size, kbuf, (float)w[idx]);
+      }
   }
-
-  for (int kind = 0; kind < 4; kind++) {
-    for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
-      int disp = boundary_kmer_offsets[offset];
+  for (int kind = 0; kind < 4; kind++)
+    for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
       for (int k = 0; k < K2; k++) {
         int idx = OFF_SPLICE_START_STOP + (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
+        if (!(float)w[idx]) continue;
         format_kmer(k, 2, kbuf);
         fprintf(file, "%d\tboundary_k2\t%s\toffset=%+d,k2=%s\t%.9g\n",
-                idx, kind_names[kind], disp, kbuf, (float)w[idx]);
+                idx, kind_names[kind], boundary_kmer_offsets[offset], kbuf, (float)w[idx]);
       }
-    }
-  }
-  for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-    int disp = boundary_cwt_offsets[offset];
-    int base = offset * WAVE_COUNT;
+  for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
     for (int sc = 0; sc < WAVE_COUNT; sc++) {
-      int idx = OFF_BP + base + sc;
+      int idx = OFF_BP + offset * WAVE_COUNT + sc;
+      if (!(float)w[idx]) continue;
       fprintf(file, "%d\tboundary_cwt_power\t%s\toffset=%+d,scale=%d\t%.9g\n",
-              idx, kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
+              idx, kind_names[1], boundary_cwt_offsets[offset], wave_sizes[sc], (float)w[idx]);
     }
-  }
-  for (int slot = 0; slot < DERIV_COUNT; slot++) {
-    for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-      int disp = boundary_cwt_offsets[offset];
+  for (int slot = 0; slot < DERIV_COUNT; slot++)
+    for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
       for (int sc = 0; sc < WAVE_COUNT; sc++) {
         int idx = derivative_index(slot, offset, sc);
+        if (!(float)w[idx]) continue;
         fprintf(file, "%d\tboundary_cwt_deriv%d\t%s\toffset=%+d,scale=%d\t%.9g\n",
-                idx, slot + 1, kind_names[1], disp, wave_sizes[sc], (float)w[idx]);
+                idx, slot + 1, kind_names[1], boundary_cwt_offsets[offset], wave_sizes[sc],
+                (float)w[idx]);
       }
-    }
-  }
-
-  for (int s = 0; s < EMIT_STATES; s++)
-    for (int k = 0; k < K3; k++) {
-      int idx = OFF_E3 + s * K3 + k;
-      format_kmer(k, 3, kbuf);
-      fprintf(file, "%d\temit_k3\t%s\tk3=%s\t%.9g\n",
-              idx, state_names[s], kbuf, (float)w[idx]);
-    }
   for (int kind = 0; kind < 4; kind++)
     for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++)
       for (int b = 0; b < KNUC; b++) {
         int idx = OFF_PWM + (kind * BOUNDARY_PWM_COUNT + offset) * KNUC + b;
+        if (!(float)w[idx]) continue;
         fprintf(file, "%d\tboundary_pwm\t%s\toffset=%+d,base=%c\t%.9g\n",
                 idx, kind_names[kind], BOUNDARY_PWM_FROM + offset, "ACGTN"[b], (float)w[idx]);
       }
