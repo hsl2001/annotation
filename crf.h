@@ -9,14 +9,18 @@
 
 /* Linear-chain CRF decoded jointly for both strands with strand-shared emissions.
    0 intergenic; 1-3 CDS(+) codon position; 4-6 intron(+) carrying the codon position of the
-   next exon base; 7-9 CDS(-) codon position; 10-12 intron(-). */
+   next exon base; 7-9 CDS(-) codon position; 10-12 intron(-).
+   Seven phase-independent transition biases are strand-shared in transcript direction:
+   intergenic->intergenic, intergenic->CDS, CDS->intergenic, CDS->CDS,
+   CDS->intron, intron->CDS, intron->intron. No bias is applied at the first base.
+   Adding these weights changes the model layout; older models require retraining. */
 static const int boundary_kmer_offsets[] = {-8, -7, -6, -5, -4, -3, -2, -1,
                                            0, 1, 2, 3, 4, 5, 6};
 static const int boundary_cwt_offsets[] = {-27, -26, -25, -24, -2, -1, 0, 1, 2};
 enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
-  STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
+  STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39, TRANSITION_FEATURES = 7,
   K2 = 17, K3 = 65, KNUC = 5, EMIT_KMER_LAYERS = 1,
   BOUNDARY_PWM_FROM = -24, BOUNDARY_PWM_COUNT = 33,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
@@ -26,7 +30,8 @@ enum {
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   OFF_PWM = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT,
-  WEIGHTS = OFF_PWM + 4 * BOUNDARY_PWM_COUNT * KNUC
+  OFF_TRANSITION = OFF_PWM + 4 * BOUNDARY_PWM_COUNT * KNUC,
+  WEIGHTS = OFF_TRANSITION + TRANSITION_FEATURES
 };
 
 void crf_init(void);
@@ -114,6 +119,20 @@ static int boundary_kind(int previous, int current) {
   if ((previous == 0 && current == 1) || (previous == 7 && current == 0)) return 2;
   if ((previous == 3 && current == 0) || (previous == 0 && current == 9)) return 3;
   return -1;
+}
+
+static int transition_index(int previous, int current) {
+  static const int indices[3][3] = {{0, 1, -1}, {2, 3, 4}, {-1, 5, 6}};
+  int a = previous == 0 ? 0 : (previous - 1) % 6 < 3 ? 1 : 2;
+  int b = current == 0 ? 0 : (current - 1) % 6 < 3 ? 1 : 2;
+  if (previous >= 7 || current >= 7) {
+    int swap = a;
+    a = b;
+    b = swap;
+  }
+  int index = indices[a][b];
+  if (index < 0) anno_fail("Invalid CRF transition feature: %d -> %d", previous, current);
+  return OFF_TRANSITION + index;
 }
 
 static const double derivative_kernels[DERIV_COUNT][2 * DERIV_RADIUS + 1] = {
@@ -416,7 +435,8 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
 
   for (int edge = 0; edge < ntrans; edge++) {
     int reverse = edge_rev[edge], kind = edge_kind[edge];
-    double score = kind >= 0 ? b_score[reverse][kind] : 0;
+    double score = w[transition_index(trans_a[edge], trans_b[edge])];
+    if (kind >= 0) score += b_score[reverse][kind];
     double p = score + emissions[trans_b[edge]];
     if (!isfinite(p))
       anno_fail("Non-finite CRF transition at position %d", position + 1);
@@ -579,6 +599,7 @@ static double contig_gradient(const double *w, const Contig *c,
       for (int edge = 0; edge < ntrans; edge++) {
         double m = edge_marginals[edge];
         if (m != 0) {
+          gradient[transition_index(trans_a[edge], trans_b[edge])] -= m;
           int reverse = edge_rev[edge], kind = edge_kind[edge];
           if (kind >= 0) {
             b_coeff[kind][reverse] -= m;
@@ -789,6 +810,7 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
         feature_observe(scale, freq, emission_index(&site, layer, state), 1);
       if (!i) continue;
       int previous = c.label[c.offset + i - 1];
+      feature_observe(scale, freq, transition_index(previous, state), 1);
       int reverse = previous >= 7 || state >= 7, kind = boundary_kind(previous, state);
       if (kind >= 0) {
         for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
@@ -831,7 +853,8 @@ static const struct {
   {"boundary_k2", OFF_SPLICE_START_STOP, OFF_BP},
   {"boundary_cwt_power", OFF_BP, OFF_BD},
   {"boundary_cwt_deriv", OFF_BD, OFF_PWM},
-  {"boundary_pwm", OFF_PWM, WEIGHTS}
+  {"boundary_pwm", OFF_PWM, OFF_TRANSITION},
+  {"transition", OFF_TRANSITION, WEIGHTS}
 };
 enum { FEATURE_GROUPS = sizeof(feature_groups) / sizeof(feature_groups[0]) };
 
@@ -1117,6 +1140,10 @@ void crf_save_weights_text(const char *path, const double *w) {
   static const char *const kind_names[4] = {
     "5ss", "3ss", "start_codon", "stop_codon"
   };
+  static const char *const transition_names[TRANSITION_FEATURES] = {
+    "intergenic->intergenic", "intergenic->CDS", "CDS->intergenic", "CDS->CDS",
+    "CDS->intron", "intron->CDS", "intron->intron"
+  };
 
   FILE *file = fopen(path, "w");
   if (!file) anno_fail("Cannot write weights text: %s", path);
@@ -1167,6 +1194,13 @@ void crf_save_weights_text(const char *path, const double *w) {
         fprintf(file, "%d\tboundary_pwm\t%s\toffset=%+d,base=%c\t%.9g\n",
                 idx, kind_names[kind], BOUNDARY_PWM_FROM + offset, "ACGTN"[b], (float)w[idx]);
       }
+
+  for (int transition = 0; transition < TRANSITION_FEATURES; transition++) {
+    int idx = OFF_TRANSITION + transition;
+    if (!(float)w[idx]) continue;
+    fprintf(file, "%d\ttransition\t%s\tbias\t%.9g\n",
+            idx, transition_names[transition], (float)w[idx]);
+  }
 
   if (fclose(file)) anno_fail("Cannot finish writing weights text: %s", path);
 }

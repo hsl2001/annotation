@@ -247,6 +247,17 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
       int edge = pair_to_edge[prev][st];
       int rev = edge_rev[edge];
       int kind = edge_kind[edge];
+      int a = prev == 0 ? 0 : (prev <= 3 || (prev >= 7 && prev <= 9)) ? 1 : 2;
+      int b = st == 0 ? 0 : (st <= 3 || (st >= 7 && st <= 9)) ? 1 : 2;
+      if (rev) {
+        int swap = a;
+        a = b;
+        b = swap;
+      }
+      const int transition_ids[3][3] = {{0, 1, -1}, {2, 3, 4}, {-1, 5, 6}};
+      int transition = OFF_TRANSITION + transition_ids[a][b];
+      total_score += w[transition];
+      if (feat_accum) feat_accum[transition] += scale;
       if (kind >= 0) {
         for (int off = 0; off < BOUNDARY_KMER_COUNT; off++) {
           int k_idx = boundary_kmer_index(&site, rev, kind, off);
@@ -568,6 +579,83 @@ static void test_crf_reverse_complement_emissions(void) {
   free_test_contig(&backward);
 }
 
+static void test_crf_phase_independent_transitions(void) {
+  crf_init();
+  double *w = anno_alloc(WEIGHTS, sizeof(*w));
+  for (int f = 0; f < TRANSITION_FEATURES; f++) w[OFF_TRANSITION + f] = 0.2 * (f + 1);
+
+  const char *seq = "AAATGTTGTAAA";
+  const uint8_t gold[] = {0, 0, 1, 2, 3, 4, 4, 4, 1, 2, 3, 0};
+  const double counts[TRANSITION_FEATURES] = {1, 1, 1, 4, 1, 1, 2};
+  int length = (int)strlen(seq);
+  char reverse[sizeof(gold) + 1];
+  uint8_t reverse_gold[sizeof(gold)];
+  for (int i = 0; i < length; i++) {
+    reverse[i] = "TGCA"[base_index(seq[length - 1 - i])];
+    int st = gold[length - 1 - i];
+    reverse_gold[i] = st == 0 ? 0 : st <= 3 ? st + 6 : 10 + (st - 2) % 3;
+  }
+  reverse[length] = '\0';
+
+  for (int rev = 0; rev < 2; rev++) {
+    Contig c = make_test_contig(rev ? reverse : seq, 0, length, rev ? reverse_gold : gold);
+    TEST_ASSERT(gold_path_valid(&c));
+    SiteStream stream;
+    site_stream_init(&stream, &c, 0);
+    double emissions[STATES], psi[STATES * STATES];
+    site_scores_stream(w, &stream, 0, emissions, psi);
+    int seen[TRANSITION_FEATURES] = {0};
+    for (int edge = 0; edge < ntrans; edge++) {
+      int a = trans_a[edge], b = trans_b[edge], kind = edge_kind[edge];
+      const int boundary_ids[4] = {4, 5, 1, 2};
+      int id = kind >= 0 ? boundary_ids[kind] : !a ? 0 :
+               (a <= 3 || (a >= 7 && a <= 9)) ? 3 : 6;
+      TEST_ASSERT_INT_EQ(OFF_TRANSITION + id, transition_index(a, b));
+      TEST_ASSERT_DOUBLE_WITHIN(0, w[OFF_TRANSITION + id], psi[edge]);
+      seen[id]++;
+    }
+    for (int f = 0; f < TRANSITION_FEATURES; f++) TEST_ASSERT(seen[f] > 0);
+
+    CrfWindow window = {&c, 0, length};
+    double scale[WEIGHTS], freq[WEIGHTS], gold_features[WEIGHTS] = {0};
+    feature_counts(&window, 1, scale, freq);
+    bf_score_and_accumulate_features(w, &c, c.label, 1, gold_features);
+    for (int f = 0; f < TRANSITION_FEATURES; f++) {
+      int idx = OFF_TRANSITION + f;
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], scale[idx]);
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], freq[idx]);
+      TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], gold_features[idx]);
+    }
+
+    BruteForceCrf bf;
+    bf_crf_solve(w, &c, &bf, 0);
+    Work work = {0};
+    double gradient[WEIGHTS] = {0};
+    double likelihood = contig_gradient(w, &c, &work, gradient);
+    double gold_score = bf_score_and_accumulate_features(w, &c, c.label, 0, NULL);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-11, gold_score - bf.logz, likelihood);
+    for (int f = 0; f < TRANSITION_FEATURES; f++) {
+      int idx = OFF_TRANSITION + f;
+      TEST_ASSERT_DOUBLE_WITHIN(1e-10, counts[f] - bf.expected_features[idx], gradient[idx]);
+      double original = w[idx], dummy[WEIGHTS] = {0};
+      w[idx] = original + 1e-6;
+      double plus = contig_gradient(w, &c, &work, dummy);
+      w[idx] = original - 1e-6;
+      double minus = contig_gradient(w, &c, &work, dummy);
+      w[idx] = original;
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7, gradient[idx], (plus - minus) / 2e-6);
+    }
+    uint8_t path[sizeof(gold)];
+    crf_decode(w, &c, path);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf.max_score,
+                             bf_score_and_accumulate_features(w, &c, path, 0, NULL));
+    work_free(&work);
+    free_test_contig(&c);
+  }
+
+  free(w);
+}
+
 static void test_crf_k2_exhaustive_t1_to_t5(void) {
   setup_k2_binary_crf();
   rng_seed(1001);
@@ -723,13 +811,14 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
 
   /* Verify finite differences against dp_grad across active emission, boundary_k2, CWT power, and CWT deriv weights */
   const double eps = 1e-6;
-  int checked_groups[5] = {0};
+  int checked_groups[6] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
     int group = (f < OFF_SPLICE_START_STOP) ? 0 :
                 (f < OFF_BP) ? 1 :
                 (f < OFF_BD) ? 2 :
-                (f < OFF_PWM) ? 3 : 4;
+                (f < OFF_PWM) ? 3 :
+                (f < OFF_TRANSITION) ? 4 : 5;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -746,7 +835,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     double fd = (ll_p - ll_m) / (2.0 * eps);
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd, dp_grad[f]);
   }
-  for (int g = 0; g < 5; g++) TEST_ASSERT(checked_groups[g] > 0);
+  for (int g = 0; g < 6; g++) TEST_ASSERT(checked_groups[g] > 0);
 
   /* Case B: Minus-strand sequence with reverse-complement stop ("TTA"), intron (10..12), and start ("CAT") */
   const char *minus_genome =
@@ -2381,6 +2470,7 @@ int main(void) {
   /* 1. CRF Module */
   RUN_TEST(test_crf_context_coordinates_and_stream);
   RUN_TEST(test_crf_reverse_complement_emissions);
+  RUN_TEST(test_crf_phase_independent_transitions);
   RUN_TEST(test_crf_k2_exhaustive_t1_to_t5);
   RUN_TEST(test_crf_grammar_exhaustive_both_strands);
   RUN_TEST(test_crf_zero_scores);
