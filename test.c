@@ -238,6 +238,13 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
     int e_idx = emission_index(&site, st);
     total_score += w[e_idx];
     if (feat_accum) feat_accum[e_idx] += scale;
+    int backoff_idx = OFF_E3 + emit_state(st) * K3 + site.k3_emit[st >= 7];
+    int bias_idx = OFF_EMIT_BIAS + emit_state(st);
+    total_score += w[backoff_idx] + w[bias_idx];
+    if (feat_accum) {
+      feat_accum[backoff_idx] += scale;
+      feat_accum[bias_idx] += scale;
+    }
 
     if (t > 0) {
       int prev = y[t - 1];
@@ -249,6 +256,12 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
           int k_idx = boundary_kmer_index(&site, rev, kind, off);
           total_score += w[k_idx];
           if (feat_accum) feat_accum[k_idx] += scale;
+        }
+        for (int off = 0; off < BOUNDARY_PWM_COUNT; off++) {
+          int idx = OFF_PWM + (kind * BOUNDARY_PWM_COUNT + off) * KNUC +
+                    site.boundary_nuc[rev][off];
+          total_score += w[idx];
+          if (feat_accum) feat_accum[idx] += scale;
         }
         if (kind == 1) {
           int gpos = c->offset + t;
@@ -490,6 +503,68 @@ static void free_test_contig(Contig *c) {
  * Part 1 Tests: CRF Module
  * ========================================================================= */
 
+static void test_crf_context_coordinates_and_stream(void) {
+  crf_init();
+  const char *seq = "ACgtNATGCCATTAACCGGTANCGTTAGCACGTACGTACGTACGT";
+  Contig c = make_test_contig(seq, 2, (int)strlen(seq) - 4, NULL);
+  double *w = anno_alloc(WEIGHTS, sizeof(*w));
+  for (int f = 0; f < WEIGHTS; f++) w[f] = sin(f * 0.17) * 0.1;
+  for (int start = 0; start < c.length; start += 7) {
+    SiteStream stream;
+    site_stream_init(&stream, &c, start);
+    for (int i = start; i < c.length; i++) {
+      double emissions[STATES], psi[STATES * STATES];
+      Site actual = site_scores_stream(w, &stream, i, emissions, psi);
+      Site expected = site_at(&c, i);
+      TEST_ASSERT_INT_EQ(expected.nuc, actual.nuc);
+      for (int rev = 0; rev < 2; rev++) {
+        TEST_ASSERT_INT_EQ(expected.k6_emit[rev], actual.k6_emit[rev]);
+        TEST_ASSERT_INT_EQ(expected.k3_emit[rev], actual.k3_emit[rev]);
+        for (int off = 0; off < BOUNDARY_KMER_COUNT; off++)
+          TEST_ASSERT_INT_EQ(expected.boundary_k2[rev][off], actual.boundary_k2[rev][off]);
+        for (int off = 0; off < BOUNDARY_PWM_COUNT; off++) {
+          int d = BOUNDARY_PWM_FROM + off;
+          int g = rev ? c.offset + i - d - 1 : c.offset + i + d;
+          int b = g >= 0 && g < c.genome_length ? base_index(seq[g]) : -1;
+          int code = b < 0 ? 4 : rev ? 3 - b : b;
+          TEST_ASSERT_INT_EQ(code, actual.boundary_nuc[rev][off]);
+        }
+      }
+      for (int st = 0; st < STATES; st++)
+        TEST_ASSERT_DOUBLE_WITHIN(1e-12, emission_score(w, &expected, st), emissions[st]);
+    }
+  }
+  free(w);
+  free_test_contig(&c);
+}
+
+static void test_crf_reverse_complement_emissions(void) {
+  crf_init();
+  const char *seq = "ACGTAATGCGGCTANACGTTAGCCATAGC";
+  int length = (int)strlen(seq);
+  char reverse[64];
+  for (int i = 0; i < length; i++) {
+    int b = base_index(seq[length - i - 1]);
+    reverse[i] = b < 0 ? 'N' : "TGCA"[b];
+  }
+  reverse[length] = '\0';
+  Contig forward = make_test_contig(seq, 0, length, NULL);
+  Contig backward = make_test_contig(reverse, 0, length, NULL);
+  double *w = anno_alloc(WEIGHTS, sizeof(*w));
+  for (int f = 0; f < WEIGHTS; f++) w[f] = sin(f * 0.13);
+  for (int i = 0; i < length; i++) {
+    Site a = site_at(&forward, i);
+    Site b = site_at(&backward, length - i - 1);
+    TEST_ASSERT_INT_EQ(a.k6_emit[0], b.k6_emit[1]);
+    TEST_ASSERT_INT_EQ(a.k3_emit[0], b.k3_emit[1]);
+    for (int st = 1; st <= 3; st++)
+      TEST_ASSERT_DOUBLE_WITHIN(0, emission_score(w, &a, st), emission_score(w, &b, st + 6));
+  }
+  free(w);
+  free_test_contig(&forward);
+  free_test_contig(&backward);
+}
+
 static void test_crf_k2_exhaustive_t1_to_t5(void) {
   setup_k2_binary_crf();
   rng_seed(1001);
@@ -645,12 +720,15 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
 
   /* Verify finite differences against dp_grad across active emission, boundary_k2, CWT power, and CWT deriv weights */
   const double eps = 1e-6;
-  int checked_groups[4] = {0};
+  int checked_groups[7] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
     int group = (f < OFF_SPLICE_START_STOP) ? 0 :
                 (f < OFF_BP) ? 1 :
-                (f < OFF_BD) ? 2 : 3;
+                (f < OFF_BD) ? 2 :
+                (f < OFF_E3) ? 3 :
+                (f < OFF_EMIT_BIAS) ? 4 :
+                (f < OFF_PWM) ? 5 : 6;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -667,7 +745,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     double fd = (ll_p - ll_m) / (2.0 * eps);
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd, dp_grad[f]);
   }
-  for (int g = 0; g < 4; g++) TEST_ASSERT(checked_groups[g] > 0);
+  for (int g = 0; g < 7; g++) TEST_ASSERT(checked_groups[g] > 0);
 
   /* Case B: Minus-strand sequence with reverse-complement stop ("TTA"), intron (10..12), and start ("CAT") */
   const char *minus_genome =
@@ -752,7 +830,8 @@ static void test_crf_length_one(void) {
   for (int i = 0; i < WEIGHTS; i++) {
     w1[i] = rng_uniform(-1.0, 1.0);
     /* w2 has identical emission weights, but wildly different transition/boundary weights */
-    w2[i] = (i < OFF_SPLICE_START_STOP) ? w1[i] : rng_uniform(-50.0, 50.0);
+    w2[i] = (i < OFF_SPLICE_START_STOP || (i >= OFF_E3 && i < OFF_PWM))
+      ? w1[i] : rng_uniform(-50.0, 50.0);
   }
 
   const uint8_t gold1[1] = {0};
@@ -766,7 +845,7 @@ static void test_crf_length_one(void) {
   dp_extract_marginals(w2, &c, &logz2, node2, edge2, grad2);
 
   Site s0 = site_at(&c, 0);
-  double expected_e0 = w1[emission_index(&s0, 0)];
+  double expected_e0 = emission_score(w1, &s0, 0);
   TEST_ASSERT_DOUBLE_WITHIN(1e-12, expected_e0, logz1);
   TEST_ASSERT_DOUBLE_WITHIN(1e-12, logz1, logz2);
   TEST_ASSERT_DOUBLE_WITHIN(1e-12, 1.0, node1[0][0]);
@@ -1001,9 +1080,9 @@ static void test_crf_shift_invariance(void) {
 
   /* Keep all forward and reverse-complement 6-mer contexts unique so shared emission
      parameters do not couple the position-specific score shifts. */
-  const char *seq = "AGGAACTTGCGTAC";
+  const char *seq = "CAGGAACTTGCGTAC";
   const uint8_t gold[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
-  Contig c = make_test_contig(seq, 2, 9, gold);
+  Contig c = make_test_contig(seq, 3, 9, gold);
 
   /* Verify that all 9 positions have distinct forward & reverse 6-mer codes */
   double shift_sum = 0.0;
@@ -1633,7 +1712,8 @@ static void test_lbfgs_crf_directional_derivatives(void) {
   double *dir = anno_alloc(WEIGHTS, sizeof(double));
 
   const double point_scales[3] = {0.0, 0.15, 0.8};
-  const double steps[5] = {1e-3, 1e-4, 1e-5, 1e-6, 1e-7};
+  const double steps[] = {1e-2, 1e-3, 1e-4, 1e-5, 1e-6, 1e-7};
+  const int step_count = (int)(sizeof(steps) / sizeof(steps[0]));
 
   for (int pt = 0; pt < 3; pt++) {
     for (int f = 0; f < WEIGHTS; f++)
@@ -1671,7 +1751,7 @@ static void test_lbfgs_crf_directional_derivatives(void) {
       /* 1. Check unregularized NLL directional derivative across step sizes h */
       double best_unreg_err = INFINITY;
       double best_reg_err = INFINITY;
-      for (int s = 0; s < 5; s++) {
+      for (int s = 0; s < step_count; s++) {
         double h = steps[s];
         for (int f = 0; f < WEIGHTS; f++) {
           theta_p[f] = theta[f] + h * dir[f];
@@ -1701,7 +1781,7 @@ static void test_lbfgs_crf_directional_derivatives(void) {
     for (int f = 0; f < WEIGHTS; f++)
       dir_scaled += grad_repeat[f] * dir[f];
     double best_scaled_err = INFINITY;
-    for (int hi = 0; hi < 5; hi++) {
+    for (int hi = 0; hi < step_count; hi++) {
       double h = steps[hi];
       for (int f = 0; f < WEIGHTS; f++) {
         theta_p[f] = theta[f] + h * dir[f];
@@ -2267,6 +2347,8 @@ int main(void) {
   printf("=== Running CRF, CWT, L-BFGS & Integration Test Suite ===\n");
 
   /* 1. CRF Module */
+  RUN_TEST(test_crf_context_coordinates_and_stream);
+  RUN_TEST(test_crf_reverse_complement_emissions);
   RUN_TEST(test_crf_k2_exhaustive_t1_to_t5);
   RUN_TEST(test_crf_grammar_exhaustive_both_strands);
   RUN_TEST(test_crf_zero_scores);

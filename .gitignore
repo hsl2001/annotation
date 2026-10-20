@@ -21,3 +21,4 @@ tmp*
 *truth.combined.slm.nip*
 !*.typ
 *.weights.txt
+/feature-results/
