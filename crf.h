@@ -15,10 +15,10 @@ enum {
   CRF_WINDOW_SIZE = 65536,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
   STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 39,
-  K2 = 17, K3 = 65, KNUC = 5,
+  K2 = 17, K5 = 1025, KNUC = 5,
   BOUNDARY_KMER_COUNT = sizeof(boundary_kmer_offsets) / sizeof(boundary_kmer_offsets[0]),
   BOUNDARY_CWT_COUNT = sizeof(boundary_cwt_offsets) / sizeof(boundary_cwt_offsets[0]),
-  OFF_E3 = 0, OFF_SPLICE_START_STOP = OFF_E3 + EMIT_STATES * K3,
+  OFF_E5 = 0, OFF_SPLICE_START_STOP = OFF_E5 + EMIT_STATES * K5,
   OFF_BP = OFF_SPLICE_START_STOP + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BD = OFF_BP + BOUNDARY_CWT_COUNT * WAVE_COUNT,
   WEIGHTS = OFF_BD + DERIV_COUNT * BOUNDARY_CWT_COUNT * WAVE_COUNT
@@ -40,7 +40,8 @@ void crf_save_weights_text(const char *path, const double *weights);
 #include <string.h>
 
 typedef struct {
-  uint8_t k3_emit[2], nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
+  uint16_t k5_emit[2];
+  uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 4, 8, 10, 11, 14, 18, 20, 24, 29, 33, 38};
@@ -68,8 +69,8 @@ static Site site_at(const Contig *c, int i) {
   int position = c->offset + i;
   int base = base_index(c->seq[position]);
   Site s = {
-    .k3_emit = {kmer(c->seq, c->genome_length, position - 1, 3, 0),
-                kmer(c->seq, c->genome_length, position - 1, 3, 1)},
+    .k5_emit = {kmer(c->seq, c->genome_length, position - 2, 5, 0),
+                kmer(c->seq, c->genome_length, position - 2, 5, 1)},
     .nuc = base < 0 ? 4 : base
   };
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
@@ -237,7 +238,7 @@ static int emit_state(int state) {
 }
 
 static int emission_index(const Site *site, int state) {
-  return OFF_E3 + emit_state(state) * K3 + site->k3_emit[state >= 7];
+  return OFF_E5 + emit_state(state) * K5 + site->k5_emit[state >= 7];
 }
 
 typedef struct {
@@ -793,12 +794,12 @@ void crf_save_weights_text(const char *path, const double *w) {
   if (!file) anno_fail("Cannot write weights text: %s", path);
   fprintf(file, "# index\tgroup\ttarget\tfeature\tweight\n");
 
-  char kbuf[4];
+  char kbuf[6];
   for (int s = 0; s < EMIT_STATES; s++) {
-    for (int k = 0; k < K3; k++) {
-      int idx = OFF_E3 + s * K3 + k;
-      format_kmer(k, 3, kbuf);
-      fprintf(file, "%d\temit_k3\t%s\tk3=%s\t%.9g\n",
+    for (int k = 0; k < K5; k++) {
+      int idx = OFF_E5 + s * K5 + k;
+      format_kmer(k, 5, kbuf);
+      fprintf(file, "%d\temit_k5\t%s\tk5=%s\t%.9g\n",
               idx, state_names[s], kbuf, (float)w[idx]);
     }
   }
