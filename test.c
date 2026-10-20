@@ -381,33 +381,14 @@ static void dp_extract_marginals(const double *w, const Contig *c,
   for (int h = 0; h < HIDDEN_STATES; h++) B[h] = exp(last_L[h]);
 
   for (int pos = c->length - 1; pos >= 0; pos--) {
-    const Site *site = work.sites + pos;
-    const double *L = work.log_alpha + (size_t)pos * HIDDEN_STATES;
     for (int h = 0; h < HIDDEN_STATES; h++)
       node_marg[pos][hidden_state[h]] += B[h];
 
     if (pos > 0) {
-      const double *prev_L = L - HIDDEN_STATES;
-      const double *psi = work.psi + (size_t)pos * ntrans;
-      double log_norm = work.log_norm[pos];
-      int last = pos == c->length - 1;
-      double B_prev[HIDDEN_STATES] = {0};
-      const HiddenEdge *edges = hidden_edges[site->nuc];
-      int edge_count = hidden_edge_count[site->nuc];
-      for (int e = 0; e < edge_count; e++) {
-        const HiddenEdge *step = edges + e;
-        if (!(B[step->current] > 0.0) || !forward_edge_allowed(prev_L, step, last)) continue;
-        double ep_prob = B[step->current] *
-          exp(prev_L[step->previous] + psi[step->transition] - log_norm - L[step->current]);
-        B_prev[step->previous] += ep_prob;
-        int a = trans_a[step->transition];
-        int b = trans_b[step->transition];
-        edge_marg[pos][a][b] += ep_prob;
-      }
-      double sum_b = 0.0;
-      for (int h = 0; h < HIDDEN_STATES; h++) sum_b += B_prev[h];
-      double inv_b = sum_b > 0.0 ? 1.0 / sum_b : 0.0;
-      for (int h = 0; h < HIDDEN_STATES; h++) B[h] = B_prev[h] * inv_b;
+      double edge_m[STATES * STATES] = {0};
+      backward_step(&work, c->length, pos, B, NULL, NULL, NULL, 0, 0, 0, 0, edge_m);
+      for (int e = 0; e < ntrans; e++)
+        edge_marg[pos][trans_a[e]][trans_b[e]] += edge_m[e];
     }
   }
   work_free(&work);
@@ -1278,23 +1259,27 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   double *grad_unreg = anno_alloc(WEIGHTS, sizeof(double));
   for (int f = 0; f < WEIGHTS; f++) w[f] = rng_uniform(-0.25, 0.25);
 
-  /* Unregularized sum over windows via contig_gradient */
+  /* Unregularized sum over windows via contig_gradient_f1 */
   Work wk = {0};
-  double ll_sum = 0.0;
-  ll_sum += contig_gradient(w, &contigs[0], &wk, grad_unreg);
-  ll_sum += contig_gradient(w, &contigs[1], &wk, grad_unreg);
+  double ll_sum = 0.0, f1_sum = 0.0, f1_part = 0.0;
+  ll_sum += contig_gradient_f1(w, &contigs[0], &wk, grad_unreg, CRF_F1_WEIGHT, &f1_part);
+  f1_sum += f1_part;
+  ll_sum += contig_gradient_f1(w, &contigs[1], &wk, grad_unreg, CRF_F1_WEIGHT, &f1_part);
+  f1_sum += f1_part;
   work_free(&wk);
 
   /* Regularized objective via crf_objective */
   double loss = crf_objective(w, grad_obj, &obj);
   TEST_ASSERT_INT_EQ(15, obj.positions);
   TEST_ASSERT_DOUBLE_WITHIN(1e-12, ll_sum, obj.likelihood);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-12, f1_sum, obj.f1_loss);
 
   double norm_sq = 0.0;
   for (int f = 0; f < WEIGHTS; f++) norm_sq += w[f] * w[f];
-  /* Check minimization sign and L2 penalty: loss = -ll_sum + CRF_L2_C2 * ||w||^2 */
+  /* Check minimization sign, Soft F1 term, and L2 penalty: loss = -ll_sum + f1_sum + CRF_L2_C2 * ||w||^2 */
   TEST_ASSERT(ll_sum <= 0.0);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-11, -ll_sum + CRF_L2_C2 * norm_sq, loss);
+  TEST_ASSERT(f1_sum >= 0.0);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-11, -ll_sum + f1_sum + CRF_L2_C2 * norm_sq, loss);
 
   for (int f = 0; f < WEIGHTS; f++) {
     double expected_g = -grad_unreg[f] + 2.0 * CRF_L2_C2 * w[f];
@@ -1323,6 +1308,58 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   free(grad_v);
   free_test_contig(&contigs[0]);
   free_test_contig(&contigs[1]);
+}
+
+static void test_crf_soft_f1_loss_and_gradient(void) {
+  crf_init();
+  rng_seed(1337);
+  double *w = anno_alloc(WEIGHTS, sizeof(double));
+  for (int f = 0; f < WEIGHTS; f++) w[f] = rng_uniform(-0.3, 0.3);
+
+  const uint8_t gold_cds[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
+  const uint8_t gold_ig[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  const uint8_t *golds[2] = {gold_cds, gold_ig};
+
+  for (int k = 0; k < 2; k++) {
+    Contig c = make_test_contig("ATGAAATAA", 0, 9, golds[k]);
+    BruteForceCrf bf;
+    bf_crf_solve(w, &c, &bf, 0);
+
+    double tp = 0.0, pred_pos = 0.0, gold_pos = 0.0;
+    for (int t = 0; t < c.length; t++) {
+      if (is_cds(golds[k][t])) gold_pos += 1.0;
+      for (int s = 0; s < STATES; s++)
+        if (is_cds(s)) {
+          pred_pos += bf.node_marginals[t][s];
+          if (s == golds[k][t]) tp += bf.node_marginals[t][s];
+        }
+    }
+    double f1_weight = 0.25;
+    double expected_f1 = gold_pos > 0.0
+      ? f1_weight * gold_pos * (1.0 - 2.0 * tp / (pred_pos + gold_pos))
+      : f1_weight * pred_pos;
+
+    Work wk = {0};
+    double grad_nll[WEIGHTS] = {0}, grad_total[WEIGHTS] = {0}, f1_loss = -1.0;
+    double ll1 = contig_gradient(w, &c, &wk, grad_nll);
+    double ll2 = contig_gradient_f1(w, &c, &wk, grad_total, f1_weight, &f1_loss);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-12, ll1, ll2);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-11, expected_f1, f1_loss);
+
+    for (int f = OFF_TRANSITION; f < WEIGHTS; f++) {
+      double orig = w[f], dummy[WEIGHTS] = {0}, f1_p = 0.0, f1_m = 0.0;
+      w[f] = orig + 1e-6;
+      double ll_p = contig_gradient_f1(w, &c, &wk, dummy, f1_weight, &f1_p);
+      w[f] = orig - 1e-6;
+      double ll_m = contig_gradient_f1(w, &c, &wk, dummy, f1_weight, &f1_m);
+      w[f] = orig;
+      double fd_total = ((ll_p - f1_p) - (ll_m - f1_m)) / 2e-6;
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd_total, grad_total[f]);
+    }
+    work_free(&wk);
+    free_test_contig(&c);
+  }
+  free(w);
 }
 
 /* =========================================================================
@@ -2342,7 +2379,17 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   BruteForceCrf bf0;
   bf_crf_solve(w_init, &c, &bf0, 0);
   double gold_s0 = bf_score_and_accumulate_features(w_init, &c, gold, 0.0, NULL);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf0.logz - gold_s0, loss0);
+  double tp0 = 0.0, pred0 = 0.0, gold_pos0 = 0.0;
+  for (int t = 0; t < c.length; t++) {
+    if (is_cds(gold[t])) gold_pos0 += 1.0;
+    for (int s = 0; s < STATES; s++)
+      if (is_cds(s)) {
+        pred0 += bf0.node_marginals[t][s];
+        if (s == gold[t]) tp0 += bf0.node_marginals[t][s];
+      }
+  }
+  double f1_0 = CRF_F1_WEIGHT * gold_pos0 * (1.0 - 2.0 * tp0 / (pred0 + gold_pos0));
+  TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf0.logz - gold_s0 + f1_0, loss0);
 
   /* Step 2: Optimize CRF objective with L-BFGS (crf_train) */
   double *w_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
@@ -2499,6 +2546,7 @@ int main(void) {
   RUN_TEST(test_crf_extreme_scores_numerical_stability);
   RUN_TEST(test_crf_shift_invariance);
   RUN_TEST(test_crf_objective_sign_regularization_and_scaling);
+  RUN_TEST(test_crf_soft_f1_loss_and_gradient);
 
   /* 2. CWT Module */
   RUN_TEST(test_cwt_zero_signal);

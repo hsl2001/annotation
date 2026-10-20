@@ -65,11 +65,6 @@ static void *anno_resize(void *memory, size_t count, size_t size) {
   return resized;
 }
 
-static void cwt_powers(const Wavelets *wavelets, const char *sequence, int length,
-                       int threads, float *powers) {
-  cwt_transform(wavelets, sequence, length, threads, NULL, powers);
-}
-
 typedef struct { float *data; size_t size; } CwtStore;
 
 static CwtStore cwt_store(Contig *contigs, int count) {
@@ -215,20 +210,14 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     if (!ok) continue;
     used++;
     /* Reading frame is recomputed from CDS lengths in translation order; the GFF phase column is ignored. */
-    int *startpos = anno_alloc(m, sizeof(int));
     for (int jj = 0, frame = 0; jj < m; jj++) {
-      int j = minus ? m - 1 - jj : jj;
-      startpos[j] = frame;
-      frame = (frame + s[j].end - s[j].start + 1) % 3;
+      int j = minus ? m - 1 - jj : jj, len = s[j].end - s[j].start + 1, start_frame = frame;
+      for (int t = 0; t < len; t++, frame = (frame + 1) % 3)
+        c->label[minus ? s[j].end - 1 - t : s[j].start - 1 + t] = (minus ? 7 : 1) + frame;
+      int q = minus ? (start_frame + len - 1) % 3 : start_frame;
+      for (int p = j ? s[j - 1].end : s[j].start; p < s[j].start - 1; p++)
+        c->label[p] = (minus ? 10 : 4) + q;
     }
-    for (int j = 0; j < m; j++) {
-      int pos = startpos[j], len = s[j].end - s[j].start + 1;
-      for (int t = 0; t < len; t++, pos = (pos + 1) % 3)
-        c->label[minus ? s[j].end - 1 - t : s[j].start - 1 + t] = (minus ? 7 : 1) + pos;
-      int q = minus ? (startpos[j] + len - 1) % 3 : startpos[j];
-      for (int p = j ? s[j - 1].end : s[j].start; p < s[j].start - 1; p++) c->label[p] = (minus ? 10 : 4) + q;
-    }
-    free(startpos);
   }
   for (int i = 0; i < n; i++) free(cds[i].parent);
   free(cds);
@@ -236,8 +225,6 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
   *skipped = g - used;
   return used;
 }
-
-static int is_cds(int state) { return (state >= 1 && state <= 3) || (state >= 7 && state <= 9); }
 
 void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
   for (int i = 0; i < c->length;) {
@@ -398,9 +385,8 @@ int main(int argc, char **argv) {
   int count;
   Contig *contigs = read_fasta(args[0], &count);
   CwtStore cwt = cwt_store(contigs, count);
-  for (int c = 0; c < count; c++) {
-    cwt_powers(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, contigs[c].cwt_power);
-  }
+  for (int c = 0; c < count; c++)
+    cwt_transform(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, NULL, contigs[c].cwt_power);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].genome_length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);

@@ -39,6 +39,14 @@ static inline int base_index(char base) {
   }
 }
 
+static inline int is_cds(int state) {
+  return (state >= 1 && state <= 3) || (state >= 7 && state <= 9);
+}
+
+static inline int is_intron(int state) {
+  return (state >= 4 && state <= 6) || (state >= 10 && state <= 12);
+}
+
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
