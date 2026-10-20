@@ -26,12 +26,11 @@ _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
                "CWT export requires binary32 floats");
 
 static double complex cwt_base_signal(char base) {
-  // const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I}; //  general mapping
-  const double complex mapping[4] = {1.0 + I, 1.0 - I, -1.0 - I, -1.0 + I}; // intron-low-energy mapping
+  const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I}; //  general mapping
+  // const double complex mapping[4] = {1.0 + I, 1.0 - I, -1.0 - I, -1.0 + I}; // intron-low-energy mapping
   // const double complex mapping[4] = {1, I, -I, -1}; // branch point emphasizing
   int index = base_index(base);
   return index < 0 ? 0.0 : mapping[index] / sqrt(2.0);
-  // return index < 0 ? 0.0 : mapping[index] / sqrt(1.0);
 }
 
 static double complex cwt_morlet_integral(double lower, double upper) {
@@ -74,10 +73,7 @@ static void wavelets_init(Wavelets *wavelets) {
     if (radius_value > (INT_MAX - 1) / 2.0) anno_fail("CWT scale exceeds supported kernel size");
     int radius = (int)radius_value;
     int width = 2 * radius + 1;
-    size_t capacity = MAX_WAVE_SIZE > 0 ? (size_t)MAX_WAVE_SIZE : 1;
-    if (capacity > (size_t)width) capacity = (size_t)width;
-    while (capacity < (size_t)width) capacity *= 2;
-    wavelets->kernel[scale] = anno_alloc(capacity, sizeof(double complex));
+    wavelets->kernel[scale] = anno_alloc((size_t)width, sizeof(double complex));
     wavelets->widths[scale] = width;
     if (width > wavelets->max_width) wavelets->max_width = width;
     for (int tap = 0; tap < width; tap++) {
@@ -106,7 +102,7 @@ static void cwt_window_scale(
   const char *restrict sequence, size_t length, size_t window, int scale, int width,
   size_t max_fft, const double complex *restrict kernel_table,
   const double complex *restrict twiddle_table, double complex *restrict signal_fft,
-  double *restrict features, float *restrict complex_values, float *restrict powers
+  float *restrict complex_values, float *restrict powers
 ) {
   size_t start = window * (size_t)CWT_WINDOW_SIZE;
   size_t window_length = length - start;
@@ -141,8 +137,6 @@ static void cwt_window_scale(
     double complex coefficient = signal_fft[index] * inv_size;
     double real = creal(coefficient), imaginary = cimag(coefficient);
     size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
-    if (features)
-      features[feature] = real, features[feature + 1] = imaginary;
     if (complex_values)
       complex_values[feature] = (float)real,
       complex_values[feature + 1] = (float)imaginary;
@@ -160,7 +154,6 @@ typedef struct {
   size_t max_fft;
   const double complex *kernel_table;
   const double complex *twiddle_table;
-  double *features;
   float *complex_values, *powers;
   atomic_size_t next_window;
 } CwtTask;
@@ -174,7 +167,7 @@ static void *cwt_worker(void *arg) {
       cwt_window_scale(task->sequence, task->length, window, scale,
                        task->wavelets->widths[scale], task->max_fft,
                        task->kernel_table, task->twiddle_table, signal_fft,
-                       task->features, task->complex_values, task->powers);
+                       task->complex_values, task->powers);
     }
     window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
   }
@@ -183,16 +176,13 @@ static void *cwt_worker(void *arg) {
 }
 
 static void cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
-                          int threads, double *features, float *complex_values, float *powers) {
+                          int threads, float *complex_values, float *powers) {
   if (length <= 0) return;
   if (threads < 1) anno_fail("CWT requires at least one worker thread");
-  if (features && (size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*features)))
-    anno_fail("CWT feature size overflow");
   if (complex_values && (size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*complex_values)))
     anno_fail("CWT output size overflow");
   if (powers && (size_t)length > SIZE_MAX / (WAVE_COUNT * sizeof(*powers)))
     anno_fail("CWT power size overflow");
-  if (features) memset(features, 0, (size_t)length * CWT_CHANNELS * sizeof(*features));
   size_t sequence_length = (size_t)length;
   size_t window_count = sequence_length / CWT_WINDOW_SIZE +
                         (sequence_length % CWT_WINDOW_SIZE != 0);
@@ -228,7 +218,7 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
   CwtTask task = {.wavelets = wavelets, .sequence = sequence, .length = sequence_length,
                   .window_count = window_count, .max_fft = max_fft,
                   .kernel_table = kernel_table, .twiddle_table = twiddle_table,
-                  .features = features, .complex_values = complex_values, .powers = powers};
+                  .complex_values = complex_values, .powers = powers};
   atomic_init(&task.next_window, 0);
   int worker_count = window_count < (size_t)threads ? (int)window_count : threads;
   pthread_t *workers = worker_count > 1

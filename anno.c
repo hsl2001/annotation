@@ -67,7 +67,7 @@ static void *anno_resize(void *memory, size_t count, size_t size) {
 
 static void cwt_powers(const Wavelets *wavelets, const char *sequence, int length,
                        int threads, float *powers) {
-  cwt_transform(wavelets, sequence, length, threads, NULL, NULL, powers);
+  cwt_transform(wavelets, sequence, length, threads, NULL, powers);
 }
 
 typedef struct { float *data; size_t size; } CwtStore;
@@ -322,7 +322,7 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta,
       size_t mapping_size;
       off_t file_position;
       float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
-      cwt_transform(wavelets, bases, g->length, threads, NULL, values, NULL);
+      cwt_transform(wavelets, bases, g->length, threads, values, NULL);
       cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
     }
     free(reverse);
@@ -333,18 +333,9 @@ static void export_cwt(const Wavelets *wavelets, const char *fasta,
   fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
 }
 
-static int cwt_program(const char *program) {
-  const char *name = strrchr(program, '/');
-  name = name ? name + 1 : program;
-  return !strncmp(name, "anno_cwt", 8) && (!name[8] || name[8] == '_');
-}
-
-static int usage(const char *program, int status, int cwt_only) {
-  if (cwt_only)
-    fprintf(stderr, "Usage: %s [-p threads] <genome.fa[.gz]> <new_directory>\n", program);
-  else
-    fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                    "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
+static int usage(const char *program, int status) {
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
+                  "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
   return status;
 }
 
@@ -358,32 +349,29 @@ static int parse_threads(const char *value) {
 }
 
 int main(int argc, char **argv) {
-  int cwt_only = cwt_program(argv[0]);
   const char *model = "anno.model";
   const char *initial_model = NULL;
   int iterations = DEFAULT_ITERATIONS, threads = 1, option;
   ketopt_t options = KETOPT_INIT;
   while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
-    if (option == 'h') return usage(argv[0], 0, cwt_only);
+    if (option == 'h') return usage(argv[0], 0);
     if (option == 'p') threads = parse_threads(options.arg);
-    else if (cwt_only) return usage(argv[0], 1, cwt_only);
     else if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
     else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
-    else return usage(argv[0], 1, cwt_only);
+    else return usage(argv[0], 1);
   }
   int rest = argc - options.ind;
   char **args = argv + options.ind;
-  int export = cwt_only ? rest == 2 : rest == 3 && !strcmp(args[0], "cwt");
-  if (cwt_only ? !export : (!export && (rest < 1 || rest > 2)))
-    return usage(argv[0], 1, cwt_only);
-  if (initial_model && (cwt_only || rest != 2))
+  int export = rest == 3 && !strcmp(args[0], "cwt");
+  if (!export && (rest < 1 || rest > 2))
+    return usage(argv[0], 1);
+  if (initial_model && (export || rest != 2))
     anno_fail("Initial model is only supported for training");
   Wavelets wavelets;
   wavelets_init(&wavelets);
   if (export) {
-    export_cwt(&wavelets, cwt_only ? args[0] : args[1],
-               cwt_only ? args[1] : args[2], threads);
+    export_cwt(&wavelets, args[1], args[2], threads);
     wavelets_free(&wavelets);
     return 0;
   }
