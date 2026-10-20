@@ -399,7 +399,7 @@ int main(int argc, char **argv) {
   unsigned long genes = 0;
   for (int c = 0; c < count; c++) {
     uint8_t *path = anno_alloc(contigs[c].length, 1);
-    crf_decode(weights, contigs + c, path);
+    crf_decode_threads(weights, contigs + c, path, threads);
     write_gff(contigs + c, path, &genes);
     free(path);
     fprintf(stderr, "Annotated %s: %d bp\n", contigs[c].name, contigs[c].length);

@@ -27,6 +27,7 @@ enum {
 void crf_init(void);
 void crf_train(Contig *contigs, int count, double *weights, int iterations, int threads);
 void crf_decode(const double *weights, const Contig *contig, uint8_t *path);
+void crf_decode_threads(const double *weights, const Contig *contig, uint8_t *path, int threads);
 void crf_save_weights_text(const char *path, const double *weights);
 
 #endif
@@ -53,6 +54,8 @@ static uint8_t hidden_state[HIDDEN_STATES], hidden_context[HIDDEN_STATES];
 typedef struct { uint8_t previous, current; uint16_t transition; } HiddenEdge;
 static HiddenEdge hidden_edges[KNUC][HIDDEN_STATES * 4];
 static int hidden_edge_count[KNUC];
+static uint8_t rev_k2[K2];
+static uint16_t rev_k5[K5];
 
 static int kmer(const char *seq, int length, int from, int size, int reverse) {
   int code = 0;
@@ -230,6 +233,18 @@ void crf_init(void) {
         if (hidden_edge_count[base] >= HIDDEN_STATES * 4) anno_fail("Too many grammar transitions");
         hidden_edges[base][hidden_edge_count[base]++] = (HiddenEdge){(uint8_t)previous, (uint8_t)current, (uint16_t)edge};
       }
+  for (int k = 0; k < 16; k++)
+    rev_k2[k] = (uint8_t)(((3 - (k & 3)) << 2) | (3 - ((k >> 2) & 3)));
+  rev_k2[16] = 16;
+  for (int k = 0; k < 1024; k++) {
+    int r = 0, tmp = k;
+    for (int i = 0; i < 5; i++) {
+      r = (r << 2) | (3 - (tmp & 3));
+      tmp >>= 2;
+    }
+    rev_k5[k] = (uint16_t)r;
+  }
+  rev_k5[1024] = 1024;
 }
 
 static int emit_state(int state) {
@@ -247,9 +262,107 @@ typedef struct {
   int capacity;
 } Work;
 
-static Site site_scores(const double *w, const Contig *c, int position,
-                        double *emissions, double *psi) {
-  Site site = site_at(c, position);
+typedef struct {
+  float power[WAVE_COUNT];
+  double deriv[DERIV_COUNT][WAVE_COUNT];
+} CwtCached;
+
+typedef struct {
+  const Contig *contig;
+  uint8_t nuc_ring[64];
+  uint8_t k2_ring[64];
+  CwtCached cwt_ring[64];
+  uint16_t k5_fwd;
+  int k5_valid_run;
+} SiteStream;
+
+static inline void site_stream_fill_cwt(SiteStream *s, int g) {
+  CwtCached *ce = &s->cwt_ring[g & 63];
+  if (s->nuc_ring[g & 63] == 4) {
+    memset(ce, 0, sizeof(*ce));
+    return;
+  }
+  const float *p = s->contig->cwt_power + (size_t)g * WAVE_COUNT;
+  for (int sc = 0; sc < WAVE_COUNT; sc++) ce->power[sc] = p[sc];
+  int ok_r1 = s->nuc_ring[(g - 1) & 63] < 4 && s->nuc_ring[(g + 1) & 63] < 4;
+  if (!ok_r1) {
+    memset(ce->deriv, 0, sizeof(ce->deriv));
+    return;
+  }
+  const float *pm1 = p - WAVE_COUNT, *pp1 = p + WAVE_COUNT;
+  for (int sc = 0; sc < WAVE_COUNT; sc++) {
+    double v_m1 = pm1[sc], v_0 = p[sc], v_p1 = pp1[sc];
+    ce->deriv[0][sc] = -0.5 * v_m1 + 0.5 * v_p1;
+    ce->deriv[1][sc] = v_m1 - 2.0 * v_0 + v_p1;
+  }
+  int ok_r2 = s->nuc_ring[(g - 2) & 63] < 4 && s->nuc_ring[(g + 2) & 63] < 4;
+  if (ok_r2) {
+    const float *pm2 = p - 2 * WAVE_COUNT, *pp2 = p + 2 * WAVE_COUNT;
+    for (int sc = 0; sc < WAVE_COUNT; sc++)
+      ce->deriv[2][sc] = -0.5 * pm2[sc] + pm1[sc] - pp1[sc] + 0.5 * pp2[sc];
+  } else {
+    for (int sc = 0; sc < WAVE_COUNT; sc++) ce->deriv[2][sc] = 0.0;
+  }
+}
+
+static void site_stream_init(SiteStream *s, const Contig *c, int start_position) {
+  s->contig = c;
+  int g_start = c->offset + start_position;
+  for (int g = g_start - 29; g <= g_start + 27; g++) {
+    int b = (g >= 0 && g < c->genome_length) ? base_index(c->seq[g]) : -1;
+    s->nuc_ring[g & 63] = (uint8_t)(b < 0 ? 4 : b);
+  }
+  for (int g = g_start - 8; g <= g_start + 5; g++) {
+    uint8_t b0 = s->nuc_ring[g & 63], b1 = s->nuc_ring[(g + 1) & 63];
+    s->k2_ring[g & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
+  }
+  s->k5_fwd = 0;
+  s->k5_valid_run = 0;
+  for (int g = g_start - 2; g <= g_start + 1; g++) {
+    uint8_t b = s->nuc_ring[g & 63];
+    if (b < 4) {
+      s->k5_fwd = (uint16_t)(((s->k5_fwd << 2) | b) & 1023);
+      s->k5_valid_run++;
+    } else {
+      s->k5_valid_run = 0;
+    }
+  }
+  for (int g = g_start - 27; g <= g_start + 25; g++)
+    site_stream_fill_cwt(s, g);
+}
+
+static inline Site site_scores_stream(const double *w, SiteStream *s, int position,
+                                      double *emissions, double *psi) {
+  const Contig *c = s->contig;
+  int g0 = c->offset + position;
+  int g_new = g0 + 28;
+  int b_new = (g_new >= 0 && g_new < c->genome_length) ? base_index(c->seq[g_new]) : -1;
+  s->nuc_ring[g_new & 63] = (uint8_t)(b_new < 0 ? 4 : b_new);
+
+  int g_k2 = g0 + 6;
+  uint8_t b0 = s->nuc_ring[g_k2 & 63], b1 = s->nuc_ring[(g_k2 + 1) & 63];
+  s->k2_ring[g_k2 & 63] = (b0 < 4 && b1 < 4) ? (uint8_t)((b0 << 2) | b1) : 16;
+
+  uint8_t b_k5 = s->nuc_ring[(g0 + 2) & 63];
+  if (b_k5 < 4) {
+    s->k5_fwd = (uint16_t)(((s->k5_fwd << 2) | b_k5) & 1023);
+    s->k5_valid_run++;
+  } else {
+    s->k5_valid_run = 0;
+  }
+  site_stream_fill_cwt(s, g0 + 26);
+
+  Site site;
+  site.nuc = s->nuc_ring[g0 & 63];
+  uint16_t k5 = s->k5_valid_run >= 5 ? s->k5_fwd : 1024;
+  site.k5_emit[0] = k5;
+  site.k5_emit[1] = rev_k5[k5];
+  for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
+    uint8_t k2f = s->k2_ring[(g0 + boundary_kmer_offsets[offset]) & 63];
+    site.boundary_k2[0][offset] = k2f;
+    site.boundary_k2[1][7 - offset] = rev_k2[k2f];
+  }
+
   for (int state = 0; state < STATES; state++) {
     double score = w[emission_index(&site, state)];
     if (!isfinite(score))
@@ -257,25 +370,33 @@ static Site site_scores(const double *w, const Contig *c, int position,
     emissions[state] = score;
   }
 
-  int genome_position = c->offset + position;
   double b_score[2][4];
   for (int rev = 0; rev < 2; rev++) {
+    const uint8_t *k2 = site.boundary_k2[rev];
     for (int kind = 0; kind < 4; kind++) {
-      double sp = 0;
-      for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
-        sp += w[boundary_kmer_index(&site, rev, kind, offset)];
-      b_score[rev][kind] = sp;
+      const double *wk = w + OFF_SPLICE_START_STOP + kind * (BOUNDARY_KMER_COUNT * K2);
+      b_score[rev][kind] = wk[0 * K2 + k2[0]] + wk[1 * K2 + k2[1]] + wk[2 * K2 + k2[2]] +
+                           wk[3 * K2 + k2[3]] + wk[4 * K2 + k2[4]] + wk[5 * K2 + k2[5]] +
+                           wk[6 * K2 + k2[6]] + wk[7 * K2 + k2[7]];
     }
     double cw = 0;
     for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
-      float power[WAVE_COUNT];
-      double derivative[DERIV_COUNT][WAVE_COUNT];
-      boundary_cwt_at(c, genome_position, rev, offset, power, derivative);
+      int displacement = boundary_cwt_offsets[offset];
+      int g = rev ? g0 - displacement - 1 : g0 + displacement;
+      const CwtCached *ce = &s->cwt_ring[g & 63];
       const double *wbp = w + OFF_BP + offset * WAVE_COUNT;
+      const double *wd0 = w + OFF_BD + (0 * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
+      const double *wd1 = w + OFF_BD + (1 * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
+      const double *wd2 = w + OFF_BD + (2 * BOUNDARY_CWT_COUNT + offset) * WAVE_COUNT;
       for (int scale = 0; scale < WAVE_COUNT; scale++) {
-        cw += wbp[scale] * power[scale];
-        for (int slot = 0; slot < DERIV_COUNT; slot++)
-          cw += w[derivative_index(slot, offset, scale)] * derivative[slot][scale];
+        cw += wbp[scale] * ce->power[scale];
+        double d0 = ce->deriv[0][scale];
+        double d1 = ce->deriv[1][scale];
+        double d2 = ce->deriv[2][scale];
+        if (rev) { d0 = -d0; d2 = -d2; }
+        cw += wd0[scale] * d0;
+        cw += wd1[scale] * d1;
+        cw += wd2[scale] * d2;
       }
     }
     b_score[rev][1] += cw;
@@ -319,10 +440,12 @@ static void work_free(Work *k) {
 static double contig_gradient(const double *w, const Contig *c,
                               Work *k, double *gradient) {
   work_ensure(k, c->length);
+  SiteStream stream;
+  site_stream_init(&stream, c, 0);
   double logz = 0, gold_score = 0;
   for (int position = 0; position < c->length; position++) {
     double emissions[STATES], psi[STATES * STATES];
-    Site site = site_scores(w, c, position, emissions, psi);
+    Site site = site_scores_stream(w, &stream, position, emissions, psi);
     k->sites[position] = site;
     int gold_state = c->label[c->offset + position];
     gold_score += emissions[gold_state];
@@ -720,19 +843,21 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
     fprintf(stderr, "L-BFGS reached the %d-iteration limit\n", completed);
 }
 
-static void viterbi_step(const double *weights, const Contig *contig, int position,
-                         const double *previous, double *current, uint8_t *back) {
-  double emissions[STATES], transitions[STATES * STATES];
-  Site site = site_scores(weights, contig, position, emissions, transitions);
+static inline void viterbi_relax(uint8_t nuc, int position, const double *emissions,
+                                 const double *transitions, const double *previous,
+                                 double *current, uint8_t *back) {
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) {
-    current[hidden] = position == 0 && initial_allowed(site.nuc, hidden) ? emissions[hidden_state[hidden]] : -INFINITY;
+    current[hidden] = position == 0 && initial_allowed(nuc, hidden) ? emissions[hidden_state[hidden]] : -INFINITY;
     back[hidden] = 0;
   }
   if (position) {
-    const HiddenEdge *edges = hidden_edges[site.nuc];
-    for (int edge = 0; edge < hidden_edge_count[site.nuc]; edge++) {
+    const HiddenEdge *edges = hidden_edges[nuc];
+    int edge_count = hidden_edge_count[nuc];
+    for (int edge = 0; edge < edge_count; edge++) {
       const HiddenEdge *step = edges + edge;
-      double score = previous[step->previous] + transitions[step->transition];
+      double prev_score = previous[step->previous];
+      if (prev_score == -INFINITY) continue;
+      double score = prev_score + transitions[step->transition];
       if (score > current[step->current]) {
         current[step->current] = score;
         back[step->current] = step->previous;
@@ -745,16 +870,131 @@ static void viterbi_step(const double *weights, const Contig *contig, int positi
   for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) current[hidden] -= maximum;
 }
 
-/* Exact whole-contig MAP decoding. */
-void crf_decode(const double *w, const Contig *c, uint8_t *path) {
-  int length = c->length;
-  uint8_t *back = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(*back));
-  double previous[HIDDEN_STATES] = {0}, current[HIDDEN_STATES];
-  for (int position = 0; position < length; position++) {
-    viterbi_step(w, c, position, previous, current,
-                 back + (size_t)position * HIDDEN_STATES);
+typedef struct {
+  const double *weights;
+  const Contig *contig;
+  uint8_t *back;
+  int chunk_id;
+  int c_start, c_end;
+  double start_vec[HIDDEN_STATES];
+  double end_vec[HIDDEN_STATES];
+} ViterbiChunk;
+
+static void *viterbi_chunk_worker(void *argument) {
+  ViterbiChunk *chunk = argument;
+  const double *w = chunk->weights;
+  const Contig *c = chunk->contig;
+  double previous[HIDDEN_STATES], current[HIDDEN_STATES];
+  double emissions[STATES], transitions[STATES * STATES];
+  SiteStream stream;
+
+  if (chunk->chunk_id == 0) {
+    memset(previous, 0, sizeof(previous));
+    site_stream_init(&stream, c, 0);
+    for (int pos = 0; pos < chunk->c_end; pos++) {
+      Site site = site_scores_stream(w, &stream, pos, emissions, transitions);
+      viterbi_relax(site.nuc, pos, emissions, transitions, previous, current,
+                    chunk->back + (size_t)pos * HIDDEN_STATES);
+      memcpy(previous, current, sizeof(previous));
+    }
+    memcpy(chunk->end_vec, previous, sizeof(previous));
+    return NULL;
+  }
+
+  int w_start = chunk->c_start - CRF_WINDOW_SIZE;
+  if (w_start < 0) w_start = 0;
+  site_stream_init(&stream, c, w_start);
+  if (w_start == 0) {
+    memset(previous, 0, sizeof(previous));
+  } else {
+    previous[0] = 0.0;
+    for (int h = 1; h < HIDDEN_STATES; h++) previous[h] = -INFINITY;
+  }
+  uint8_t dummy_back[HIDDEN_STATES];
+  for (int pos = w_start; pos < chunk->c_start; pos++) {
+    Site site = site_scores_stream(w, &stream, pos, emissions, transitions);
+    viterbi_relax(site.nuc, pos, emissions, transitions, previous, current, dummy_back);
     memcpy(previous, current, sizeof(previous));
   }
+  memcpy(chunk->start_vec, previous, sizeof(previous));
+  for (int pos = chunk->c_start; pos < chunk->c_end; pos++) {
+    Site site = site_scores_stream(w, &stream, pos, emissions, transitions);
+    viterbi_relax(site.nuc, pos, emissions, transitions, previous, current,
+                  chunk->back + (size_t)pos * HIDDEN_STATES);
+    memcpy(previous, current, sizeof(previous));
+  }
+  memcpy(chunk->end_vec, previous, sizeof(previous));
+  return NULL;
+}
+
+/* Exact whole-contig MAP decoding (optionally multi-threaded across chunks). */
+void crf_decode_threads(const double *w, const Contig *c, uint8_t *path, int threads) {
+  int length = c->length;
+  uint8_t *back = anno_alloc((size_t)length, HIDDEN_STATES * sizeof(*back));
+  int max_chunks = length / CRF_WINDOW_SIZE;
+  int n_chunks = threads > 1 ? (threads < max_chunks ? threads : max_chunks) : 1;
+  if (n_chunks < 1) n_chunks = 1;
+
+  double previous[HIDDEN_STATES] = {0}, current[HIDDEN_STATES];
+  if (n_chunks == 1) {
+    SiteStream stream;
+    site_stream_init(&stream, c, 0);
+    double emissions[STATES], transitions[STATES * STATES];
+    for (int position = 0; position < length; position++) {
+      Site site = site_scores_stream(w, &stream, position, emissions, transitions);
+      viterbi_relax(site.nuc, position, emissions, transitions, previous, current,
+                    back + (size_t)position * HIDDEN_STATES);
+      memcpy(previous, current, sizeof(previous));
+    }
+  } else {
+    ViterbiChunk *chunks = anno_alloc((size_t)n_chunks, sizeof(*chunks));
+    pthread_t *tids = anno_alloc((size_t)n_chunks, sizeof(*tids));
+    for (int k = 0; k < n_chunks; k++) {
+      chunks[k] = (ViterbiChunk){
+        .weights = w,
+        .contig = c,
+        .back = back,
+        .chunk_id = k,
+        .c_start = (int)((long long)k * length / n_chunks),
+        .c_end = (int)((long long)(k + 1) * length / n_chunks)
+      };
+      if (pthread_create(tids + k, NULL, viterbi_chunk_worker, chunks + k))
+        anno_fail("pthread_create failed");
+    }
+    for (int k = 0; k < n_chunks; k++)
+      if (pthread_join(tids[k], NULL)) anno_fail("pthread_join failed");
+
+    double emissions[STATES], transitions[STATES * STATES];
+    uint8_t dummy_back[HIDDEN_STATES];
+    for (int k = 1; k < n_chunks; k++) {
+      double true_prev[HIDDEN_STATES], approx_prev[HIDDEN_STATES];
+      double true_cur[HIDDEN_STATES], approx_cur[HIDDEN_STATES];
+      memcpy(true_prev, chunks[k - 1].end_vec, sizeof(true_prev));
+      memcpy(approx_prev, chunks[k].start_vec, sizeof(approx_prev));
+      if (memcmp(true_prev, approx_prev, sizeof(true_prev)) == 0) continue;
+
+      SiteStream stream;
+      site_stream_init(&stream, c, chunks[k].c_start);
+      int coalesced = 0;
+      for (int pos = chunks[k].c_start; pos < chunks[k].c_end; pos++) {
+        Site site = site_scores_stream(w, &stream, pos, emissions, transitions);
+        viterbi_relax(site.nuc, pos, emissions, transitions, approx_prev, approx_cur, dummy_back);
+        viterbi_relax(site.nuc, pos, emissions, transitions, true_prev, true_cur,
+                      back + (size_t)pos * HIDDEN_STATES);
+        memcpy(approx_prev, approx_cur, sizeof(approx_prev));
+        memcpy(true_prev, true_cur, sizeof(true_prev));
+        if (memcmp(true_prev, approx_prev, sizeof(true_prev)) == 0) {
+          coalesced = 1;
+          break;
+        }
+      }
+      if (!coalesced)
+        memcpy(chunks[k].end_vec, true_prev, sizeof(true_prev));
+    }
+    memcpy(previous, chunks[n_chunks - 1].end_vec, sizeof(previous));
+    free(chunks), free(tids);
+  }
+
   int best = 0;
   for (int hidden = 1; hidden < HIDDEN_STATES; hidden++)
     if (terminal_allowed(hidden) && previous[hidden] > previous[best]) best = hidden;
@@ -764,6 +1004,10 @@ void crf_decode(const double *w, const Contig *c, uint8_t *path) {
     best = back[(size_t)position * HIDDEN_STATES + best];
   }
   free(back);
+}
+
+void crf_decode(const double *w, const Contig *c, uint8_t *path) {
+  crf_decode_threads(w, c, path, 1);
 }
 
 static void format_kmer(int code, int size, char *out) {
