@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+abs() { echo "${1#-}"; }
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if (( $# > 1 )); then
@@ -44,7 +44,7 @@ awk -F '\t' '
       group_order[++group_count] = group
     }
     total[group]++
-    if ($5 + 0 > 0.01) active[group]++
+    if ($(abs "$5" + 0) > 0.01) active[group]++
   }
   END {
     if (failed) exit 1
