@@ -26,15 +26,15 @@ _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
                "CWT export requires binary32 floats");
 
 static double complex cwt_base_signal(char base) {
-#ifdef CWT_BRANCH_MAPPING
+#if defined(CWT_MAPPING_INTRON_LOW_ENERGY)
+  const double complex mapping[4] = {1.0 + I, 1.0 - I, -1.0 - I, -1.0 + I};
+#elif defined(CWT_MAPPING_BRANCHPOINT)
   const double complex mapping[4] = {1, I, -I, -1};
 #else
-  const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I}; //  general mapping
-  // const double complex mapping[4] = {1.0 + I, 1.0 - I, -1.0 - I, -1.0 + I}; // intron-low-energy mapping
-  // const double complex mapping[4] = {1, I, -I, -1}; // branch point emphasizing
+  const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I};
 #endif
   int index = base_index(base);
-#ifdef CWT_BRANCH_MAPPING
+#if defined(CWT_MAPPING_BRANCHPOINT)
   return index < 0 ? 0.0 : mapping[index];
 #else
   return index < 0 ? 0.0 : mapping[index] / sqrt(2.0);
