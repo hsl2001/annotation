@@ -28,10 +28,7 @@ enum {
   OFF_BCROSS_D2 = OFF_BCROSS_D1 + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_BPWM_CWT = OFF_BCROSS_D2 + 4 * BOUNDARY_KMER_COUNT * K2,
   OFF_GC_DIFF = OFF_BPWM_CWT + 4 * BOUNDARY_CWT_COUNT * KNUC,
-  OFF_GC_LVL = OFF_GC_DIFF + EMIT_STATES,
-  OFF_E3_GC = OFF_GC_LVL + EMIT_STATES,
-  OFF_TRANS_GC = OFF_E3_GC + EMIT_STATES * K3,
-  OFF_TRANSITION = OFF_TRANS_GC + TRANSITION_FEATURES,
+  OFF_TRANSITION = OFF_GC_DIFF + EMIT_STATES,
   OFF_F1_WEIGHT = OFF_TRANSITION + TRANSITION_FEATURES,
   WEIGHTS = OFF_F1_WEIGHT + 1
 };
@@ -62,7 +59,7 @@ typedef struct {
   uint8_t boundary_nuc[2][BOUNDARY_PWM_COUNT];
   uint8_t boundary_cwt_nuc[2][BOUNDARY_CWT_COUNT];
   uint8_t nuc, boundary_k2[2][BOUNDARY_KMER_COUNT];
-  float gc_dev, gc_contrast;
+  float gc_contrast;
 } Site;
 
 static const int hidden_offsets[STATES] = {0, 1, 5, 11, 14, 19, 39, 69, 72, 76, 82, 102, 132};
@@ -90,7 +87,6 @@ static int kmer(const char *seq, int length, int from, int size, int reverse) {
 }
 
 static double local_gc_at(const Contig *c, int position) {
-  if (c->genome_length < 128) return 0.40;
   int lo = position - GC_RADIUS < 0 ? 0 : position - GC_RADIUS;
   int hi = position + GC_RADIUS >= c->genome_length ? c->genome_length - 1 : position + GC_RADIUS;
   int gc = 0, atgc = 0;
@@ -101,7 +97,7 @@ static double local_gc_at(const Contig *c, int position) {
       if (b == 1 || b == 2) gc++;
     }
   }
-  return atgc > 0 ? (double)gc / (double)atgc : 0.40;
+  return atgc > 0 ? (double)gc / (double)atgc : 0.0;
 }
 
 static void site_context(const Contig *c, int position, Site *site) {
@@ -124,15 +120,8 @@ static void site_context(const Contig *c, int position, Site *site) {
       site->boundary_cwt_nuc[rev][offset] = b < 0 ? 4 : rev ? 3 - b : b;
     }
   }
-  if (c->genome_length >= 128) {
-    double lgc = local_gc_at(c, position);
-    uint32_t k3 = site->kmer_emit[0][0];
-    site->gc_dev = (float)(lgc - 0.40);
-    site->gc_contrast = k3 < 64 ? (float)((double)k3_gc_count[k3] / 3.0 - lgc) : 0.0f;
-  } else {
-    site->gc_dev = 0.0f;
-    site->gc_contrast = 0.0f;
-  }
+  uint32_t k3 = site->kmer_emit[0][0];
+  site->gc_contrast = k3 < 64 ? (float)((double)k3_gc_count[k3] / 3.0 - local_gc_at(c, position)) : 0.0f;
 }
 
 static Site __attribute__((unused)) site_at(const Contig *c, int i) {
@@ -508,27 +497,21 @@ static int emission_index(const Site *site, int layer, int state) {
 }
 
 static double emission_score(const double *w, const Site *site, int state) {
-  int es = emit_state(state), rev = state >= 7;
+  int es = emit_state(state);
   double score = 0;
   for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
     score += w[emission_index(site, layer, state)];
-  if (site->gc_dev != 0.0f || site->gc_contrast != 0.0f) {
+  if (site->gc_contrast != 0.0f)
     score += w[OFF_GC_DIFF + es] * site->gc_contrast;
-    score += w[OFF_GC_LVL + es] * site->gc_dev;
-    score += w[OFF_E3_GC + es * K3 + (int)site->kmer_emit[0][rev]] * site->gc_dev;
-  }
   return score;
 }
 
 static void emission_accumulate(double *values, const Site *site, int state, double value) {
-  int es = emit_state(state), rev = state >= 7;
+  int es = emit_state(state);
   for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
     values[emission_index(site, layer, state)] += value;
-  if (site->gc_dev != 0.0f || site->gc_contrast != 0.0f) {
+  if (site->gc_contrast != 0.0f)
     values[OFF_GC_DIFF + es] += value * site->gc_contrast;
-    values[OFF_GC_LVL + es] += value * site->gc_dev;
-    values[OFF_E3_GC + es * K3 + (int)site->kmer_emit[0][rev]] += value * site->gc_dev;
-  }
 }
 
 typedef struct {
@@ -571,16 +554,14 @@ static void site_stream_init(SiteStream *s, const Contig *c, int start_position)
   for (int g = g_start - 27; g <= g_start + 25; g++)
     site_stream_fill_cwt(s, g);
   s->gc_count = s->atgc_count = 0;
-  if (c->genome_length >= 128) {
-    int g0 = g_start - 1;
-    int lo = g0 - GC_RADIUS < 0 ? 0 : g0 - GC_RADIUS;
-    int hi = g0 + GC_RADIUS >= c->genome_length ? c->genome_length - 1 : g0 + GC_RADIUS;
-    for (int g = lo; g <= hi; g++) {
-      int b = base_index(c->seq[g]);
-      if (b >= 0) {
-        s->atgc_count++;
-        if (b == 1 || b == 2) s->gc_count++;
-      }
+  int g0 = g_start - 1;
+  int lo = g0 - GC_RADIUS < 0 ? 0 : g0 - GC_RADIUS;
+  int hi = g0 + GC_RADIUS >= c->genome_length ? c->genome_length - 1 : g0 + GC_RADIUS;
+  for (int g = lo; g <= hi; g++) {
+    int b = base_index(c->seq[g]);
+    if (b >= 0) {
+      s->atgc_count++;
+      if (b == 1 || b == 2) s->gc_count++;
     }
   }
 }
@@ -599,22 +580,20 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
 
   site_stream_fill_cwt(s, g0 + 26);
 
-  if (c->genome_length >= 128) {
-    int g_out = g0 - GC_RADIUS - 1;
-    if (g_out >= 0 && g_out < c->genome_length) {
-      int bo = base_index(c->seq[g_out]);
-      if (bo >= 0) {
-        s->atgc_count--;
-        if (bo == 1 || bo == 2) s->gc_count--;
-      }
+  int g_out = g0 - GC_RADIUS - 1;
+  if (g_out >= 0 && g_out < c->genome_length) {
+    int bo = base_index(c->seq[g_out]);
+    if (bo >= 0) {
+      s->atgc_count--;
+      if (bo == 1 || bo == 2) s->gc_count--;
     }
-    int g_in = g0 + GC_RADIUS;
-    if (g_in >= 0 && g_in < c->genome_length) {
-      int bi = base_index(c->seq[g_in]);
-      if (bi >= 0) {
-        s->atgc_count++;
-        if (bi == 1 || bi == 2) s->gc_count++;
-      }
+  }
+  int g_in = g0 + GC_RADIUS;
+  if (g_in >= 0 && g_in < c->genome_length) {
+    int bi = base_index(c->seq[g_in]);
+    if (bi >= 0) {
+      s->atgc_count++;
+      if (bi == 1 || bi == 2) s->gc_count++;
     }
   }
 
@@ -641,15 +620,10 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
     site.boundary_cwt_nuc[0][offset] = bf;
     site.boundary_cwt_nuc[1][offset] = br < 4 ? (uint8_t)(3 - br) : 4;
   }
-  if (c->genome_length >= 128) {
-    double lgc = s->atgc_count > 0 ? (double)s->gc_count / (double)s->atgc_count : 0.40;
-    uint32_t k3 = site.kmer_emit[0][0];
-    site.gc_dev = (float)(lgc - 0.40);
-    site.gc_contrast = k3 < 64 ? (float)((double)k3_gc_count[k3] / 3.0 - lgc) : 0.0f;
-  } else {
-    site.gc_dev = 0.0f;
-    site.gc_contrast = 0.0f;
-  }
+  uint32_t k3 = site.kmer_emit[0][0];
+  site.gc_contrast = (k3 < 64 && s->atgc_count > 0)
+    ? (float)((double)k3_gc_count[k3] / 3.0 - (double)s->gc_count / (double)s->atgc_count)
+    : 0.0f;
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
     uint8_t k2f = s->k2_ring[(g0 + boundary_kmer_offsets[offset]) & 63];
     site.boundary_k2[0][offset] = k2f;
@@ -713,9 +687,7 @@ static inline Site site_scores_stream(const double *w, SiteStream *s, int positi
 
   for (int edge = 0; edge < ntrans; edge++) {
     int reverse = edge_rev[edge], kind = edge_kind[edge];
-    int t_id = edge_trans[edge] - OFF_TRANSITION;
     double score = w[edge_trans[edge]];
-    if (site.gc_dev != 0.0f) score += w[OFF_TRANS_GC + t_id] * site.gc_dev;
     if (kind >= 0) score += b_score[reverse][kind];
     double p = score + emissions[trans_b[edge]];
     if (!isfinite(p))
@@ -1080,9 +1052,7 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
       for (int edge = 0; edge < ntrans; edge++) {
         double m = edge_marginals[edge];
         if (m != 0) {
-          int t_id = edge_trans[edge] - OFF_TRANSITION;
           gradient[edge_trans[edge]] -= m;
-          if (site->gc_dev != 0.0f) gradient[OFF_TRANS_GC + t_id] -= m * site->gc_dev;
           int reverse = edge_rev[edge], kind = edge_kind[edge];
           if (kind >= 0) {
             b_coeff[kind][reverse] -= m;
@@ -1279,24 +1249,17 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
     site_stream_init(&stream, &c, 0);
     for (int i = 0; i < c.length; i++) {
       Site site = site_scores_stream(dummy_w, &stream, i, dummy_e, dummy_psi);
-      int state = y[i], es = emit_state(state), rev = state >= 7;
+      int state = y[i], es = emit_state(state);
       for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
         feature_observe(NULL, scale, emission_index(&site, layer, state), 1, 1);
-      if (site.gc_dev != 0.0f || site.gc_contrast != 0.0f) {
+      if (site.gc_contrast != 0.0f)
         feature_observe(NULL, scale, OFF_GC_DIFF + es, 1, site.gc_contrast);
-        feature_observe(NULL, scale, OFF_GC_LVL + es, 1, site.gc_dev);
-        feature_observe(NULL, scale, OFF_E3_GC + es * K3 + (int)site.kmer_emit[0][rev],
-                        1, site.gc_dev);
-      }
       if (is_cds(state))
         feature_observe(NULL, scale, OFF_F1_WEIGHT, 1, CRF_F1_BASE_WEIGHT);
       if (!i) continue;
       int edge = path_edge(y, c.length, i);
       if (edge < 0) anno_fail("Invalid transition in validated CRF training path");
-      int t_id = edge_trans[edge] - OFF_TRANSITION;
       feature_observe(NULL, scale, edge_trans[edge], 1, 1);
-      if (site.gc_dev != 0.0f)
-        feature_observe(NULL, scale, OFF_TRANS_GC + t_id, 1, site.gc_dev);
       int reverse = edge_rev[edge], kind = edge_kind[edge];
       if (kind >= 0)
         boundary_observe(&c, &site, c.offset + i, reverse, kind, 1, NULL, scale);
@@ -1613,26 +1576,10 @@ void crf_save_weights_text(const char *path, const double *w) {
                 idx, kind_names[kind], boundary_cwt_offsets[offset], "ACGTN"[b], (float)w[idx]);
       }
   for (int s = 0; s < EMIT_STATES; s++) {
-    int idx_d = OFF_GC_DIFF + s, idx_l = OFF_GC_LVL + s;
+    int idx_d = OFF_GC_DIFF + s;
     if ((float)w[idx_d])
       fprintf(file, "%d\tgc_contrast\t%s\tk3_minus_local_gc\t%.9g\n",
               idx_d, state_names[s], (float)w[idx_d]);
-    if ((float)w[idx_l])
-      fprintf(file, "%d\tgc_level\t%s\tlocal_gc_dev\t%.9g\n",
-              idx_l, state_names[s], (float)w[idx_l]);
-    for (int k = 0; k < K3; k++) {
-      int idx_k = OFF_E3_GC + s * K3 + k;
-      if (!(float)w[idx_k]) continue;
-      format_kmer(k, 3, kbuf);
-      fprintf(file, "%d\temit_k3_gc\t%s\tk3=%s\t%.9g\n",
-              idx_k, state_names[s], kbuf, (float)w[idx_k]);
-    }
-  }
-  for (int transition = 0; transition < TRANSITION_FEATURES; transition++) {
-    int idx = OFF_TRANS_GC + transition;
-    if (!(float)w[idx]) continue;
-    fprintf(file, "%d\ttransition_gc\t%s\tlocal_gc_dev\t%.9g\n",
-            idx, transition_names[transition], (float)w[idx]);
   }
 
   for (int transition = 0; transition < TRANSITION_FEATURES; transition++) {

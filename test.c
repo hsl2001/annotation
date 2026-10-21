@@ -224,12 +224,8 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
       int rev = edge_rev[edge];
       int kind = edge_kind[edge];
       int transition = edge_trans[edge];
-      int t_id = transition - OFF_TRANSITION;
-      total_score += w[transition] + w[OFF_TRANS_GC + t_id] * site.gc_dev;
-      if (feat_accum) {
-        feat_accum[transition] += scale;
-        if (site.gc_dev != 0.0f) feat_accum[OFF_TRANS_GC + t_id] += scale * site.gc_dev;
-      }
+      total_score += w[transition];
+      if (feat_accum) feat_accum[transition] += scale;
       if (kind >= 0) {
         int gpos = c->offset + t;
         for (int off = 0; off < BOUNDARY_KMER_COUNT; off++) {
@@ -927,7 +923,7 @@ static void test_crf_length_one(void) {
   for (int i = 0; i < WEIGHTS; i++) {
     w1[i] = rng_uniform(-1.0, 1.0);
     /* w2 has identical emission weights, but wildly different transition/boundary weights */
-    w2[i] = i < OFF_SPLICE_START_STOP
+    w2[i] = (i < OFF_SPLICE_START_STOP || (i >= OFF_GC_DIFF && i < OFF_TRANSITION))
       ? w1[i] : rng_uniform(-50.0, 50.0);
   }
 
