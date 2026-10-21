@@ -1,0 +1,1 @@
+for f in data/*.fasta; do n=${f##*/}; n=${n%.fasta}; printf 'cd %q && python3 plot.py -P introns -o %q -g %q -p 16 %q\n' "$PWD" "plots-$n" "data/$n.gff3" "$f" | qsub -N "plot-$n" -j oe -o "$HOME/log/plot-$n.log" -l select=1:ncpus=16; done
