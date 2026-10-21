@@ -22,4 +22,5 @@ tmp*
 !*.typ
 *.weights.txt
 /feature-results/
-anno_cwt
+anno_cwt*
+test-runner

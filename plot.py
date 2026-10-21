@@ -515,6 +515,12 @@ def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> N
 
 
 class CwtPlotter:
+    CWT_ENCODINGS = (
+        ("general", Path("./anno_cwt_general")),
+        ("intron-low-energy", Path("./anno_cwt_intron_low_energy")),
+        ("branchpoint", Path("./anno_cwt_branchpoint")),
+    )
+
     @classmethod
     def run_meme(cls, fasta: Path, output: Path) -> list[dict[str, Any]]:
         output.mkdir(parents=True, exist_ok=True)
@@ -713,6 +719,17 @@ class CwtPlotter:
 
     @classmethod
     def run(cls, args: argparse.Namespace) -> None:
+        encodings = [(args.anno.stem, args.anno)] if args.anno else cls.CWT_ENCODINGS
+        for name, binary in encodings:
+            variant_args = argparse.Namespace(**vars(args))
+            variant_args.anno = binary
+            if len(encodings) > 1:
+                variant_args.out = args.out / name
+                variant_args.cwt = args.cwt / name if args.cwt else None
+            cls.run_encoding(variant_args)
+
+    @classmethod
+    def run_encoding(cls, args: argparse.Namespace) -> None:
         args.out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out, ignore_cleanup_errors=True) as tmp:
             work = Path(tmp)
@@ -799,7 +816,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-g", "--gff", type=Path)
     parser.add_argument("-o", "--out", type=Path, default=Path("plots"))
     parser.add_argument("-c", "--cwt", type=Path)
-    parser.add_argument("--anno", type=Path, default=Path("./anno_cwt"))
+    parser.add_argument("--anno", type=Path, help="Use one CWT binary instead of running all three encodings")
     parser.add_argument("-p", "--threads", type=pos_int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("-n", "--rows", type=pos_int, default=1500)
     parser.add_argument("-s", "--seed", type=int, default=42)
