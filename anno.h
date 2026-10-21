@@ -11,7 +11,7 @@
 #define CWT_WINDOW_SIZE 1024
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
-#define MIN_CDS 12
+#define MIN_CDS 6
 #define DEFAULT_ITERATIONS 300
 
 typedef struct {

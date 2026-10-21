@@ -6,8 +6,7 @@
 
 #define CRF_L2_C2 1.0
 #define CRF_F1_BASE_WEIGHT 0.03
-#define CRF_F1_TARGET_LOSS 0.25
-#define CRF_MIN_FREQ 1
+#define CRF_F1_TARGET_LOSS 0.1
 
 static const int boundary_kmer_offsets[] = {-4, -3, -2, -1, 0, 1, 2};
 static const int boundary_cwt_offsets[] = {-26, -24, -6, -4, -2, -1, 0, 2, 4};
@@ -250,13 +249,6 @@ static void cwt_at_pos(const Contig *c, int g, float *power,
     return;
   }
   memcpy(power, c->cwt_power + (size_t)g * WAVE_COUNT, WAVE_COUNT * sizeof(*power));
-  if (c->genome_length >= 128 && g >= 16 && g + 16 < c->genome_length &&
-      base_index(c->seq[g - 16]) >= 0 && base_index(c->seq[g + 16]) >= 0) {
-    const float *p_left = c->cwt_power + (size_t)(g - 16) * WAVE_COUNT;
-    const float *p_right = c->cwt_power + (size_t)(g + 16) * WAVE_COUNT;
-    for (int scale = 0; scale < WAVE_COUNT; scale++)
-      power[scale] -= 0.5f * (p_left[scale] + p_right[scale]);
-  }
   for (int slot = 0; slot < DERIV_COUNT; slot++) {
     const double *kernel = derivative_kernels[slot];
     int valid = 1;
@@ -833,39 +825,38 @@ static double normalize_log_alpha(double *log_alpha, int position) {
   return log_norm;
 }
 
-static inline void feature_observe(double *grad, double *scale, double *freq,
+static inline void feature_observe(double *grad, double *scale,
                                    int f, double coeff, double value) {
   if (grad) grad[f] += coeff * value;
   if (scale) scale[f] += value * value;
-  if (freq && value != 0) freq[f] += 1;
 }
 
 static void boundary_observe(const Contig *c, const Site *site, int genome_pos,
                              int rev, int kind, double coeff,
-                             double *grad, double *scale, double *freq) {
+                             double *grad, double *scale) {
   for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++) {
-    feature_observe(grad, scale, freq, boundary_kmer_index(site, rev, kind, offset), coeff, 1);
+    feature_observe(grad, scale, boundary_kmer_index(site, rev, kind, offset), coeff, 1);
     double d1_m = 0, d2_m = 0;
     boundary_kmer_cwt_at(c, genome_pos, rev, offset, &d1_m, &d2_m);
-    feature_observe(grad, scale, freq, bcross_d1_index(site, rev, kind, offset), coeff, d1_m);
-    feature_observe(grad, scale, freq, bcross_d2_index(site, rev, kind, offset), coeff, d2_m);
+    feature_observe(grad, scale, bcross_d1_index(site, rev, kind, offset), coeff, d1_m);
+    feature_observe(grad, scale, bcross_d2_index(site, rev, kind, offset), coeff, d2_m);
   }
   for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++)
-    feature_observe(grad, scale, freq, boundary_pwm_index(site, rev, kind, offset), coeff, 1);
+    feature_observe(grad, scale, boundary_pwm_index(site, rev, kind, offset), coeff, 1);
   for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++) {
     float power[WAVE_COUNT];
     double derivative[DERIV_COUNT][WAVE_COUNT];
     boundary_cwt_at(c, genome_pos, rev, offset, power, derivative);
     double d2_m = 0;
     for (int sc = 0; sc < WAVE_COUNT; sc++) {
-      feature_observe(grad, scale, freq, bp_index(kind, offset, sc), coeff, power[sc]);
+      feature_observe(grad, scale, bp_index(kind, offset, sc), coeff, power[sc]);
       for (int slot = 0; slot < DERIV_COUNT; slot++)
-        feature_observe(grad, scale, freq, derivative_index(kind, slot, offset, sc),
+        feature_observe(grad, scale, derivative_index(kind, slot, offset, sc),
                         coeff, derivative[slot][sc]);
       d2_m += derivative[1][sc];
     }
     d2_m *= (1.0 / WAVE_COUNT);
-    feature_observe(grad, scale, freq, bpwm_cwt_index(site, rev, kind, offset), coeff, d2_m);
+    feature_observe(grad, scale, bpwm_cwt_index(site, rev, kind, offset), coeff, d2_m);
   }
 }
 
@@ -901,12 +892,6 @@ static void boundary_observe_cached(const CwtCached *cwt_center, const Site *sit
   }
 }
 
-static inline double f1_pred_weight(int st, int gold_state, int length) {
-  if (is_cds(st)) return 1.0;
-  if (length >= 64 && gold_state == 0 && is_intron(st)) return 0.5;
-  return 0.0;
-}
-
 static void backward_step(const Work *k, int length, int position, double *B, double *D,
                           const double *prev_Ap, const double *prev_At,
                           double c_pred, double c_tp, int gold_state, double r_bar,
@@ -920,65 +905,20 @@ static void backward_step(const Work *k, int length, int position, double *B, do
   double B_prev[HIDDEN_STATES] = {0}, D_prev[HIDDEN_STATES] = {0};
   const HiddenEdge *edges = hidden_edges[site->nuc];
   int edge_count = hidden_edge_count[site->nuc];
-
-  double psi_max = -INFINITY;
-  for (int t = 0; t < ntrans; t++)
-    if (psi[t] > psi_max) psi_max = psi[t];
-  int fast = isfinite(psi_max);
-  for (int t = 0; fast && t < ntrans; t++)
-    if (psi[t] - psi_max < -600.0) fast = 0;
-  if (fast) {
-    double exp_prev[HIDDEN_STATES] = {0}, inv_L[HIDDEN_STATES] = {0}, exp_psi[STATES * STATES];
-    for (int t = 0; t < ntrans; t++) exp_psi[t] = exp(psi[t] - psi_max);
-    for (int h = 0; h < HIDDEN_STATES; h++) {
-      if (prev_L[h] >= -600.0) exp_prev[h] = exp(prev_L[h]);
-      if (B[h] > 0.0 && L[h] > -INFINITY && (!last || terminal_allowed(h))) {
-        double shift = psi_max - log_norm - L[h];
-        inv_L[h] = fabs(shift) <= 600.0 ? exp(shift) : -1.0;
-      }
-    }
-    for (int edge = 0; edge < edge_count; edge++) {
-      const HiddenEdge *step = edges + edge;
-      int u = step->previous, v = step->current;
-      double inv_v = inv_L[v];
-      if (inv_v == 0.0) continue;
-      double ep_u = exp_prev[u];
-      double q;
-      if (inv_v > 0.0 && ep_u > 0.0) {
-        q = ep_u * exp_psi[step->transition] * inv_v;
-      } else {
-        if (!(prev_L[u] > -INFINITY)) continue;
-        q = exp(prev_L[u] + psi[step->transition] - log_norm - L[v]);
-      }
-      double edge_prob = B[v] * q;
-      B_prev[u] += edge_prob;
-      if (edge_marginals) edge_marginals[step->transition] += edge_prob;
-      if (D) {
-        int st = hidden_state[v];
-        double pw = f1_pred_weight(st, gold_state, length);
-        double rv = pw * c_pred + (is_cds(st) && st == gold_state ? c_tp : 0.0);
-        double au = c_pred * prev_Ap[u] + c_tp * prev_At[u];
-        D_prev[u] += q * (B[v] * rv + D[v]);
-        edge_marginals[step->transition] += q * (B[v] * (au + rv - r_bar) + D[v]);
-      }
-    }
-  } else {
-    for (int edge = 0; edge < edge_count; edge++) {
-      const HiddenEdge *step = edges + edge;
-      int u = step->previous, v = step->current;
-      if (!(B[v] > 0.0) || !forward_edge_allowed(prev_L, step, last)) continue;
-      double q = exp(prev_L[u] + psi[step->transition] - log_norm - L[v]);
-      double edge_prob = B[v] * q;
-      B_prev[u] += edge_prob;
-      if (edge_marginals) edge_marginals[step->transition] += edge_prob;
-      if (D) {
-        int st = hidden_state[v];
-        double pw = f1_pred_weight(st, gold_state, length);
-        double rv = pw * c_pred + (is_cds(st) && st == gold_state ? c_tp : 0.0);
-        double au = c_pred * prev_Ap[u] + c_tp * prev_At[u];
-        D_prev[u] += q * (B[v] * rv + D[v]);
-        edge_marginals[step->transition] += q * (B[v] * (au + rv - r_bar) + D[v]);
-      }
+  for (int edge = 0; edge < edge_count; edge++) {
+    const HiddenEdge *step = edges + edge;
+    int u = step->previous, v = step->current;
+    if (!(B[v] > 0.0) || !forward_edge_allowed(prev_L, step, last)) continue;
+    double q = exp(prev_L[u] + psi[step->transition] - log_norm - L[v]);
+    double edge_prob = B[v] * q;
+    B_prev[u] += edge_prob;
+    if (edge_marginals) edge_marginals[step->transition] += edge_prob;
+    if (D) {
+      int st = hidden_state[v];
+      double rv = is_cds(st) ? c_pred + (st == gold_state ? c_tp : 0.0) : 0.0;
+      double au = c_pred * prev_Ap[u] + c_tp * prev_At[u];
+      D_prev[u] += q * (B[v] * rv + D[v]);
+      edge_marginals[step->transition] += q * (B[v] * (au + rv - r_bar) + D[v]);
     }
   }
   double sum_b = 0;
@@ -1024,8 +964,8 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
                     (c->length > 1 || terminal_allowed(hidden))
           ? emissions[st] : -INFINITY;
         if (use_f1) {
-          Ap[hidden] = L[hidden] > -INFINITY ? f1_pred_weight(st, gold_state, c->length) : 0.0;
-          At[hidden] = L[hidden] > -INFINITY && is_cds(st) && st == gold_state;
+          Ap[hidden] = L[hidden] > -INFINITY && is_cds(st);
+          At[hidden] = Ap[hidden] && st == gold_state;
         }
       }
     } else {
@@ -1043,104 +983,31 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
         L[hidden] = -INFINITY;
         if (use_f1) Ap[hidden] = At[hidden] = 0;
       }
-      double psi_max = -INFINITY;
-      for (int t = 0; t < ntrans; t++)
-        if (psi[t] > psi_max) psi_max = psi[t];
-      int fast = isfinite(psi_max);
-      for (int t = 0; fast && t < ntrans; t++)
-        if (psi[t] - psi_max < -600.0) fast = 0;
-
-      if (fast) {
-        double exp_prev[HIDDEN_STATES] = {0}, exp_psi[STATES * STATES];
-        uint8_t reachable[HIDDEN_STATES] = {0}, slow[HIDDEN_STATES] = {0};
-        int any_slow = 0;
-        for (int t = 0; t < ntrans; t++) exp_psi[t] = exp(psi[t] - psi_max);
-        for (int h = 0; h < HIDDEN_STATES; h++)
-          if (prev_L[h] >= -600.0) exp_prev[h] = exp(prev_L[h]);
-        for (int edge = 0; edge < edge_count; edge++) {
-          const HiddenEdge *step = edges + edge;
-          if (!forward_edge_allowed(prev_L, step, last)) continue;
-          reachable[step->current] = 1;
-          double w_edge = exp_prev[step->previous] * exp_psi[step->transition];
-          incoming_sum[step->current] += w_edge;
-          if (use_f1) {
-            Ap[step->current] += w_edge * prev_Ap[step->previous];
-            At[step->current] += w_edge * prev_At[step->previous];
-          }
-        }
-        for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-          if (reachable[hidden]) {
-            if (incoming_sum[hidden] >= 1e-250) {
-              if (use_f1) {
-                int st = hidden_state[hidden];
-                Ap[hidden] = Ap[hidden] / incoming_sum[hidden] +
-                             f1_pred_weight(st, gold_state, c->length);
-                At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
-              }
-              L[hidden] = psi_max + log(incoming_sum[hidden]);
-            } else {
-              slow[hidden] = 1;
-              any_slow = 1;
-              incoming_sum[hidden] = 0.0;
-              if (use_f1) Ap[hidden] = At[hidden] = 0.0;
-            }
-          }
-        if (any_slow) {
-          for (int edge = 0; edge < edge_count; edge++) {
-            const HiddenEdge *step = edges + edge;
-            if (!slow[step->current] || !forward_edge_allowed(prev_L, step, last)) continue;
-            double score = prev_L[step->previous] + psi[step->transition];
-            if (score > L[step->current]) L[step->current] = score;
-          }
-          for (int edge = 0; edge < edge_count; edge++) {
-            const HiddenEdge *step = edges + edge;
-            if (!slow[step->current] || !forward_edge_allowed(prev_L, step, last)) continue;
-            double w_edge = exp(prev_L[step->previous] + psi[step->transition] - L[step->current]);
-            incoming_sum[step->current] += w_edge;
-            if (use_f1) {
-              Ap[step->current] += w_edge * prev_Ap[step->previous];
-              At[step->current] += w_edge * prev_At[step->previous];
-            }
-          }
-          for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-            if (slow[hidden] && L[hidden] > -INFINITY) {
-              if (use_f1) {
-                int st = hidden_state[hidden];
-                Ap[hidden] = Ap[hidden] / incoming_sum[hidden] +
-                             f1_pred_weight(st, gold_state, c->length);
-                At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
-              }
-              L[hidden] += log(incoming_sum[hidden]);
-            }
-        }
-      } else {
-        for (int edge = 0; edge < edge_count; edge++) {
-          const HiddenEdge *step = edges + edge;
-          if (!forward_edge_allowed(prev_L, step, last)) continue;
-          double score = prev_L[step->previous] + psi[step->transition];
-          if (score > L[step->current]) L[step->current] = score;
-        }
-        for (int edge = 0; edge < edge_count; edge++) {
-          const HiddenEdge *step = edges + edge;
-          if (!forward_edge_allowed(prev_L, step, last)) continue;
-          double w_edge = exp(prev_L[step->previous] + psi[step->transition] - L[step->current]);
-          incoming_sum[step->current] += w_edge;
-          if (use_f1) {
-            Ap[step->current] += w_edge * prev_Ap[step->previous];
-            At[step->current] += w_edge * prev_At[step->previous];
-          }
-        }
-        for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-          if (L[hidden] > -INFINITY) {
-            if (use_f1) {
-              int st = hidden_state[hidden];
-              Ap[hidden] = Ap[hidden] / incoming_sum[hidden] +
-                           f1_pred_weight(st, gold_state, c->length);
-              At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
-            }
-            L[hidden] += log(incoming_sum[hidden]);
-          }
+      for (int edge = 0; edge < edge_count; edge++) {
+        const HiddenEdge *step = edges + edge;
+        if (!forward_edge_allowed(prev_L, step, last)) continue;
+        double score = prev_L[step->previous] + psi[step->transition];
+        if (score > L[step->current]) L[step->current] = score;
       }
+      for (int edge = 0; edge < edge_count; edge++) {
+        const HiddenEdge *step = edges + edge;
+        if (!forward_edge_allowed(prev_L, step, last)) continue;
+        double w_edge = exp(prev_L[step->previous] + psi[step->transition] - L[step->current]);
+        incoming_sum[step->current] += w_edge;
+        if (use_f1) {
+          Ap[step->current] += w_edge * prev_Ap[step->previous];
+          At[step->current] += w_edge * prev_At[step->previous];
+        }
+      }
+      for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+        if (L[hidden] > -INFINITY) {
+          if (use_f1) {
+            int st = hidden_state[hidden];
+            Ap[hidden] = Ap[hidden] / incoming_sum[hidden] + is_cds(st);
+            At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
+          }
+          L[hidden] += log(incoming_sum[hidden]);
+        }
     }
     k->log_norm[position] = normalize_log_alpha(L, position);
     logz += k->log_norm[position];
@@ -1400,16 +1267,13 @@ static double crf_scaled_objective(const double *v, double *gradient, void *cont
   return loss;
 }
 
-static void feature_counts(const CrfWindow *windows, size_t count, double *scale, double *freq) {
+static void feature_counts(const CrfWindow *windows, size_t count, double *scale) {
   memset(scale, 0, WEIGHTS * sizeof(*scale));
-  if (freq) memset(freq, 0, WEIGHTS * sizeof(*freq));
   double dummy_w[WEIGHTS] = {0}, dummy_e[STATES], dummy_psi[STATES * STATES];
-  int has_genome_window = 0;
   for (size_t w = 0; w < count; w++) {
     Contig c = *windows[w].contig;
     c.offset = windows[w].start;
     c.length = windows[w].length;
-    if (c.length >= 64) has_genome_window = 1;
     const uint8_t *y = c.label + c.offset;
     SiteStream stream;
     site_stream_init(&stream, &c, 0);
@@ -1417,120 +1281,31 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
       Site site = site_scores_stream(dummy_w, &stream, i, dummy_e, dummy_psi);
       int state = y[i], es = emit_state(state), rev = state >= 7;
       for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++)
-        feature_observe(NULL, scale, freq, emission_index(&site, layer, state), 1, 1);
+        feature_observe(NULL, scale, emission_index(&site, layer, state), 1, 1);
       if (site.gc_dev != 0.0f || site.gc_contrast != 0.0f) {
-        feature_observe(NULL, scale, freq, OFF_GC_DIFF + es, 1, site.gc_contrast);
-        feature_observe(NULL, scale, freq, OFF_GC_LVL + es, 1, site.gc_dev);
-        feature_observe(NULL, scale, freq, OFF_E3_GC + es * K3 + (int)site.kmer_emit[0][rev],
+        feature_observe(NULL, scale, OFF_GC_DIFF + es, 1, site.gc_contrast);
+        feature_observe(NULL, scale, OFF_GC_LVL + es, 1, site.gc_dev);
+        feature_observe(NULL, scale, OFF_E3_GC + es * K3 + (int)site.kmer_emit[0][rev],
                         1, site.gc_dev);
       }
       if (is_cds(state))
-        feature_observe(NULL, scale, freq, OFF_F1_WEIGHT, 1, CRF_F1_BASE_WEIGHT);
+        feature_observe(NULL, scale, OFF_F1_WEIGHT, 1, CRF_F1_BASE_WEIGHT);
       if (!i) continue;
       int edge = path_edge(y, c.length, i);
       if (edge < 0) anno_fail("Invalid transition in validated CRF training path");
       int t_id = edge_trans[edge] - OFF_TRANSITION;
-      feature_observe(NULL, scale, freq, edge_trans[edge], 1, 1);
+      feature_observe(NULL, scale, edge_trans[edge], 1, 1);
       if (site.gc_dev != 0.0f)
-        feature_observe(NULL, scale, freq, OFF_TRANS_GC + t_id, 1, site.gc_dev);
+        feature_observe(NULL, scale, OFF_TRANS_GC + t_id, 1, site.gc_dev);
       int reverse = edge_rev[edge], kind = edge_kind[edge];
       if (kind >= 0)
-        boundary_observe(&c, &site, c.offset + i, reverse, kind, 1, NULL, scale, freq);
-    }
-  }
-  if (has_genome_window && freq) {
-    /* Activate non-N candidate features on genome windows and match interaction scales to base counts. */
-    for (int s = 0; s < EMIT_STATES; s++) {
-      for (int k = 0; k < 64; k++) {
-        int idx_e3 = OFF_E3 + s * K3 + k, idx_gc = OFF_E3_GC + s * K3 + k;
-        feature_observe(NULL, scale, freq, idx_e3, 1, 1);
-        feature_observe(NULL, scale, freq, idx_gc, 1, 1);
-        if (scale[idx_gc] < scale[idx_e3]) scale[idx_gc] = scale[idx_e3];
-      }
-      feature_observe(NULL, scale, freq, OFF_GC_DIFF + s, 1, 1);
-      feature_observe(NULL, scale, freq, OFF_GC_LVL + s, 1, 1);
-    }
-    static const int pwm_min_disp[4] = {-3, -24, -6, -3};
-    static const int pwm_max_disp[4] = { 6,   3,  4,  5};
-    for (int kind = 0; kind < 4; kind++) {
-      for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
-        for (int k = 0; k < 16; k++) {
-          int idx = (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
-          feature_observe(NULL, scale, freq, OFF_SPLICE_START_STOP + idx, 1, 1);
-          feature_observe(NULL, scale, freq, OFF_BCROSS_D1 + idx, 1, 1);
-          feature_observe(NULL, scale, freq, OFF_BCROSS_D2 + idx, 1, 1);
-          double base_s = fmax(scale[OFF_SPLICE_START_STOP + idx], 16.0);
-          if (scale[OFF_BCROSS_D1 + idx] < base_s) scale[OFF_BCROSS_D1 + idx] = base_s;
-          if (scale[OFF_BCROSS_D2 + idx] < base_s) scale[OFF_BCROSS_D2 + idx] = base_s;
-        }
-      for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++) {
-        int disp = BOUNDARY_PWM_FROM + offset;
-        int active_disp = disp >= pwm_min_disp[kind] && disp <= pwm_max_disp[kind];
-        for (int b = 0; b < 4; b++) {
-          int idx = OFF_PWM + (kind * BOUNDARY_PWM_COUNT + offset) * KNUC + b;
-          if (active_disp) feature_observe(NULL, scale, freq, idx, 1, 1);
-          else freq[idx] = 0;
-        }
-      }
-      for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
-        for (int b = 0; b < 4; b++) {
-          int idx = OFF_BPWM_CWT + (kind * BOUNDARY_CWT_COUNT + offset) * KNUC + b;
-          feature_observe(NULL, scale, freq, idx, 1, 4);
-        }
-    }
-    for (int t = 0; t < TRANSITION_FEATURES; t++) {
-      feature_observe(NULL, scale, freq, OFF_TRANSITION + t, 1, 1);
-      feature_observe(NULL, scale, freq, OFF_TRANS_GC + t, 1, 1);
-      if (scale[OFF_TRANS_GC + t] < scale[OFF_TRANSITION + t])
-        scale[OFF_TRANS_GC + t] = scale[OFF_TRANSITION + t];
+        boundary_observe(&c, &site, c.offset + i, reverse, kind, 1, NULL, scale);
     }
   }
 }
 
 static void counts_to_scales(double *scale) {
   for (int f = 0; f < WEIGHTS; f++) scale[f] = 1 / sqrt(fmax(scale[f], 1));
-}
-
-static int feature_active(double freq) {
-  return freq >= CRF_MIN_FREQ;
-}
-
-static const struct {
-  const char *name;
-  int from, to;
-} feature_groups[] = {
-  {"emit_k3", OFF_E3, OFF_SPLICE_START_STOP},
-  {"boundary_k2", OFF_SPLICE_START_STOP, OFF_BP},
-  {"boundary_cwt_power", OFF_BP, OFF_BD},
-  {"boundary_cwt_deriv", OFF_BD, OFF_PWM},
-  {"boundary_pwm", OFF_PWM, OFF_BCROSS_D1},
-  {"boundary_k2_cwt_d1", OFF_BCROSS_D1, OFF_BCROSS_D2},
-  {"boundary_k2_cwt_d2", OFF_BCROSS_D2, OFF_BPWM_CWT},
-  {"boundary_pwm_cwt", OFF_BPWM_CWT, OFF_GC_DIFF},
-  {"gc_context", OFF_GC_DIFF, OFF_TRANSITION},
-  {"transition", OFF_TRANSITION, OFF_F1_WEIGHT},
-  {"f1_weight", OFF_F1_WEIGHT, WEIGHTS}
-};
-enum { FEATURE_GROUPS = sizeof(feature_groups) / sizeof(feature_groups[0]) };
-
-typedef struct {
-  CrfObjective *inner;
-  int *index, count;
-  double *v, *gradient;
-} CrfActive;
-
-static double crf_active_objective(const double *x, double *gradient, void *context) {
-  CrfActive *active = context;
-  for (int i = 0; i < active->count; i++) active->v[active->index[i]] = x[i];
-  double loss = crf_scaled_objective(active->v, active->gradient, active->inner);
-  for (int i = 0; i < active->count; i++) gradient[i] = active->gradient[active->index[i]];
-  return loss;
-}
-
-static void crf_active_progress(void *context, int iteration, double objective, double step,
-                                int line_search_trials, size_t n, const double *gradient) {
-  crf_progress(((CrfActive *)context)->inner, iteration, objective, step, line_search_trials,
-               n, gradient);
 }
 
 void crf_train(Contig *contigs, int count, double *w, int iterations, int threads) {
@@ -1558,34 +1333,14 @@ void crf_train(Contig *contigs, int count, double *w, int iterations, int thread
   int completed = 0;
   objective.scale = anno_alloc(WEIGHTS, sizeof(*objective.scale));
   objective.weights = anno_alloc(WEIGHTS, sizeof(*objective.weights));
-  double *freq = anno_alloc(WEIGHTS, sizeof(*freq));
-  feature_counts(windows, window_count, objective.scale, freq);
-  CrfActive active = {
-    .inner = &objective,
-    .index = anno_alloc(WEIGHTS, sizeof(*active.index)),
-    .v = anno_alloc(WEIGHTS, sizeof(*active.v)),
-    .gradient = anno_alloc(WEIGHTS, sizeof(*active.gradient))
-  };
-  fprintf(stderr, "Active features (min frequency %d):", CRF_MIN_FREQ);
-  for (int g = 0; g < FEATURE_GROUPS; g++) {
-    int group_active = 0;
-    for (int f = feature_groups[g].from; f < feature_groups[g].to; f++)
-      if (feature_active(freq[f])) active.index[active.count++] = f, group_active++;
-    fprintf(stderr, " %s %d/%d", feature_groups[g].name, group_active,
-            feature_groups[g].to - feature_groups[g].from);
-  }
-  fprintf(stderr, ", total %d/%d\n", active.count, WEIGHTS);
-  free(freq);
+  feature_counts(windows, window_count, objective.scale);
   counts_to_scales(objective.scale);
-  double *x = anno_alloc((size_t)active.count, sizeof(*x));
-  for (int i = 0; i < active.count; i++)
-    x[i] = w[active.index[i]] / objective.scale[active.index[i]];
-  LbfgsStatus status = lbfgs_minimize((size_t)active.count, x, crf_active_objective,
-                                      crf_active_progress, &active, iterations, &completed);
-  memset(w, 0, WEIGHTS * sizeof(*w));
-  for (int i = 0; i < active.count; i++)
-    w[active.index[i]] = x[i] * objective.scale[active.index[i]];
-  free(x), free(active.index), free(active.v), free(active.gradient);
+  for (int f = 0; f < WEIGHTS; f++)
+    w[f] /= objective.scale[f];
+  LbfgsStatus status = lbfgs_minimize(WEIGHTS, w, crf_scaled_objective, crf_progress, &objective,
+                                      iterations, &completed);
+  for (int f = 0; f < WEIGHTS; f++)
+    w[f] *= objective.scale[f];
   free(objective.scale), free(objective.weights);
   for (int t = 0; t < objective.train.threads; t++) {
     work_free(&objective.workers[t].work);

@@ -141,7 +141,7 @@ static int by_parent(const void *x, const void *y) {
 static int by_total(const void *x, const void *y) { return ((const Group *)y)->total - ((const Group *)x)->total; }
 
 static int valid_cds(const char *seq, const Cds *s, int m, int total, int minus) {
-  if (total < 6 || total % 3) return 0;
+  if (total < MIN_CDS || total % 3) return 0;
   for (int jj = 0, index = 0, codon = 0; jj < m; jj++) {
     int j = minus ? m - 1 - jj : jj, len = s[j].end - s[j].start + 1;
     for (int t = 0; t < len; t++, index++) {

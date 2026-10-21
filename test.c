@@ -368,7 +368,7 @@ static void bf_crf_solve(const double *w, const Contig *c, BruteForceCrf *out,
 }
 
 static void feature_scales(const CrfWindow *windows, size_t count, double *scale) {
-  feature_counts(windows, count, scale, NULL);
+  feature_counts(windows, count, scale);
   counts_to_scales(scale);
 }
 
@@ -581,13 +581,12 @@ static void test_crf_phase_independent_transitions(void) {
     for (int f = 0; f < TRANSITION_FEATURES; f++) TEST_ASSERT(seen[f] > 0);
 
     CrfWindow window = {&c, 0, length};
-    double scale[WEIGHTS], freq[WEIGHTS], gold_features[WEIGHTS] = {0};
-    feature_counts(&window, 1, scale, freq);
+    double scale[WEIGHTS], gold_features[WEIGHTS] = {0};
+    feature_counts(&window, 1, scale);
     bf_score_and_accumulate_features(w, &c, c.label, 1, gold_features);
     for (int f = 0; f < TRANSITION_FEATURES; f++) {
       int idx = OFF_TRANSITION + f;
       TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], scale[idx]);
-      TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], freq[idx]);
       TEST_ASSERT_DOUBLE_WITHIN(0, counts[f], gold_features[idx]);
     }
 
@@ -636,13 +635,12 @@ static void test_crf_phase_independent_transitions(void) {
     Contig c2 = make_test_contig(rev ? reverse2 : seq2, 0, length2, rev ? reverse_gold2 : gold2);
     TEST_ASSERT(gold_path_valid(&c2));
     CrfWindow window2 = {&c2, 0, length2};
-    double scale2[WEIGHTS], freq2[WEIGHTS], gold_features2[WEIGHTS] = {0};
-    feature_counts(&window2, 1, scale2, freq2);
+    double scale2[WEIGHTS], gold_features2[WEIGHTS] = {0};
+    feature_counts(&window2, 1, scale2);
     bf_score_and_accumulate_features(w, &c2, c2.label, 1, gold_features2);
     for (int f = 0; f < TRANSITION_FEATURES; f++) {
       int idx = OFF_TRANSITION + f;
       TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], scale2[idx]);
-      TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], freq2[idx]);
       TEST_ASSERT_DOUBLE_WITHIN(0, counts2[f], gold_features2[idx]);
     }
     Work work2 = {0};
@@ -2342,20 +2340,6 @@ static double reference_gd_optimize(size_t n, double *x, lbfgs_evaluate evaluate
   return f;
 }
 
-/* crf_objective restricted to the active feature set that crf_train optimizes. */
-typedef struct {
-  CrfObjective *objective;
-  const double *freq;
-} MaskedObjective;
-
-static double masked_objective(const double *w, double *gradient, void *context) {
-  MaskedObjective *masked = context;
-  double loss = crf_objective(w, gradient, masked->objective);
-  for (int f = 0; f < WEIGHTS; f++)
-    if (!feature_active(masked->freq[f])) gradient[f] = 0;
-  return loss;
-}
-
 static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void) {
   crf_init();
 
@@ -2408,22 +2392,8 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   double *w_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
   crf_train(&c, 1, w_lbfgs, 60, 1);
 
-  /* Inactive features (unseen on the gold path) stay exactly zero; k3 emissions are learned */
-  double *count = anno_alloc(WEIGHTS, sizeof(double));
-  double *freq = anno_alloc(WEIGHTS, sizeof(double));
-  feature_counts(windows, win_count, count, freq);
-  MaskedObjective masked = {.objective = &obj, .freq = freq};
-  int active_k3 = 0, nonzero_k3 = 0;
-  for (int f = 0; f < WEIGHTS; f++) {
-    if (!feature_active(freq[f])) TEST_ASSERT(w_lbfgs[f] == 0.0);
-    else if (f >= OFF_E3 && f < OFF_SPLICE_START_STOP)
-      active_k3++, nonzero_k3 += w_lbfgs[f] != 0.0;
-  }
-  TEST_ASSERT_INT_EQ(9, active_k3);
-  TEST_ASSERT_INT_EQ(9, nonzero_k3);
-
   double *grad_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
-  double loss_lbfgs = masked_objective(w_lbfgs, grad_lbfgs, &masked);
+  double loss_lbfgs = crf_objective(w_lbfgs, grad_lbfgs, &obj);
   TEST_ASSERT(loss_lbfgs < loss0);
   TEST_ASSERT(lbfgs_norm(WEIGHTS, grad_lbfgs) < 1e-4);
 
@@ -2431,8 +2401,8 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
      final objective value, gradient norm, and predicted posterior path probabilities */
   double *w_ref = anno_alloc(WEIGHTS, sizeof(double));
   double *grad_ref = anno_alloc(WEIGHTS, sizeof(double));
-  double loss_ref = reference_gd_optimize(WEIGHTS, w_ref, masked_objective, &masked, 400);
-  loss_ref = masked_objective(w_ref, grad_ref, &masked);
+  double loss_ref = reference_gd_optimize(WEIGHTS, w_ref, crf_objective, &obj, 400);
+  loss_ref = crf_objective(w_ref, grad_ref, &obj);
 
   TEST_ASSERT_DOUBLE_WITHIN(1e-6, loss_ref, loss_lbfgs);
   TEST_ASSERT(lbfgs_norm(WEIGHTS, grad_ref) < 1e-4);
@@ -2457,8 +2427,6 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   free(grad_lbfgs);
   free(w_ref);
   free(grad_ref);
-  free(count);
-  free(freq);
   free_test_contig(&c);
 }
 
