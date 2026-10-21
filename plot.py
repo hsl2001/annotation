@@ -799,7 +799,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-g", "--gff", type=Path)
     parser.add_argument("-o", "--out", type=Path, default=Path("plots"))
     parser.add_argument("-c", "--cwt", type=Path)
-    parser.add_argument("--anno", type=Path, default=Path("./anno"))
+    parser.add_argument("--anno", type=Path, default=Path("./anno_cwt"))
     parser.add_argument("-p", "--threads", type=pos_int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("-n", "--rows", type=pos_int, default=1500)
     parser.add_argument("-s", "--seed", type=int, default=42)

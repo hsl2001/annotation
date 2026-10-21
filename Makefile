@@ -8,10 +8,13 @@ HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
 
 .PHONY: all clean test
 
-all: $(PROGRAMS)
+all: $(PROGRAMS) anno_cwt
 
 $(PROGRAMS): %: %.c $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+
+anno_cwt: anno.c $(HEADERS)
+	$(CC) $(CFLAGS) -DCWT_BRANCH_MAPPING $(LDFLAGS) -o $@ $< $(LIBS)
 
 $(TEST_PROGRAM): test.c $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)

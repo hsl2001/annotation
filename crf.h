@@ -13,7 +13,7 @@ static const int boundary_kmer_offsets[] = {-4, -3, -2, -1, 0, 1, 2};
 static const int boundary_cwt_offsets[] = {-26, -24, -6, -4, -2, -1, 0, 2, 4};
 enum {
   CRF_WINDOW_SIZE = 65536,
-  GC_RADIUS = 256,
+  GC_RADIUS = 2048,
   DERIV_COUNT = 3, DERIV_RADIUS = 2,
   STATES = 13, EMIT_STATES = 7, HIDDEN_STATES = 137, TRANSITION_FEATURES = 21,
   K2 = 17, K3 = 65, KNUC = 5, EMIT_KMER_LAYERS = 1,
@@ -49,6 +49,7 @@ void crf_save_weights_text(const char *path, const double *weights);
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -926,25 +927,29 @@ static void backward_step(const Work *k, int length, int position, double *B, do
   int fast = isfinite(psi_max);
   for (int t = 0; fast && t < ntrans; t++)
     if (psi[t] - psi_max < -600.0) fast = 0;
-  for (int h = 0; fast && h < HIDDEN_STATES; h++)
-    if (B[h] > 0.0 && L[h] > -INFINITY && (!last || terminal_allowed(h)) &&
-        fabs(psi_max - log_norm - L[h]) > 650.0)
-      fast = 0;
-
   if (fast) {
     double exp_prev[HIDDEN_STATES] = {0}, inv_L[HIDDEN_STATES] = {0}, exp_psi[STATES * STATES];
     for (int t = 0; t < ntrans; t++) exp_psi[t] = exp(psi[t] - psi_max);
     for (int h = 0; h < HIDDEN_STATES; h++) {
-      if (prev_L[h] > -INFINITY) exp_prev[h] = exp(prev_L[h]);
-      if (B[h] > 0.0 && L[h] > -INFINITY && (!last || terminal_allowed(h)))
-        inv_L[h] = exp(psi_max - log_norm - L[h]);
+      if (prev_L[h] >= -600.0) exp_prev[h] = exp(prev_L[h]);
+      if (B[h] > 0.0 && L[h] > -INFINITY && (!last || terminal_allowed(h))) {
+        double shift = psi_max - log_norm - L[h];
+        inv_L[h] = fabs(shift) <= 600.0 ? exp(shift) : -1.0;
+      }
     }
     for (int edge = 0; edge < edge_count; edge++) {
       const HiddenEdge *step = edges + edge;
       int u = step->previous, v = step->current;
-      double inv_v = inv_L[v], ep_u = exp_prev[u];
-      if (inv_v == 0.0 || ep_u == 0.0) continue;
-      double q = ep_u * exp_psi[step->transition] * inv_v;
+      double inv_v = inv_L[v];
+      if (inv_v == 0.0) continue;
+      double ep_u = exp_prev[u];
+      double q;
+      if (inv_v > 0.0 && ep_u > 0.0) {
+        q = ep_u * exp_psi[step->transition] * inv_v;
+      } else {
+        if (!(prev_L[u] > -INFINITY)) continue;
+        q = exp(prev_L[u] + psi[step->transition] - log_norm - L[v]);
+      }
       double edge_prob = B[v] * q;
       B_prev[u] += edge_prob;
       if (edge_marginals) edge_marginals[step->transition] += edge_prob;
@@ -1047,10 +1052,11 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
 
       if (fast) {
         double exp_prev[HIDDEN_STATES] = {0}, exp_psi[STATES * STATES];
-        uint8_t reachable[HIDDEN_STATES] = {0};
+        uint8_t reachable[HIDDEN_STATES] = {0}, slow[HIDDEN_STATES] = {0};
+        int any_slow = 0;
         for (int t = 0; t < ntrans; t++) exp_psi[t] = exp(psi[t] - psi_max);
         for (int h = 0; h < HIDDEN_STATES; h++)
-          if (prev_L[h] > -INFINITY) exp_prev[h] = exp(prev_L[h]);
+          if (prev_L[h] >= -600.0) exp_prev[h] = exp(prev_L[h]);
         for (int edge = 0; edge < edge_count; edge++) {
           const HiddenEdge *step = edges + edge;
           if (!forward_edge_allowed(prev_L, step, last)) continue;
@@ -1063,13 +1069,8 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
           }
         }
         for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-          if (reachable[hidden] && !(incoming_sum[hidden] >= 1e-250)) {
-            fast = 0;
-            break;
-          }
-        if (fast) {
-          for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
-            if (incoming_sum[hidden] > 0.0) {
+          if (reachable[hidden]) {
+            if (incoming_sum[hidden] >= 1e-250) {
               if (use_f1) {
                 int st = hidden_state[hidden];
                 Ap[hidden] = Ap[hidden] / incoming_sum[hidden] +
@@ -1077,14 +1078,42 @@ static double contig_gradient_f1(const double *w, const Contig *c, Work *k,
                 At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
               }
               L[hidden] = psi_max + log(incoming_sum[hidden]);
+            } else {
+              slow[hidden] = 1;
+              any_slow = 1;
+              incoming_sum[hidden] = 0.0;
+              if (use_f1) Ap[hidden] = At[hidden] = 0.0;
             }
-        } else {
-          memset(incoming_sum, 0, sizeof(incoming_sum));
-          if (use_f1)
-            for (int hidden = 0; hidden < HIDDEN_STATES; hidden++) Ap[hidden] = At[hidden] = 0;
+          }
+        if (any_slow) {
+          for (int edge = 0; edge < edge_count; edge++) {
+            const HiddenEdge *step = edges + edge;
+            if (!slow[step->current] || !forward_edge_allowed(prev_L, step, last)) continue;
+            double score = prev_L[step->previous] + psi[step->transition];
+            if (score > L[step->current]) L[step->current] = score;
+          }
+          for (int edge = 0; edge < edge_count; edge++) {
+            const HiddenEdge *step = edges + edge;
+            if (!slow[step->current] || !forward_edge_allowed(prev_L, step, last)) continue;
+            double w_edge = exp(prev_L[step->previous] + psi[step->transition] - L[step->current]);
+            incoming_sum[step->current] += w_edge;
+            if (use_f1) {
+              Ap[step->current] += w_edge * prev_Ap[step->previous];
+              At[step->current] += w_edge * prev_At[step->previous];
+            }
+          }
+          for (int hidden = 0; hidden < HIDDEN_STATES; hidden++)
+            if (slow[hidden] && L[hidden] > -INFINITY) {
+              if (use_f1) {
+                int st = hidden_state[hidden];
+                Ap[hidden] = Ap[hidden] / incoming_sum[hidden] +
+                             f1_pred_weight(st, gold_state, c->length);
+                At[hidden] = At[hidden] / incoming_sum[hidden] + (is_cds(st) && st == gold_state);
+              }
+              L[hidden] += log(incoming_sum[hidden]);
+            }
         }
-      }
-      if (!fast) {
+      } else {
         for (int edge = 0; edge < edge_count; edge++) {
           const HiddenEdge *step = edges + edge;
           if (!forward_edge_allowed(prev_L, step, last)) continue;
@@ -1260,6 +1289,7 @@ static size_t make_windows(Contig *contigs, int count, CrfWindow **windows, size
 typedef struct {
   CrfWindow *windows;
   size_t count, skipped;
+  atomic_size_t next_window;
   int threads;
 } CrfTrain;
 
@@ -1280,8 +1310,9 @@ static void *crf_worker(void *arg) {
   worker->f1_loss = 0;
   worker->positions = 0;
   memset(worker->gradient, 0, WEIGHTS * sizeof(*worker->gradient));
-  for (size_t slot = (size_t)worker->thread_id; slot < train->count;
-       slot += (size_t)train->threads) {
+  for (;;) {
+    size_t slot = atomic_fetch_add_explicit(&train->next_window, 1, memory_order_relaxed);
+    if (slot >= train->count) break;
     const CrfWindow *window = train->windows + slot;
     Contig instance = *window->contig;
     instance.offset = window->start;
@@ -1313,6 +1344,7 @@ static double crf_objective(const double *w, double *gradient, void *context) {
   size_t positions = 0;
 
   memset(gradient, 0, WEIGHTS * sizeof(*gradient));
+  atomic_init(&train->next_window, 0);
   for (int t = 0; t < train->threads; t++) {
     objective->workers[t].w = w;
     if (train->threads > 1 &&
@@ -1407,33 +1439,50 @@ static void feature_counts(const CrfWindow *windows, size_t count, double *scale
     }
   }
   if (has_genome_window && freq) {
-    /* Activate non-N candidate features on genome windows so negative penalties can be learned. */
+    /* Activate non-N candidate features on genome windows and match interaction scales to base counts. */
     for (int s = 0; s < EMIT_STATES; s++) {
       for (int k = 0; k < 64; k++) {
-        feature_observe(NULL, scale, freq, OFF_E3 + s * K3 + k, 1, 1);
-        feature_observe(NULL, scale, freq, OFF_E3_GC + s * K3 + k, 1, 0.05);
+        int idx_e3 = OFF_E3 + s * K3 + k, idx_gc = OFF_E3_GC + s * K3 + k;
+        feature_observe(NULL, scale, freq, idx_e3, 1, 1);
+        feature_observe(NULL, scale, freq, idx_gc, 1, 1);
+        if (scale[idx_gc] < scale[idx_e3]) scale[idx_gc] = scale[idx_e3];
       }
-      feature_observe(NULL, scale, freq, OFF_GC_DIFF + s, 1, 0.1);
-      feature_observe(NULL, scale, freq, OFF_GC_LVL + s, 1, 0.05);
+      feature_observe(NULL, scale, freq, OFF_GC_DIFF + s, 1, 1);
+      feature_observe(NULL, scale, freq, OFF_GC_LVL + s, 1, 1);
     }
+    static const int pwm_min_disp[4] = {-3, -24, -6, -3};
+    static const int pwm_max_disp[4] = { 6,   3,  4,  5};
     for (int kind = 0; kind < 4; kind++) {
       for (int offset = 0; offset < BOUNDARY_KMER_COUNT; offset++)
         for (int k = 0; k < 16; k++) {
           int idx = (kind * BOUNDARY_KMER_COUNT + offset) * K2 + k;
           feature_observe(NULL, scale, freq, OFF_SPLICE_START_STOP + idx, 1, 1);
-          feature_observe(NULL, scale, freq, OFF_BCROSS_D1 + idx, 1, 0.1);
-          feature_observe(NULL, scale, freq, OFF_BCROSS_D2 + idx, 1, 0.1);
+          feature_observe(NULL, scale, freq, OFF_BCROSS_D1 + idx, 1, 1);
+          feature_observe(NULL, scale, freq, OFF_BCROSS_D2 + idx, 1, 1);
+          double base_s = fmax(scale[OFF_SPLICE_START_STOP + idx], 16.0);
+          if (scale[OFF_BCROSS_D1 + idx] < base_s) scale[OFF_BCROSS_D1 + idx] = base_s;
+          if (scale[OFF_BCROSS_D2 + idx] < base_s) scale[OFF_BCROSS_D2 + idx] = base_s;
         }
-      for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++)
-        for (int b = 0; b < 4; b++)
-          feature_observe(NULL, scale, freq, OFF_PWM + (kind * BOUNDARY_PWM_COUNT + offset) * KNUC + b, 1, 1);
+      for (int offset = 0; offset < BOUNDARY_PWM_COUNT; offset++) {
+        int disp = BOUNDARY_PWM_FROM + offset;
+        int active_disp = disp >= pwm_min_disp[kind] && disp <= pwm_max_disp[kind];
+        for (int b = 0; b < 4; b++) {
+          int idx = OFF_PWM + (kind * BOUNDARY_PWM_COUNT + offset) * KNUC + b;
+          if (active_disp) feature_observe(NULL, scale, freq, idx, 1, 1);
+          else freq[idx] = 0;
+        }
+      }
       for (int offset = 0; offset < BOUNDARY_CWT_COUNT; offset++)
-        for (int b = 0; b < 4; b++)
-          feature_observe(NULL, scale, freq, OFF_BPWM_CWT + (kind * BOUNDARY_CWT_COUNT + offset) * KNUC + b, 1, 0.1);
+        for (int b = 0; b < 4; b++) {
+          int idx = OFF_BPWM_CWT + (kind * BOUNDARY_CWT_COUNT + offset) * KNUC + b;
+          feature_observe(NULL, scale, freq, idx, 1, 4);
+        }
     }
     for (int t = 0; t < TRANSITION_FEATURES; t++) {
       feature_observe(NULL, scale, freq, OFF_TRANSITION + t, 1, 1);
-      feature_observe(NULL, scale, freq, OFF_TRANS_GC + t, 1, 0.05);
+      feature_observe(NULL, scale, freq, OFF_TRANS_GC + t, 1, 1);
+      if (scale[OFF_TRANS_GC + t] < scale[OFF_TRANSITION + t])
+        scale[OFF_TRANS_GC + t] = scale[OFF_TRANSITION + t];
     }
   }
 }
