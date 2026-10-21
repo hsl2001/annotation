@@ -215,12 +215,8 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
   for (int t = 0; t < c->length; t++) {
     Site site = site_at(c, t);
     int st = y[t];
-    for (int layer = 0; layer < EMIT_KMER_LAYERS; layer++) {
-      int e_idx = emit_kmer_offsets[layer] + emit_state(st) * emit_kmer_counts[layer] +
-                  (int)site.kmer_emit[layer][st >= 7];
-      total_score += w[e_idx];
-      if (feat_accum) feat_accum[e_idx] += scale;
-    }
+    total_score += emission_score(w, &site, st);
+    if (feat_accum) emission_accumulate(feat_accum, &site, st, scale);
 
     if (t > 0) {
       int edge = path_edge(y, c->length, t);
@@ -228,37 +224,52 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
       int rev = edge_rev[edge];
       int kind = edge_kind[edge];
       int transition = edge_trans[edge];
-      total_score += w[transition];
-      if (feat_accum) feat_accum[transition] += scale;
+      int t_id = transition - OFF_TRANSITION;
+      total_score += w[transition] + w[OFF_TRANS_GC + t_id] * site.gc_dev;
+      if (feat_accum) {
+        feat_accum[transition] += scale;
+        if (site.gc_dev != 0.0f) feat_accum[OFF_TRANS_GC + t_id] += scale * site.gc_dev;
+      }
       if (kind >= 0) {
+        int gpos = c->offset + t;
         for (int off = 0; off < BOUNDARY_KMER_COUNT; off++) {
           int k_idx = boundary_kmer_index(&site, rev, kind, off);
-          total_score += w[k_idx];
-          if (feat_accum) feat_accum[k_idx] += scale;
+          double d1_m = 0, d2_m = 0;
+          boundary_kmer_cwt_at(c, gpos, rev, off, &d1_m, &d2_m);
+          int d1_idx = bcross_d1_index(&site, rev, kind, off);
+          int d2_idx = bcross_d2_index(&site, rev, kind, off);
+          total_score += w[k_idx] + w[d1_idx] * d1_m + w[d2_idx] * d2_m;
+          if (feat_accum) {
+            feat_accum[k_idx] += scale;
+            feat_accum[d1_idx] += scale * d1_m;
+            feat_accum[d2_idx] += scale * d2_m;
+          }
         }
         for (int off = 0; off < BOUNDARY_PWM_COUNT; off++) {
-          int idx = OFF_PWM + (kind * BOUNDARY_PWM_COUNT + off) * KNUC +
-                    site.boundary_nuc[rev][off];
+          int idx = boundary_pwm_index(&site, rev, kind, off);
           total_score += w[idx];
           if (feat_accum) feat_accum[idx] += scale;
         }
-        if (kind == 1) {
-          int gpos = c->offset + t;
-          for (int off = 0; off < BOUNDARY_CWT_COUNT; off++) {
-            float power[WAVE_COUNT];
-            double deriv[DERIV_COUNT][WAVE_COUNT];
-            boundary_cwt_at(c, gpos, rev, off, power, deriv);
-            for (int sc = 0; sc < WAVE_COUNT; sc++) {
-              int bp_idx = OFF_BP + off * WAVE_COUNT + sc;
-              total_score += w[bp_idx] * (double)power[sc];
-              if (feat_accum) feat_accum[bp_idx] += scale * (double)power[sc];
-              for (int slot = 0; slot < DERIV_COUNT; slot++) {
-                int bd_idx = derivative_index(slot, off, sc);
-                total_score += w[bd_idx] * deriv[slot][sc];
-                if (feat_accum) feat_accum[bd_idx] += scale * deriv[slot][sc];
-              }
+        for (int off = 0; off < BOUNDARY_CWT_COUNT; off++) {
+          float power[WAVE_COUNT];
+          double deriv[DERIV_COUNT][WAVE_COUNT];
+          boundary_cwt_at(c, gpos, rev, off, power, deriv);
+          double d2_m = 0;
+          for (int sc = 0; sc < WAVE_COUNT; sc++) {
+            int bp_idx = bp_index(kind, off, sc);
+            total_score += w[bp_idx] * (double)power[sc];
+            if (feat_accum) feat_accum[bp_idx] += scale * (double)power[sc];
+            for (int slot = 0; slot < DERIV_COUNT; slot++) {
+              int bd_idx = derivative_index(kind, slot, off, sc);
+              total_score += w[bd_idx] * deriv[slot][sc];
+              if (feat_accum) feat_accum[bd_idx] += scale * deriv[slot][sc];
             }
+            d2_m += deriv[1][sc];
           }
+          d2_m *= (1.0 / WAVE_COUNT);
+          int bpc_idx = bpwm_cwt_index(&site, rev, kind, off);
+          total_score += w[bpc_idx] * d2_m;
+          if (feat_accum) feat_accum[bpc_idx] += scale * d2_m;
         }
       }
     }
