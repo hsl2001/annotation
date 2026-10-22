@@ -8,20 +8,15 @@
 #if defined(CWT_IMPLEMENTATION) && !defined(ANNO_CWT_IMPLEMENTATION)
 #define ANNO_CWT_IMPLEMENTATION
 
-#include <errno.h>
 #include <complex.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <unistd.h>
 
 _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
                "CWT requires binary32 floats");
@@ -45,7 +40,7 @@ static double complex cwt_morlet_integral(double lower, double upper) {
   upper = fmin(upper, 8.0);
   if (lower >= upper) return 0.0;
   double normalization = 1.0 / sqrt(sqrt(acos(-1.0)) *
-                                   (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
+                                    (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
   int segments = (int)ceil((upper - lower) * 2.0);
   double step = (upper - lower) / segments;
   double complex integral = 0.0;
@@ -101,7 +96,7 @@ static void cwt_window_scale(
   const char *restrict sequence, size_t length, size_t window, int scale, int width,
   size_t max_fft, const double complex *restrict kernel_table,
   const double complex *restrict twiddle_table, double complex *restrict signal_fft,
-  float *restrict complex_values, float *restrict powers
+  float *restrict complex_values
 ) {
   size_t start = window * (size_t)CWT_WINDOW_SIZE;
   size_t window_length = length - start;
@@ -134,14 +129,9 @@ static void cwt_window_scale(
   for (size_t position = start; position < end; position++) {
     size_t index = position - input_start + (size_t)(width - 1 - width / 2);
     double complex coefficient = signal_fft[index] * inv_size;
-    double real = creal(coefficient), imaginary = cimag(coefficient);
     size_t feature = position * CWT_CHANNELS + 2 * (size_t)scale;
-    if (complex_values)
-      complex_values[feature] = (float)real,
-      complex_values[feature + 1] = (float)imaginary;
-    if (powers)
-      powers[position * WAVE_COUNT + (size_t)scale] =
-        (float)(real * real + imaginary * imaginary);
+    complex_values[feature] = (float)creal(coefficient);
+    complex_values[feature + 1] = (float)cimag(coefficient);
   }
 }
 
@@ -153,35 +143,32 @@ typedef struct {
   size_t max_fft;
   const double complex *kernel_table;
   const double complex *twiddle_table;
-  float *complex_values, *powers;
+  float *complex_values;
   atomic_size_t next_window;
 } CwtTask;
 
 static void *cwt_worker(void *arg) {
   CwtTask *task = arg;
   double complex *signal_fft = anno_alloc(task->max_fft, sizeof(*signal_fft));
-  size_t window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
-  while (window < task->window_count) {
-    for (int scale = 0; scale < WAVE_COUNT; scale++) {
+  for (;;) {
+    size_t window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
+    if (window >= task->window_count) break;
+    for (int scale = 0; scale < WAVE_COUNT; scale++)
       cwt_window_scale(task->sequence, task->length, window, scale,
                        task->wavelets->widths[scale], task->max_fft,
                        task->kernel_table, task->twiddle_table, signal_fft,
-                       task->complex_values, task->powers);
-    }
-    window = atomic_fetch_add_explicit(&task->next_window, 1, memory_order_relaxed);
+                       task->complex_values);
   }
   free(signal_fft);
   return NULL;
 }
 
 static void cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
-                          int threads, float *complex_values, float *powers) {
+                          int threads, float *complex_values) {
   if (length <= 0) return;
   if (threads < 1) anno_fail("CWT requires at least one worker thread");
-  if (complex_values && (size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*complex_values)))
+  if ((size_t)length > SIZE_MAX / (CWT_CHANNELS * sizeof(*complex_values)))
     anno_fail("CWT output size overflow");
-  if (powers && (size_t)length > SIZE_MAX / (WAVE_COUNT * sizeof(*powers)))
-    anno_fail("CWT power size overflow");
   size_t sequence_length = (size_t)length;
   size_t window_count = sequence_length / CWT_WINDOW_SIZE +
                         (sequence_length % CWT_WINDOW_SIZE != 0);
@@ -217,7 +204,7 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
   CwtTask task = {.wavelets = wavelets, .sequence = sequence, .length = sequence_length,
                   .window_count = window_count, .max_fft = max_fft,
                   .kernel_table = kernel_table, .twiddle_table = twiddle_table,
-                  .complex_values = complex_values, .powers = powers};
+                  .complex_values = complex_values};
   atomic_init(&task.next_window, 0);
   int worker_count = window_count < (size_t)threads ? (int)window_count : threads;
   pthread_t *workers = worker_count > 1
@@ -233,55 +220,8 @@ static void cwt_transform(const Wavelets *wavelets, const char *sequence, int le
   free(twiddle_table);
 }
 
-static void *cwt_map_file(FILE *stream, size_t bytes, off_t start, void **mapping,
-                          size_t *mapping_size, const char *kind) {
-  if (bytes > (size_t)INT64_MAX || start < 0 ||
-      (uintmax_t)start > (uintmax_t)INT64_MAX - bytes)
-    anno_fail("CWT %s file size overflow", kind);
-  off_t end = start + (off_t)bytes;
-  if ((uintmax_t)end != (uintmax_t)start + bytes)
-    anno_fail("CWT %s file size overflow", kind);
-  long page_size = sysconf(_SC_PAGE_SIZE);
-  if (page_size < 1) anno_fail("Cannot determine memory page size");
-  off_t aligned = start - start % page_size;
-  size_t prefix = (size_t)(start - aligned);
-  if (bytes > SIZE_MAX - prefix) anno_fail("CWT mapping size overflow");
-  size_t length = prefix + bytes;
-  if (ftruncate(fileno(stream), end)) anno_fail("Cannot size %s file: %s", kind, strerror(errno));
-  void *base = mmap(NULL, length, PROT_READ | PROT_WRITE, MAP_SHARED, fileno(stream), aligned);
-  if (base == MAP_FAILED) anno_fail("Cannot map %s file: %s", kind, strerror(errno));
-  *mapping = base;
-  *mapping_size = length;
-  return (unsigned char *)base + prefix;
-}
-
 static inline int gff_cwt_bound_basis(int rev, int kind, int slot) {
   return GFF_REGIONS + ((rev * GFF_BOUND_KINDS + kind) * GFF_CWT_WINDOW + slot);
-}
-
-void gff_cwt_predict(const uint8_t *label, int length, const GffCwtModel *model, float *out_cwt) {
-  if (length <= 0) return;
-  for (int i = 0; i < length; i++) {
-    int r = gff_region(label ? label[i] : 0);
-    float *dst = out_cwt + (size_t)i * CWT_CHANNELS;
-    for (int ch = 0; ch < CWT_CHANNELS; ch++)
-      dst[ch] = model->region[r][ch];
-  }
-  if (!label) return;
-  for (int b = 1; b < length; b++) {
-    int kind = boundary_kind(label[b - 1], label[b]);
-    if (kind < 0) continue;
-    int rev = boundary_rev(label[b - 1], label[b]);
-    for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
-      int delta = slot - GFF_CWT_RADIUS;
-      int i = rev ? b - delta - 1 : b + delta;
-      if (i < 0 || i >= length) continue;
-      float *dst = out_cwt + (size_t)i * CWT_CHANNELS;
-      const float *w = model->bound[rev][kind][slot];
-      for (int ch = 0; ch < CWT_CHANNELS; ch++)
-        dst[ch] += w[ch];
-    }
-  }
 }
 
 void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
@@ -300,13 +240,12 @@ void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
   if (!bound_marg) return;
   for (int b = 1; b < length; b++) {
     const double *bm = bound_marg + (size_t)b * (2 * GFF_BOUND_KINDS);
-    for (int rev = 0; rev < 2; rev++) {
+    for (int rev = 0; rev < 2; rev++)
       for (int kind = 0; kind < GFF_BOUND_KINDS; kind++) {
         double p = bm[rev * GFF_BOUND_KINDS + kind];
         if (p == 0.0) continue;
         for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
-          int delta = slot - GFF_CWT_RADIUS;
-          int i = rev ? b - delta - 1 : b + delta;
+          int i = gff_cwt_bound_pos(b, rev, slot);
           if (i < 0 || i >= length) continue;
           double *dst = out_cwt + (size_t)i * CWT_CHANNELS;
           const float *w = model->bound[rev][kind][slot];
@@ -314,7 +253,6 @@ void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
             dst[ch] += p * (double)w[ch];
         }
       }
-    }
   }
 }
 
@@ -337,12 +275,11 @@ void gff_cwt_residual_adjoint(const double *residual, int length, const GffCwtMo
     memset(grad_bound, 0, (size_t)length * (2 * GFF_BOUND_KINDS) * sizeof(*grad_bound));
     for (int b = 1; b < length; b++) {
       double *gb = grad_bound + (size_t)b * (2 * GFF_BOUND_KINDS);
-      for (int rev = 0; rev < 2; rev++) {
+      for (int rev = 0; rev < 2; rev++)
         for (int kind = 0; kind < GFF_BOUND_KINDS; kind++) {
           double sum = 0.0;
           for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
-            int delta = slot - GFF_CWT_RADIUS;
-            int i = rev ? b - delta - 1 : b + delta;
+            int i = gff_cwt_bound_pos(b, rev, slot);
             if (i < 0 || i >= length) continue;
             const double *res = residual + (size_t)i * CWT_CHANNELS;
             const float *w = model->bound[rev][kind][slot];
@@ -351,60 +288,69 @@ void gff_cwt_residual_adjoint(const double *residual, int length, const GffCwtMo
           }
           gb[rev * GFF_BOUND_KINDS + kind] = sum;
         }
-      }
     }
   }
 }
 
-void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model) {
-  double *gram = anno_alloc((size_t)GFF_CWT_BASIS * GFF_CWT_BASIS, sizeof(*gram));
-  double *rhs = anno_alloc((size_t)GFF_CWT_BASIS * CWT_CHANNELS, sizeof(*rhs));
+void gff_cwt_accumulator_init(GffCwtAccumulator *accumulator) {
+  memset(accumulator, 0, sizeof(*accumulator));
+  accumulator->gram = anno_alloc((size_t)GFF_CWT_BASIS * GFF_CWT_BASIS,
+                                 sizeof(*accumulator->gram));
+  accumulator->rhs = anno_alloc((size_t)GFF_CWT_BASIS * CWT_CHANNELS,
+                                sizeof(*accumulator->rhs));
+}
 
-  for (int c = 0; c < count; c++) {
-    const Contig *contig = contigs + c;
-    int length = contig->length;
-    if (length <= 0 || !contig->label || !contig->cwt) continue;
-    const uint8_t *y = contig->label + contig->offset;
-    const char *seq = contig->seq + contig->offset;
-    const float *cwt = contig->cwt + (size_t)contig->offset * CWT_CHANNELS;
+void gff_cwt_accumulate_range(GffCwtAccumulator *accumulator, const Contig *contig,
+                              int start, int length, const float *cwt) {
+  if (!contig->label || !cwt || start < 0 || length < 0 ||
+      start > contig->length - length)
+    anno_fail("Invalid GFF->CWT training range");
+  const uint8_t *labels = contig->label;
+  const char *sequence = contig->seq + start;
 
-    for (int i = 0; i < length; i++) {
-      if (base_index(seq[i]) < 0) continue;
-      int active[2 * GFF_CWT_WINDOW + 4];
-      int n_active = 0;
-      active[n_active++] = gff_region(y[i]);
+  for (int i = 0; i < length; i++) {
+    if (base_index(sequence[i]) < 0) continue;
+    int pos = start + i;
+    accumulator->valid_bases++;
+    int active[2 * GFF_CWT_WINDOW + 4];
+    int n_active = 0;
+    active[n_active++] = gff_region(labels[pos]);
 
-      int b_lo = i - GFF_CWT_RADIUS - 1;
-      if (b_lo < 1) b_lo = 1;
-      int b_hi = i + GFF_CWT_RADIUS + 1;
-      if (b_hi >= length) b_hi = length - 1;
-      for (int b = b_lo; b <= b_hi; b++) {
-        int kind = boundary_kind(y[b - 1], y[b]);
-        if (kind < 0) continue;
-        int rev = boundary_rev(y[b - 1], y[b]);
-        int delta = rev ? (b - 1 - i) : (i - b);
-        if (delta < -GFF_CWT_RADIUS || delta > GFF_CWT_RADIUS) continue;
-        active[n_active++] = gff_cwt_bound_basis(rev, kind, delta + GFF_CWT_RADIUS);
-      }
+    int b_lo = pos - GFF_CWT_RADIUS - 1;
+    if (b_lo < 1) b_lo = 1;
+    int b_hi = pos + GFF_CWT_RADIUS + 1;
+    if (b_hi >= contig->length) b_hi = contig->length - 1;
+    for (int b = b_lo; b <= b_hi; b++) {
+      int kind = boundary_kind(labels[b - 1], labels[b]);
+      if (kind < 0) continue;
+      int rev = boundary_rev(labels[b - 1], labels[b]);
+      int delta = rev ? (b - 1 - pos) : (pos - b);
+      if (delta < -GFF_CWT_RADIUS || delta > GFF_CWT_RADIUS) continue;
+      active[n_active++] = gff_cwt_bound_basis(rev, kind, delta + GFF_CWT_RADIUS);
+    }
 
-      const float *obs = cwt + (size_t)i * CWT_CHANNELS;
-      for (int a = 0; a < n_active; a++) {
-        int ma = active[a];
-        double *r_row = rhs + (size_t)ma * CWT_CHANNELS;
-        for (int ch = 0; ch < CWT_CHANNELS; ch++)
-          r_row[ch] += (double)obs[ch];
-        double *g_row = gram + (size_t)ma * GFF_CWT_BASIS;
-        for (int d = 0; d < n_active; d++)
-          g_row[active[d]] += 1.0;
-      }
+    const float *obs = cwt + (size_t)i * CWT_CHANNELS;
+    for (int a = 0; a < n_active; a++) {
+      int ma = active[a];
+      double *r_row = accumulator->rhs + (size_t)ma * CWT_CHANNELS;
+      for (int ch = 0; ch < CWT_CHANNELS; ch++)
+        r_row[ch] += (double)obs[ch];
+      double *g_row = accumulator->gram + (size_t)ma * GFF_CWT_BASIS;
+      for (int d = 0; d < n_active; d++)
+        g_row[active[d]] += 1.0;
     }
   }
+}
 
+void gff_cwt_accumulator_finish(GffCwtAccumulator *accumulator, GffCwtModel *model) {
+  if (!accumulator->gram || !accumulator->rhs || !accumulator->valid_bases)
+    anno_fail("GFF->CWT training requires at least one valid labeled base");
+  double *gram = accumulator->gram;
+  double *rhs = accumulator->rhs;
   for (int m = 0; m < GFF_CWT_BASIS; m++)
     gram[(size_t)m * GFF_CWT_BASIS + m] += GFF_CWT_RIDGE;
 
-  /* Cholesky factorization: gram = L * L^T */
-  for (int i = 0; i < GFF_CWT_BASIS; i++) {
+  for (int i = 0; i < GFF_CWT_BASIS; i++)
     for (int j = 0; j <= i; j++) {
       double sum = gram[(size_t)i * GFF_CWT_BASIS + j];
       for (int k = 0; k < j; k++)
@@ -417,9 +363,7 @@ void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model) {
         gram[(size_t)i * GFF_CWT_BASIS + j] = sum / gram[(size_t)j * GFF_CWT_BASIS + j];
       }
     }
-  }
 
-  /* Forward substitution: L * Z = rhs */
   for (int i = 0; i < GFF_CWT_BASIS; i++) {
     double inv_diag = 1.0 / gram[(size_t)i * GFF_CWT_BASIS + i];
     for (int ch = 0; ch < CWT_CHANNELS; ch++) {
@@ -430,7 +374,6 @@ void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model) {
     }
   }
 
-  /* Backward substitution: L^T * Phi = Z */
   for (int i = GFF_CWT_BASIS - 1; i >= 0; i--) {
     double inv_diag = 1.0 / gram[(size_t)i * GFF_CWT_BASIS + i];
     for (int ch = 0; ch < CWT_CHANNELS; ch++) {
@@ -441,48 +384,13 @@ void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model) {
     }
   }
 
-  memset(model, 0, sizeof(*model));
-  for (int r = 0; r < GFF_REGIONS; r++)
-    for (int ch = 0; ch < CWT_CHANNELS; ch++)
-      model->region[r][ch] = (float)rhs[(size_t)r * CWT_CHANNELS + ch];
-  for (int rev = 0; rev < 2; rev++)
-    for (int kind = 0; kind < GFF_BOUND_KINDS; kind++)
-      for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
-        int m = gff_cwt_bound_basis(rev, kind, slot);
-        for (int ch = 0; ch < CWT_CHANNELS; ch++)
-          model->bound[rev][kind][slot][ch] = (float)rhs[(size_t)m * CWT_CHANNELS + ch];
-      }
+  float *weights = (float *)model;
+  for (int i = 0; i < GFF_CWT_BASIS * CWT_CHANNELS; i++)
+    weights[i] = (float)rhs[i];
 
   free(gram);
   free(rhs);
-}
-
-double gff_cwt_eval_residual(const Contig *contigs, int count, const GffCwtModel *model,
-                             double *out_raw_energy) {
-  double res_energy = 0.0, raw_energy = 0.0;
-  for (int c = 0; c < count; c++) {
-    const Contig *contig = contigs + c;
-    int length = contig->length;
-    if (length <= 0 || !contig->cwt) continue;
-    float *pred = anno_alloc((size_t)length * CWT_CHANNELS, sizeof(*pred));
-    const uint8_t *y = contig->label ? contig->label + contig->offset : NULL;
-    gff_cwt_predict(y, length, model, pred);
-    const char *seq = contig->seq + contig->offset;
-    const float *obs = contig->cwt + (size_t)contig->offset * CWT_CHANNELS;
-    for (int i = 0; i < length; i++) {
-      if (base_index(seq[i]) < 0) continue;
-      for (int ch = 0; ch < CWT_CHANNELS; ch++) {
-        double o = (double)obs[(size_t)i * CWT_CHANNELS + ch];
-        double p = (double)pred[(size_t)i * CWT_CHANNELS + ch];
-        double d = p - o;
-        raw_energy += 0.5 * o * o;
-        res_energy += 0.5 * d * d;
-      }
-    }
-    free(pred);
-  }
-  if (out_raw_energy) *out_raw_energy = raw_energy;
-  return res_energy;
+  memset(accumulator, 0, sizeof(*accumulator));
 }
 
 #endif

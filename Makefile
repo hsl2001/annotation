@@ -4,7 +4,7 @@ LIBS = -lz -lm
 
 PROGRAMS = anno
 TEST_PROGRAM = test-runner
-HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
+HEADERS = anno.h crf.h cwt.h gff_cwt_model.h kseq.h ketopt.h lbfgs.h rfft.h
 
 .PHONY: all clean test
 

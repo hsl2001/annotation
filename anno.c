@@ -3,6 +3,7 @@
 #endif
 #define _POSIX_C_SOURCE 200809L
 #include "anno.h"
+#include "gff_cwt_model.h"
 #include "kseq.h"
 #include "ketopt.h"
 #include <errno.h>
@@ -13,9 +14,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <zlib.h>
 
 #define RFFT_IMPLEMENTATION
@@ -28,6 +26,9 @@ const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #include "cwt.h"
 #define CRF_IMPLEMENTATION
 #include "crf.h"
+
+_Static_assert(sizeof(GffCwtModel) == GFF_CWT_BASIS * CWT_CHANNELS * sizeof(float),
+               "GffCwtModel must be a packed float array");
 
 KSEQ_INIT(gzFile, gzread)
 
@@ -65,30 +66,6 @@ static void *anno_resize(void *memory, size_t count, size_t size) {
   return resized;
 }
 
-typedef struct { float *data; size_t size; } CwtStore;
-
-static CwtStore cwt_store(Contig *contigs, int count) {
-  size_t bases = 0;
-  for (int i = 0; i < count; i++) {
-    if ((size_t)contigs[i].genome_length > SIZE_MAX - bases) anno_fail("CWT size overflow");
-    bases += (size_t)contigs[i].genome_length;
-  }
-  if (bases > SIZE_MAX / (CWT_CHANNELS * sizeof(float))) anno_fail("CWT size overflow");
-  size_t bytes = bases * CWT_CHANNELS * sizeof(float);
-  FILE *backing = tmpfile();
-  if (!backing) anno_fail("Cannot create CWT scratch file: %s", strerror(errno));
-  void *mapping;
-  size_t mapping_size;
-  float *data = cwt_map_file(backing, bytes, 0, &mapping, &mapping_size, "CWT scratch");
-  if (fclose(backing)) anno_fail("Cannot close CWT scratch file: %s", strerror(errno));
-  size_t offset = 0;
-  for (int i = 0; i < count; i++) {
-    contigs[i].cwt = data + offset * CWT_CHANNELS;
-    offset += (size_t)contigs[i].genome_length;
-  }
-  return (CwtStore){data, mapping_size};
-}
-
 Contig *read_fasta(const char *path, int *count) {
   gzFile input = gzopen(!strcmp(path, "-") ? "/dev/stdin" : path, "rb");
   if (!input) anno_fail("Cannot open FASTA: %s", path);
@@ -100,20 +77,11 @@ Contig *read_fasta(const char *path, int *count) {
     if (record->seq.l > (size_t)INT_MAX) anno_fail("Contig too long: %s", record->name.s);
     contigs = anno_resize(contigs, (size_t)*count + 1, sizeof(*contigs));
     Contig *c = contigs + (*count)++;
-    memset(c, 0, sizeof(*c));
-    c->name = anno_strdup(record->name.s);
-    c->seq = anno_strdup(record->seq.s);
-    c->length = (int)record->seq.l;
-    c->genome_length = c->length;
-    if (record->comment.l) {
-      const char *crop = strstr(record->comment.s, "crop=");
-      int offset = 0, length = 0;
-      if (crop && sscanf(crop + 5, "%d:%d", &offset, &length) == 2 &&
-          offset >= 0 && length > 0 && offset <= c->genome_length - length) {
-        c->offset = offset;
-        c->length = length;
-      }
-    }
+    *c = (Contig){
+      .name = anno_strdup(record->name.s),
+      .seq = anno_strdup(record->seq.s),
+      .length = (int)record->seq.l
+    };
   }
   kseq_destroy(record);
   if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
@@ -124,6 +92,7 @@ static void free_contigs(Contig *contigs, int count) {
   for (int contig = 0; contig < count; contig++) {
     free(contigs[contig].name);
     free(contigs[contig].seq);
+    free(contigs[contig].cwt);
     free(contigs[contig].label);
   }
   free(contigs);
@@ -138,7 +107,9 @@ static int by_parent(const void *x, const void *y) {
   return order ? order : a->start - b->start;
 }
 
-static int by_total(const void *x, const void *y) { return ((const Group *)y)->total - ((const Group *)x)->total; }
+static int by_total(const void *x, const void *y) {
+  return ((const Group *)y)->total - ((const Group *)x)->total;
+}
 
 static int valid_cds(const char *seq, const Cds *s, int m, int total, int minus) {
   if (total < MIN_CDS || total % 3) return 0;
@@ -182,7 +153,7 @@ int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
     int contig = 0;
     while (contig < count && strcmp(contigs[contig].name, field[0])) contig++;
     int start = atoi(field[3]), end = atoi(field[4]);
-    if (contig == count || start < 1 || end < start || end > contigs[contig].genome_length) continue;
+    if (contig == count || start < 1 || end < start || end > contigs[contig].length) continue;
     cds = anno_resize(cds, (size_t)n + 1, sizeof(*cds));
     cds[n].parent = anno_strdup(parent);
     cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
@@ -234,66 +205,115 @@ void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
     if (coding < MIN_CDS) continue;
     unsigned long g = ++*genes;
     char strand = minus ? '-' : '+';
-    int off = c->offset;
-    printf("%s\tanno\tgene\t%d\t%d\t.\t%c\t.\tID=gene%lu\n", c->name, off + start + 1, off + i, strand, g);
-    printf("%s\tanno\tmRNA\t%d\t%d\t.\t%c\t.\tID=mRNA%lu;Parent=gene%lu\n", c->name, off + start + 1, off + i, strand, g, g);
+    printf("%s\tanno\tgene\t%d\t%d\t.\t%c\t.\tID=gene%lu\n", c->name, start + 1, i, strand, g);
+    printf("%s\tanno\tmRNA\t%d\t%d\t.\t%c\t.\tID=mRNA%lu;Parent=gene%lu\n", c->name, start + 1, i, strand, g, g);
     for (int j = start; j < i;) {
       if (!is_cds(path[j])) { j++; continue; }
       int k = j;
       while (k < i && is_cds(path[k])) k++;
       int phase = (3 - (minus ? path[k - 1] - 7 : path[j] - 1)) % 3;
-      printf("%s\tanno\texon\t%d\t%d\t.\t%c\t.\tParent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, g);
-      printf("%s\tanno\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%lu;Parent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, phase, g, g);
+      printf("%s\tanno\texon\t%d\t%d\t.\t%c\t.\tParent=mRNA%lu\n", c->name, j + 1, k, strand, g);
+      printf("%s\tanno\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%lu;Parent=mRNA%lu\n", c->name, j + 1, k, strand, phase, g, g);
       j = k;
     }
   }
 }
 
-typedef struct {
-  uint32_t index;
-  float weight;
-} ModelEntry;
-
-static void save_model(const char *path, const GffCwtModel *gff_cwt, const double *w) {
-  ModelEntry *entries = anno_alloc(WEIGHTS, sizeof(*entries));
-  uint32_t header[3] = {WEIGHTS, GFF_CWT_BASIS * CWT_CHANNELS, 0};
-  for (int i = 0; i < WEIGHTS; i++)
-    if ((float)w[i]) entries[header[2]++] = (ModelEntry){(uint32_t)i, (float)w[i]};
+static void save_model(const char *path, const double *w) {
+  uint32_t count = WEIGHTS;
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite(header, sizeof(*header), 3, file) != 3 ||
-      fwrite(gff_cwt, sizeof(*gff_cwt), 1, file) != 1 ||
-      fwrite(entries, sizeof(*entries), header[2], file) != header[2] || fclose(file))
+  if (!file || fwrite(&count, sizeof(count), 1, file) != 1 ||
+      fwrite(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fclose(file))
     anno_fail("Cannot write model: %s", path);
-  free(entries);
-  crf_save_weights_text("anno.weights.txt", w);
 }
 
-static void load_model(const char *path, GffCwtModel *gff_cwt, double *w) {
-  uint32_t header[3];
+static void load_model(const char *path, double *w) {
+  uint32_t count = 0;
   FILE *file = fopen(path, "rb");
-  if (!file || fread(header, sizeof(*header), 3, file) != 3 ||
-      header[0] != WEIGHTS || header[1] != GFF_CWT_BASIS * CWT_CHANNELS ||
-      header[2] > WEIGHTS || fread(gff_cwt, sizeof(*gff_cwt), 1, file) != 1)
-    anno_fail("Cannot read model: %s (expected %d-weight feature layout)", path, WEIGHTS);
-  const float *gc_floats = (const float *)gff_cwt;
-  for (size_t i = 0; i < sizeof(*gff_cwt) / sizeof(float); i++)
-    if (!isfinite(gc_floats[i])) anno_fail("Non-finite GFF->CWT weight: %s", path);
-  ModelEntry *entries = anno_alloc(header[2], sizeof(*entries));
-  if (fread(entries, sizeof(*entries), header[2], file) != header[2] || fgetc(file) != EOF)
-    anno_fail("Truncated or oversized model: %s", path);
-  fclose(file);
-  memset(w, 0, WEIGHTS * sizeof(*w));
-  for (uint32_t i = 0; i < header[2]; i++) {
-    if (entries[i].index >= WEIGHTS) anno_fail("Model weight index out of range: %s", path);
-    if (!isfinite(entries[i].weight)) anno_fail("Non-finite model weight: %s", path);
-    w[entries[i].index] = entries[i].weight;
+  if (!file || fread(&count, sizeof(count), 1, file) != 1 || count != WEIGHTS ||
+      fread(w, sizeof(*w), WEIGHTS, file) != WEIGHTS || fgetc(file) != EOF || fclose(file))
+    anno_fail("Cannot read model: %s (expected %d weights)", path, WEIGHTS);
+  for (int i = 0; i < WEIGHTS; i++)
+    if (!isfinite(w[i])) anno_fail("Non-finite model weight: %s", path);
+}
+
+static void write_gff_cwt_header(const char *path, const GffCwtModel *model) {
+  const float *values = (const float *)model;
+  FILE *file = fopen(path, "w");
+  if (!file) anno_fail("Cannot write embedded GFF->CWT header: %s", path);
+  fprintf(file, "#ifndef GFF_CWT_MODEL_H\n#define GFF_CWT_MODEL_H\n\n");
+  fprintf(file, "static const float embedded_gff_cwt_values[%d] = {\n",
+          GFF_CWT_BASIS * CWT_CHANNELS);
+  for (int i = 0; i < GFF_CWT_BASIS * CWT_CHANNELS; i++) {
+    if (!isfinite(values[i])) {
+      fclose(file);
+      anno_fail("Non-finite GFF->CWT coefficient at index %d", i);
+    }
+    fprintf(file, "  %#.9gf,%s", values[i], i % 6 == 5 ? "\n" : " ");
   }
-  free(entries);
+  fprintf(file, "\n};\n\n#endif\n");
+  if (fclose(file)) anno_fail("Cannot finish embedded GFF->CWT header: %s", path);
+}
+
+static int pretrain_cwt(int argc, char **argv) {
+  if (argc < 5 || (argc - 3) % 2) {
+    fprintf(stderr, "Usage: %s pretrain-cwt <output-header.h> <fasta> <gff3> [<fasta> <gff3> ...]\n",
+            argv[0]);
+    return 1;
+  }
+  Wavelets wavelets;
+  wavelets_init(&wavelets);
+  GffCwtAccumulator accumulator;
+  gff_cwt_accumulator_init(&accumulator);
+  for (int arg = 3; arg < argc; arg += 2) {
+    int count;
+    Contig *contigs = read_fasta(argv[arg], &count);
+    for (int c = 0; c < count; c++)
+      contigs[c].label = anno_alloc((size_t)contigs[c].length, sizeof(*contigs[c].label));
+    int skipped = 0;
+    int used = label_cds(contigs, count, argv[arg + 1], &skipped);
+    if (!used) anno_fail("No valid CDS annotations found in %s", argv[arg + 1]);
+    enum { PRETRAIN_CHUNK_SIZE = 1 << 20 };
+    int halo = wavelets.max_width / 2;
+    for (int c = 0; c < count; c++) {
+      const Contig *contig = contigs + c;
+      for (int start = 0; start < contig->length;) {
+        int chunk_length = contig->length - start > PRETRAIN_CHUNK_SIZE
+          ? PRETRAIN_CHUNK_SIZE : contig->length - start;
+        int source_start = start > halo ? start - halo : 0;
+        int core_end = start + chunk_length;
+        int source_end = contig->length - core_end > halo ? core_end + halo : contig->length;
+        int source_length = source_end - source_start;
+        float *chunk_cwt = anno_alloc((size_t)source_length * CWT_CHANNELS, sizeof(*chunk_cwt));
+        cwt_transform(&wavelets, contig->seq + source_start, source_length, 1, chunk_cwt);
+        gff_cwt_accumulate_range(
+          &accumulator, contig, start, chunk_length,
+          chunk_cwt + (size_t)(start - source_start) * CWT_CHANNELS);
+        free(chunk_cwt);
+        start = core_end;
+      }
+    }
+    fprintf(stderr, "Accumulated %s / %s: %d contigs, %d transcripts, %d skipped\n",
+            argv[arg], argv[arg + 1], count, used, skipped);
+    free_contigs(contigs, count);
+  }
+  GffCwtModel model;
+  uint64_t valid_bases = accumulator.valid_bases;
+  gff_cwt_accumulator_finish(&accumulator, &model);
+  write_gff_cwt_header(argv[2], &model);
+  fprintf(stderr, "Embedded GFF->CWT model trained from %llu valid bases: %s\n",
+          (unsigned long long)valid_bases, argv[2]);
+  wavelets_free(&wavelets);
+  return 0;
 }
 
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n",
-          program);
+  fprintf(stderr,
+          "Usage:\n"
+          "  %s pretrain-cwt <output-header.h> <fasta> <gff3> [<fasta> <gff3> ...]\n"
+          "  %s [-m model] [-i initial_model] [-e iterations] [-p threads] -t <genome.fa[.gz]> > genes.gff3\n"
+          "  %s [-m model] <genome.fa[.gz]> > genes.gff3\n",
+          program, program, program);
   return status;
 }
 
@@ -307,70 +327,67 @@ static int parse_threads(const char *value) {
 }
 
 int main(int argc, char **argv) {
+  if (argc > 1 && !strcmp(argv[1], "pretrain-cwt"))
+    return pretrain_cwt(argc, argv);
   const char *model = "anno.model";
   const char *initial_model = NULL;
-  int iterations = DEFAULT_ITERATIONS, threads = 1, option;
+  int iterations = DEFAULT_ITERATIONS, threads = 1, train = 0, option;
   ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
+  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:th", NULL)) >= 0) {
     if (option == 'h') return usage(argv[0], 0);
     if (option == 'p') threads = parse_threads(options.arg);
     else if (option == 'm') model = options.arg;
     else if (option == 'i') initial_model = options.arg;
     else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
+    else if (option == 't') train = 1;
     else return usage(argv[0], 1);
   }
   int rest = argc - options.ind;
   char **args = argv + options.ind;
-  if (rest < 1 || rest > 2)
+  if (rest != 1)
     return usage(argv[0], 1);
-  if (initial_model && rest != 2)
+  if (initial_model && !train)
     anno_fail("Initial model is only supported for training");
-  Wavelets wavelets;
-  wavelets_init(&wavelets);
+
   crf_init();
-  GffCwtModel gff_cwt = {0};
   double *weights = anno_alloc(WEIGHTS, sizeof(*weights));
-  if (rest == 1) {
-    load_model(model, &gff_cwt, weights);
-    crf_set_gff_cwt(&gff_cwt);
-  }
-  if (initial_model) {
-    load_model(initial_model, &gff_cwt, weights);
-    crf_set_gff_cwt(&gff_cwt);
+  if (train && initial_model) {
+    load_model(initial_model, weights);
     fprintf(stderr, "Warm start from %s\n", initial_model);
+  } else if (!train) {
+    load_model(model, weights);
   }
+
   int count;
   Contig *contigs = read_fasta(args[0], &count);
-  CwtStore cwt = cwt_store(contigs, count);
-  for (int c = 0; c < count; c++)
-    cwt_transform(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, contigs[c].cwt, NULL);
-  if (rest == 2) {
-    for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].genome_length, 1);
-    int skipped, used = label_cds(contigs, count, args[1], &skipped);
-    fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    gff_cwt_train(contigs, count, &gff_cwt);
-    crf_set_gff_cwt(&gff_cwt);
-    double raw_energy = 0.0;
-    double res_energy = gff_cwt_eval_residual(contigs, count, &gff_cwt, &raw_energy);
-    fprintf(stderr, "GFF->CWT model trained: raw energy %.6g, residual energy %.6g\n",
-            raw_energy, res_energy);
+  if (train) {
+    Wavelets wavelets;
+    wavelets_init(&wavelets);
+    GffCwtModel embedded_gff_cwt;
+    memcpy(&embedded_gff_cwt, embedded_gff_cwt_values, sizeof(embedded_gff_cwt));
+    crf_set_gff_cwt(&embedded_gff_cwt);
+    for (int c = 0; c < count; c++) {
+      contigs[c].cwt = anno_alloc((size_t)contigs[c].length * CWT_CHANNELS, sizeof(float));
+      cwt_transform(&wavelets, contigs[c].seq, contigs[c].length, threads, contigs[c].cwt);
+    }
+    fprintf(stderr, "Self-training on %d FASTA contigs without GFF labels\n", count);
     crf_train(contigs, count, weights, iterations, threads);
-    save_model(model, &gff_cwt, weights);
+    save_model(model, weights);
+    wavelets_free(&wavelets);
   }
+
   puts("##gff-version 3");
   unsigned long genes = 0;
   for (int c = 0; c < count; c++) {
-    uint8_t *path = anno_alloc(contigs[c].length, 1);
-    crf_decode_threads(weights, contigs + c, path, threads);
+    uint8_t *path = anno_alloc((size_t)contigs[c].length, 1);
+    crf_decode(weights, contigs + c, path);
     write_gff(contigs + c, path, &genes);
     free(path);
     fprintf(stderr, "Annotated %s: %d bp\n", contigs[c].name, contigs[c].length);
   }
   if (fflush(stdout) || ferror(stdout)) anno_fail("Cannot write GFF");
   fprintf(stderr, "Predicted %lu genes\n", genes);
-  wavelets_free(&wavelets);
   free_contigs(contigs, count);
-  if (munmap(cwt.data, cwt.size)) anno_fail("Cannot release CWT scratch mapping: %s", strerror(errno));
   free(weights);
   return 0;
 }

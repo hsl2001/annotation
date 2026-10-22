@@ -22,20 +22,26 @@
 #define DEFAULT_ITERATIONS 300
 
 typedef struct {
-   double _Complex *kernel[WAVE_COUNT];
-   int widths[WAVE_COUNT], max_width;
+  double _Complex *kernel[WAVE_COUNT];
+  int widths[WAVE_COUNT], max_width;
 } Wavelets;
 
 typedef struct {
-   float region[GFF_REGIONS][CWT_CHANNELS];
-   float bound[2][GFF_BOUND_KINDS][GFF_CWT_WINDOW][CWT_CHANNELS];
+  float region[GFF_REGIONS][CWT_CHANNELS];
+  float bound[2][GFF_BOUND_KINDS][GFF_CWT_WINDOW][CWT_CHANNELS];
 } GffCwtModel;
 
 typedef struct {
-   char *name, *seq;
-   int length, genome_length, offset;
-   float *cwt;
-   uint8_t *label;
+  double *gram;
+  double *rhs;
+  uint64_t valid_bases;
+} GffCwtAccumulator;
+
+typedef struct {
+  char *name, *seq;
+  int length;
+  float *cwt;
+  uint8_t *label;
 } Contig;
 
 extern const int wave_sizes[WAVE_COUNT];
@@ -62,11 +68,7 @@ static inline int is_intron(int state) {
 
 /* Frame-agnostic region class from GFF state (no 3-bp periodicity assumption). */
 static inline int gff_region(int state) {
-  if (state <= 0) return 0;
-  if (state <= 3) return 1;
-  if (state <= 6) return 2;
-  if (state <= 9) return 3;
-  return 4;
+  return state <= 0 ? 0 : (state - 1) / 3 + 1;
 }
 
 static inline int boundary_kind(int previous, int current) {
@@ -83,17 +85,22 @@ static inline int boundary_rev(int previous, int current) {
   return previous >= 7 || current >= 7;
 }
 
+static inline int gff_cwt_bound_pos(int boundary_pos, int rev, int slot) {
+  int delta = slot - GFF_CWT_RADIUS;
+  return rev ? boundary_pos - delta - 1 : boundary_pos + delta;
+}
+
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
 
-void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model);
-void gff_cwt_predict(const uint8_t *label, int length, const GffCwtModel *model, float *out_cwt);
+void gff_cwt_accumulator_init(GffCwtAccumulator *accumulator);
+void gff_cwt_accumulate_range(GffCwtAccumulator *accumulator, const Contig *contig,
+                              int start, int length, const float *cwt);
+void gff_cwt_accumulator_finish(GffCwtAccumulator *accumulator, GffCwtModel *model);
 void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
                           int length, const GffCwtModel *model, double *out_cwt);
 void gff_cwt_residual_adjoint(const double *residual, int length, const GffCwtModel *model,
                               double *grad_region, double *grad_bound);
-double gff_cwt_eval_residual(const Contig *contigs, int count, const GffCwtModel *model,
-                             double *out_raw_energy);
 
 #endif
