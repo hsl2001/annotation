@@ -18,8 +18,6 @@
 
 #define RFFT_IMPLEMENTATION
 #include "rfft.h"
-#define LBFGS_IMPLEMENTATION
-#include "lbfgs.h"
 
 const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #define CWT_IMPLEMENTATION

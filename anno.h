@@ -11,15 +11,14 @@
 #define CWT_WINDOW_SIZE 1024
 #define CWT_CHANNELS (2 * WAVE_COUNT)
 
-#define GFF_REGIONS 5
 #define GFF_BOUND_KINDS 4
 #define GFF_CWT_RADIUS 26
 #define GFF_CWT_WINDOW (2 * GFF_CWT_RADIUS + 1)
-#define GFF_CWT_BASIS (GFF_REGIONS + 2 * GFF_BOUND_KINDS * GFF_CWT_WINDOW)
+#define GFF_CWT_BASIS (GFF_BOUND_KINDS * GFF_CWT_WINDOW)
 #define GFF_CWT_RIDGE 1.0
 
 #define MIN_CDS 6
-#define DEFAULT_ITERATIONS 300
+#define DEFAULT_ITERATIONS 10
 
 typedef struct {
   double _Complex *kernel[WAVE_COUNT];
@@ -27,12 +26,11 @@ typedef struct {
 } Wavelets;
 
 typedef struct {
-  float region[GFF_REGIONS][CWT_CHANNELS];
-  float bound[2][GFF_BOUND_KINDS][GFF_CWT_WINDOW][CWT_CHANNELS];
+  float bound[GFF_BOUND_KINDS][GFF_CWT_WINDOW][CWT_CHANNELS];
 } GffCwtModel;
 
 typedef struct {
-  double *gram;
+  double *gram[2];
   double *rhs;
   uint64_t valid_bases;
 } GffCwtAccumulator;
@@ -66,9 +64,9 @@ static inline int is_intron(int state) {
   return (state >= 4 && state <= 6) || (state >= 10 && state <= 12);
 }
 
-/* Frame-agnostic region class from GFF state (no 3-bp periodicity assumption). */
-static inline int gff_region(int state) {
-  return state <= 0 ? 0 : (state - 1) / 3 + 1;
+/* Frame-agnostic region class: 0=intergenic, 1=CDS, 2=intron (no codon periodicity). */
+static inline int emit_region(int state) {
+  return state <= 0 ? 0 : is_cds(state) ? 1 : 2;
 }
 
 static inline int boundary_kind(int previous, int current) {
@@ -90,6 +88,20 @@ static inline int gff_cwt_bound_pos(int boundary_pos, int rev, int slot) {
   return rev ? boundary_pos - delta - 1 : boundary_pos + delta;
 }
 
+static inline double cwt_strand_sign(int rev, int ch) {
+  return (rev && (ch & 1)) ? -1.0 : 1.0;
+}
+
+static inline double gff_cwt_bound_energy(const GffCwtModel *model, int kind) {
+  double sum = 0.0;
+  for (int slot = 0; slot < GFF_CWT_WINDOW; slot++)
+    for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+      double v = (double)model->bound[kind][slot][ch];
+      sum += v * v;
+    }
+  return sum;
+}
+
 Contig *read_fasta(const char *path, int *count);
 int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
 void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
@@ -98,9 +110,9 @@ void gff_cwt_accumulator_init(GffCwtAccumulator *accumulator);
 void gff_cwt_accumulate_range(GffCwtAccumulator *accumulator, const Contig *contig,
                               int start, int length, const float *cwt);
 void gff_cwt_accumulator_finish(GffCwtAccumulator *accumulator, GffCwtModel *model);
-void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
-                          int length, const GffCwtModel *model, double *out_cwt);
-void gff_cwt_residual_adjoint(const double *residual, int length, const GffCwtModel *model,
-                              double *grad_region, double *grad_bound);
+void gff_cwt_predict_soft(const double *bound_marg, int length,
+                          const GffCwtModel *model, double *out_cwt);
+void gff_cwt_residual_adjoint(const double *residual, int length,
+                              const GffCwtModel *model, double *grad_bound);
 
 #endif

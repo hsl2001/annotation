@@ -51,8 +51,6 @@ void *anno_alloc(size_t count, size_t size) {
 
 #define RFFT_IMPLEMENTATION
 #include "rfft.h"
-#define LBFGS_IMPLEMENTATION
-#include "lbfgs.h"
 
 const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #define CWT_IMPLEMENTATION
@@ -147,14 +145,10 @@ static double rng_uniform(double low, double high) {
 
 static void init_test_gff_cwt_model(GffCwtModel *m) {
   rng_seed(987654321ULL);
-  for (int r = 0; r < GFF_REGIONS; r++)
-    for (int ch = 0; ch < CWT_CHANNELS; ch++)
-      m->region[r][ch] = (float)rng_uniform(-0.8, 0.8);
-  for (int rev = 0; rev < 2; rev++)
-    for (int k = 0; k < GFF_BOUND_KINDS; k++)
-      for (int s = 0; s < GFF_CWT_WINDOW; s++)
-        for (int ch = 0; ch < CWT_CHANNELS; ch++)
-          m->bound[rev][k][s][ch] = (float)rng_uniform(-0.5, 0.5);
+  for (int k = 0; k < GFF_BOUND_KINDS; k++)
+    for (int s = 0; s < GFF_CWT_WINDOW; s++)
+      for (int ch = 0; ch < CWT_CHANNELS; ch++)
+        m->bound[k][s][ch] = (float)rng_uniform(-0.5, 0.5);
 }
 
 static Contig make_test_contig(const char *seq, const uint8_t *labels) {
@@ -256,23 +250,19 @@ static void test_cwt_transform_and_chunking(void) {
   wavelets_free(&wavelets);
 }
 
-/* 2. GFF -> CWT Model, Adjoint, and Accumulator Tests */
+/* 2. GFF -> CWT Model, Adjoint, Conjugate Symmetry, and Accumulator Tests */
 
 static double eval_hard_residual(const Contig *c, const GffCwtModel *model) {
-  double *reg_m = anno_alloc((size_t)c->length * GFF_REGIONS, sizeof(double));
   double *bnd_m = anno_alloc((size_t)c->length * (2 * GFF_BOUND_KINDS), sizeof(double));
   double *pred = anno_alloc((size_t)c->length * CWT_CHANNELS, sizeof(double));
-  for (int i = 0; i < c->length; i++) {
-    reg_m[i * GFF_REGIONS + gff_region(c->label[i])] = 1.0;
-    if (i > 0) {
-      int kind = boundary_kind(c->label[i - 1], c->label[i]);
-      if (kind >= 0) {
-        int rev = boundary_rev(c->label[i - 1], c->label[i]);
-        bnd_m[i * (2 * GFF_BOUND_KINDS) + rev * GFF_BOUND_KINDS + kind] = 1.0;
-      }
+  for (int i = 1; i < c->length; i++) {
+    int kind = boundary_kind(c->label[i - 1], c->label[i]);
+    if (kind >= 0) {
+      int rev = boundary_rev(c->label[i - 1], c->label[i]);
+      bnd_m[i * (2 * GFF_BOUND_KINDS) + rev * GFF_BOUND_KINDS + kind] = 1.0;
     }
   }
-  gff_cwt_predict_soft(reg_m, bnd_m, c->length, model, pred);
+  gff_cwt_predict_soft(bnd_m, c->length, model, pred);
   double energy = 0.0;
   for (int i = 0; i < c->length; i++) {
     if (base_index(c->seq[i]) < 0) continue;
@@ -281,7 +271,7 @@ static double eval_hard_residual(const Contig *c, const GffCwtModel *model) {
       energy += 0.5 * d * d;
     }
   }
-  free(reg_m), free(bnd_m), free(pred);
+  free(bnd_m), free(pred);
   return energy;
 }
 
@@ -293,30 +283,26 @@ static void test_gff_cwt_model_and_adjoint(void) {
   GffCwtModel model;
   init_test_gff_cwt_model(&model);
   const int L = 80;
-  double *reg_m = anno_alloc((size_t)L * GFF_REGIONS, sizeof(double));
   double *bnd_m = anno_alloc((size_t)L * (2 * GFF_BOUND_KINDS), sizeof(double));
   double *pred_cwt = anno_alloc((size_t)L * CWT_CHANNELS, sizeof(double));
   double *res_cwt = anno_alloc((size_t)L * CWT_CHANNELS, sizeof(double));
-  double *grad_reg = anno_alloc((size_t)L * GFF_REGIONS, sizeof(double));
   double *grad_bnd = anno_alloc((size_t)L * (2 * GFF_BOUND_KINDS), sizeof(double));
 
-  for (int i = 0; i < L * GFF_REGIONS; i++) reg_m[i] = rng_uniform(0.0, 1.0);
   for (int i = 2 * GFF_BOUND_KINDS; i < L * (2 * GFF_BOUND_KINDS); i++)
     bnd_m[i] = rng_uniform(0.0, 0.5);
   for (int i = 0; i < L * CWT_CHANNELS; i++) res_cwt[i] = rng_uniform(-1.0, 1.0);
 
-  gff_cwt_predict_soft(reg_m, bnd_m, L, &model, pred_cwt);
-  gff_cwt_residual_adjoint(res_cwt, L, &model, grad_reg, grad_bnd);
+  gff_cwt_predict_soft(bnd_m, L, &model, pred_cwt);
+  gff_cwt_residual_adjoint(res_cwt, L, &model, grad_bnd);
 
   double lhs = 0.0, rhs = 0.0;
   for (int i = 0; i < L * CWT_CHANNELS; i++) lhs += res_cwt[i] * pred_cwt[i];
-  for (int i = 0; i < L * GFF_REGIONS; i++) rhs += grad_reg[i] * reg_m[i];
   for (int i = 0; i < L * (2 * GFF_BOUND_KINDS); i++) rhs += grad_bnd[i] * bnd_m[i];
   TEST_ASSERT_DOUBLE_WITHIN(1e-11, lhs, rhs);
 
-  const char *seq = "ACGTACGTACGTATGTTGTAATGCAACGTACGT";
-  uint8_t labels[33] = {0};
-  const uint8_t gene[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
+  const char *seq = "ACGTACGTACGTATGGTTAGTAATGCAACGTACGT";
+  uint8_t labels[35] = {0};
+  const uint8_t gene[11] = {1, 2, 3, 4, 4, 4, 4, 4, 1, 2, 3};
   memcpy(labels + 12, gene, sizeof(gene));
   Contig c = make_test_contig(seq, labels);
   cwt_transform(&wavelets, c.seq, c.length, 1, c.cwt);
@@ -337,12 +323,12 @@ static void test_gff_cwt_model_and_adjoint(void) {
   gff_cwt_accumulator_finish(&acc, &split_model);
   TEST_ASSERT(memcmp(&full_model, &split_model, sizeof(full_model)) == 0);
 
-  free(reg_m), free(bnd_m), free(pred_cwt), free(res_cwt), free(grad_reg), free(grad_bnd);
+  free(bnd_m), free(pred_cwt), free(res_cwt), free(grad_bnd);
   free_test_contig(&c);
   wavelets_free(&wavelets);
 }
 
-/* 3. CRF Grammar, Decoding, Residual Gradient, and Self-Training Tests */
+/* 3. HMM Grammar, Decoding, and Self-Training Tests */
 
 static void test_crf_reverse_complement_and_decode(void) {
   crf_init();
@@ -380,66 +366,6 @@ static void test_crf_reverse_complement_and_decode(void) {
   free_test_contig(&cr);
 }
 
-static void test_crf_residual_gradient_and_objective(void) {
-  crf_init();
-  GffCwtModel gmodel;
-  init_test_gff_cwt_model(&gmodel);
-  crf_set_gff_cwt(&gmodel);
-  rng_seed(1337);
-
-  double *w = anno_alloc(WEIGHTS, sizeof(double));
-  for (int f = 0; f < WEIGHTS; f++) w[f] = rng_uniform(-0.3, 0.3);
-
-  const char *genome =
-    "ACGTACGTACGTACGTACGTACGTACGTAC"
-    "ATGTTGTAA"
-    "ACGTACGTACGTACGTACGTACGTACGTACGT";
-  Contig c = make_test_contig(genome, NULL);
-
-  Work wk = {0};
-  double grad[WEIGHTS] = {0}, dummy[WEIGHTS] = {0};
-  double res_weight = 0.25;
-  double loss0 = window_residual_gradient(w, &c, &wk, grad, res_weight, 25, 19, 3, 12);
-  TEST_ASSERT(loss0 > 0.0);
-
-  double direction[WEIGHTS], dot = 0.0, orig[WEIGHTS];
-  memcpy(orig, w, sizeof(orig));
-  for (int f = 0; f < WEIGHTS; f++) {
-    direction[f] = rng_uniform(-0.3, 0.3);
-    dot += grad[f] * direction[f];
-  }
-  for (int f = 0; f < WEIGHTS; f++) w[f] = orig[f] + 1e-6 * direction[f];
-  double loss_plus = window_residual_gradient(w, &c, &wk, dummy, res_weight, 25, 19, 3, 12);
-  for (int f = 0; f < WEIGHTS; f++) w[f] = orig[f] - 1e-6 * direction[f];
-  double loss_minus = window_residual_gradient(w, &c, &wk, dummy, res_weight, 25, 19, 3, 12);
-  memcpy(w, orig, sizeof(orig));
-  TEST_ASSERT_DOUBLE_WITHIN(1e-6, dot, (loss_plus - loss_minus) / 2e-6);
-
-  CrfWindow win = {&c, 25, 19, 3, 12};
-  CrfWorker worker = {.gradient = anno_alloc(WEIGHTS, sizeof(double))};
-  CrfObjective obj = {
-    .train = {.windows = &win, .count = 1, .threads = 1},
-    .workers = &worker
-  };
-  worker.train = &obj.train;
-  double obj_grad[WEIGHTS] = {0}, obj_dot = 0.0;
-  crf_objective(w, obj_grad, &obj);
-  for (int f = 0; f < WEIGHTS; f++) obj_dot += obj_grad[f] * direction[f];
-  for (int f = 0; f < WEIGHTS; f++) w[f] = orig[f] + 1e-6 * direction[f];
-  double obj_plus = crf_objective(w, dummy, &obj);
-  for (int f = 0; f < WEIGHTS; f++) w[f] = orig[f] - 1e-6 * direction[f];
-  double obj_minus = crf_objective(w, dummy, &obj);
-  memcpy(w, orig, sizeof(orig));
-  TEST_ASSERT_DOUBLE_WITHIN(1e-6, obj_dot, (obj_plus - obj_minus) / 2e-6);
-
-  work_free(&worker.work);
-  free(worker.gradient);
-  work_free(&wk);
-  free_test_contig(&c);
-  crf_set_gff_cwt(NULL);
-  free(w);
-}
-
 static void test_self_training_end_to_end_and_threads(void) {
   Wavelets wavelets;
   wavelets_init(&wavelets);
@@ -447,22 +373,22 @@ static void test_self_training_end_to_end_and_threads(void) {
 
   const char *seq1 =
     "ACGTACGTACGTACGTACGTACGTACGTAC"
-    "ATGAAATAA"
+    "ATGGTTAGTAA"
     "ACGTACGTACGTACGTACGTACGTACGTACGT";
   const char *seq2 =
     "ACGTACGTACGTACGTACGTACGTACGTAC"
-    "TTATTTCAT"
+    "TTACTAACCAT"
     "ACGTACGTACGTACGTACGTACGTACGTACGT";
-  const uint8_t labels1[9] = {1, 2, 3, 1, 2, 3, 1, 2, 3};
-  const uint8_t labels2[9] = {9, 8, 7, 9, 8, 7, 9, 8, 7};
+  const uint8_t labels1[11] = {1, 2, 3, 4, 4, 4, 4, 4, 1, 2, 3};
+  const uint8_t labels2[11] = {9, 8, 7, 12, 12, 12, 12, 12, 9, 8, 7};
 
   Contig labeled[2] = {make_test_contig(seq1, NULL), make_test_contig(seq2, NULL)};
   for (int i = 0; i < 2; i++) {
     cwt_transform(&wavelets, labeled[i].seq, labeled[i].length, 1, labeled[i].cwt);
     labeled[i].label = anno_alloc((size_t)labeled[i].length, 1);
   }
-  memcpy(labeled[0].label + 30, labels1, 9);
-  memcpy(labeled[1].label + 30, labels2, 9);
+  memcpy(labeled[0].label + 30, labels1, 11);
+  memcpy(labeled[1].label + 30, labels2, 11);
 
   GffCwtAccumulator acc;
   GffCwtModel gmodel;
@@ -475,25 +401,23 @@ static void test_self_training_end_to_end_and_threads(void) {
   gff_cwt_accumulator_finish(&acc, &gmodel);
   crf_set_gff_cwt(&gmodel);
 
-  Work wk = {0};
-  double dummy_grad[WEIGHTS] = {0};
   double *w_1t = anno_alloc(WEIGHTS, sizeof(double));
   double *w_2t = anno_alloc(WEIGHTS, sizeof(double));
-  double init_res = window_residual_gradient(w_1t, &labeled[0], &wk, dummy_grad,
-                                             CRF_RESIDUAL_WEIGHT, 0, labeled[0].length,
-                                             0, labeled[0].length);
 
-  crf_train(labeled, 2, w_1t, 15, 1);
-  crf_train(labeled, 2, w_2t, 15, 2);
+  crf_train(labeled, 2, w_1t, 5, 1);
+  crf_train(labeled, 2, w_2t, 5, 2);
 
-  double trained_res = window_residual_gradient(w_1t, &labeled[0], &wk, dummy_grad,
-                                                CRF_RESIDUAL_WEIGHT, 0, labeled[0].length,
-                                                0, labeled[0].length);
-  TEST_ASSERT(trained_res < init_res);
   for (int f = 0; f < WEIGHTS; f++)
-    TEST_ASSERT_DOUBLE_WITHIN(1e-8, w_1t[f], w_2t[f]);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-12, w_1t[f], w_2t[f]);
 
-  work_free(&wk);
+  uint8_t dec0[71] = {0}, dec1[71] = {0};
+  crf_decode(w_1t, &labeled[0], dec0);
+  crf_decode(w_1t, &labeled[1], dec1);
+  for (int t = 0; t < 11; t++) {
+    TEST_ASSERT_INT_EQ(labels1[t], dec0[30 + t]);
+    TEST_ASSERT_INT_EQ(labels2[t], dec1[30 + t]);
+  }
+
   free(w_1t), free(w_2t);
   free_test_contig(&labeled[0]);
   free_test_contig(&labeled[1]);
@@ -501,36 +425,13 @@ static void test_self_training_end_to_end_and_threads(void) {
   wavelets_free(&wavelets);
 }
 
-/* 4. L-BFGS Optimizer Tests */
-
-static double rosenbrock_eval(const double *x, double *g, void *ctx) {
-  (void)ctx;
-  double a = 1.0 - x[0], b = x[1] - x[0] * x[0];
-  g[0] = -2.0 * a - 400.0 * x[0] * b;
-  g[1] = 200.0 * b;
-  return a * a + 100.0 * b * b;
-}
-
-static void test_lbfgs_rosenbrock_and_validation(void) {
-  double x[2] = {-1.2, 1.0};
-  int completed = 0;
-  LbfgsStatus st = lbfgs_minimize(2, x, rosenbrock_eval, NULL, NULL, 200, &completed);
-  TEST_ASSERT(st == LBFGS_CONVERGED || st == LBFGS_STOPPING_CRITERION);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-3, 1.0, x[0]);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-3, 1.0, x[1]);
-  TEST_ASSERT_INT_EQ(LBFGS_INVALID_ARGUMENT,
-                     lbfgs_minimize(0, x, rosenbrock_eval, NULL, NULL, 10, &completed));
-}
-
 int main(void) {
-  printf("=== Running CWT, GFF->CWT, CRF & L-BFGS Test Suite ===\n");
+  printf("=== Running CWT, GFF->CWT & HMM Self-Training Test Suite ===\n");
   RUN_TEST(test_cwt_transform_and_chunking);
   RUN_TEST(test_gff_cwt_model_and_adjoint);
   RUN_TEST(test_crf_reverse_complement_and_decode);
-  RUN_TEST(test_crf_residual_gradient_and_objective);
   RUN_TEST(test_self_training_end_to_end_and_threads);
-  RUN_TEST(test_lbfgs_rosenbrock_and_validation);
-  printf("------------------------------------------------------\n");
+  printf("------------------------------------------------------------\n");
   printf("%d Tests %d Failures\n", g_tests_run, g_tests_failed);
   printf("%s\n", g_tests_failed == 0 ? "OK" : "FAIL");
   return g_tests_failed == 0 ? 0 : 1;
