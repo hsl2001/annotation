@@ -40,7 +40,7 @@ KmerHit = tuple[str, str]
 Arr = NDArray[Any]
 
 PLOT_NAMES: tuple[str, ...] = (
-    "exons", "introns", "exons-mutated", "exon-kmer", "control", "control-aggt",
+    "exons", "introns", "exons-mutated", "exon-kmer", "intron-kmer", "control", "control-aggt",
     "control-aggt-p1", "first-exons", "last-exons", "control-no-repeat",
     "control-aggt-no-repeat", "control-aggt-p1-no-repeat", "control-gtag", "control-gtag-no-repeat",
 )
@@ -405,6 +405,27 @@ class GenomeData:
             self.sequences = seqs
         return self.sequences
 
+    def intron_kmers(self) -> tuple[dict[str, list[KmerHit]], dict[str, int], int]:
+        if not (introns := self.exon_sets["introns"]):
+            raise ValueError("No intron features found for intron-kmer")
+        windows: dict[str, list[KmerHit]] = {"5ss": []}
+        skipped = 0
+        for name, start, end, strand in introns:
+            # Center on the first intronic base in transcript orientation.
+            pos = start if strand == "+" else end
+            lo, hi = pos - KMER_RADIUS - 1, pos + KMER_RADIUS
+            if lo < 0 or hi > self.contigs[name].length:
+                skipped += 1
+                continue
+            seq = self.sequences[name][lo:hi]
+            if strand == "-":
+                seq = seq.translate(DNA_COMPLEMENT)[::-1]
+            if len(seq) != KMER_WIDTH or any(ch not in "ACGT" for ch in seq):
+                skipped += 1
+                continue
+            windows["5ss"].append((f"{name}:{start}-{end}:{strand}:5ss:{pos}:dist=+0bp", seq))
+        return windows, {"5ss": 0}, skipped
+
     def _motif_tables(self, gtag: bool = False) -> tuple[list[tuple[Arr, Arr]], list[Arr]]:
         # AG/GT: motifs flank the interval (exon-like). GT/AG: motifs are the interval's own first/last 2 bp (intron-like).
         # Per strand: (start dinucleotide, end dinucleotide) on the genomic + strand; minus uses reverse complements.
@@ -579,30 +600,37 @@ class CwtPlotter:
         axis.set_title(title, fontsize=9)
 
     @classmethod
-    def render_exon_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path) -> None:
+    def render_kmer(cls, windows: dict[str, list[KmerHit]], peaks: dict[str, int], skipped: int, out: Path, feature: str = "exon") -> None:
         out.mkdir(parents=True, exist_ok=True)
+        boundaries = tuple(windows)
+        centered = feature == "intron"
+        kind = "centered" if centered else "maxima"
         fastas: dict[str, Path] = {}
-        for b in BOUNDARIES:
+        for b in boundaries:
             if not windows[b]:
-                raise ValueError(f"No valid {KMER_WIDTH}-mer CWT maxima for exon {b}")
-            with (fa := out / f"{b}-maxima-{KMER_WIDTH}mer.fasta").open("w") as stream:
+                raise ValueError(f"No valid {KMER_WIDTH}-mer {kind} sequences for {feature} {b}")
+            with (fa := out / f"{b}-{kind}-{KMER_WIDTH}mer.fasta").open("w") as stream:
                 stream.writelines(f">{w[0]}\n{w[1]}\n" for w in windows[b])
             fastas[b] = fa
-            print(f"Running STREME on {len(windows[b]):,} exon {b} maxima at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}") for b in BOUNDARIES}
-            results = {b: futs[b].result() for b in BOUNDARIES}
+            print(f"Running STREME on {len(windows[b]):,} {feature} {b} {kind} sequences at {peaks[b]:+d} bp", file=sys.stderr, flush=True)
+        with ThreadPoolExecutor(max_workers=len(boundaries)) as pool:
+            futs = {b: pool.submit(cls.run_meme, fastas[b], out / f"meme-{b}") for b in boundaries}
+            results = {b: futs[b].result() for b in boundaries}
         if skipped:
-            print(f"Skipped {skipped:,} maxima with incomplete or ambiguous {KMER_WIDTH}-mers", file=sys.stderr, flush=True)
-        with (out / "maxima-distances.tsv").open("w") as stream:
+            print(f"Skipped {skipped:,} {kind} sequences with incomplete or ambiguous {KMER_WIDTH}-mers", file=sys.stderr, flush=True)
+        with (out / ("splice-site-distances.tsv" if centered else "maxima-distances.tsv")).open("w") as stream:
             stream.write("flank\tsequence_id\tdistance_bp\n")
-            for b in BOUNDARIES:
+            for b in boundaries:
                 stream.writelines(f"{b}\t{w[0]}\t{peaks[b]}\n" for w in windows[b])
 
-        fig, axes = plt.subplots(MEME_MOTIFS, 2, figsize=(17, 4.2 * MEME_MOTIFS), layout="constrained", squeeze=False)
-        titles = {"start": f"Exon start upstream (peak {peaks['start']:+d} bp, n={len(windows['start']):,})",
-                  "end": f"Exon end downstream (peak {peaks['end']:+d} bp, n={len(windows['end']):,})"}
-        for col, b in enumerate(BOUNDARIES):
+        fig, axes = plt.subplots(MEME_MOTIFS, len(boundaries), figsize=(8.5 * len(boundaries), 4.2 * MEME_MOTIFS), layout="constrained", squeeze=False)
+        titles = (
+            {"5ss": f"Intron 5' splice site (first intronic base at 0 bp, n={len(windows['5ss']):,})"}
+            if centered else
+            {"start": f"Exon start upstream (peak {peaks['start']:+d} bp, n={len(windows['start']):,})",
+             "end": f"Exon end downstream (peak {peaks['end']:+d} bp, n={len(windows['end']):,})"}
+        )
+        for col, b in enumerate(boundaries):
             for row in range(MEME_MOTIFS):
                 ax = axes[row, col]
                 if row < len(results[b]):
@@ -669,7 +697,7 @@ class CwtPlotter:
             names = [n for n in names if n not in rep_names]
         if not names:
             return []
-        if any(k in n for n in names for k in ("exon-kmer", "control-aggt", "control-gtag")):
+        if any(k in n for n in names for k in ("exon-kmer", "intron-kmer", "control-aggt", "control-gtag")):
             genome.load_sequences(fasta)
 
         exons = genome.exon_sets["exons"]
@@ -692,9 +720,12 @@ class CwtPlotter:
 
         for name in names:
             out_dir = args.out / name
-            if name == "exon-kmer":
+            if name == "intron-kmer":
+                windows, peaks, skipped = genome.intron_kmers()
+                cls.render_kmer(windows, peaks, skipped, out_dir, feature="intron")
+            elif name == "exon-kmer":
                 assert kmer_cache is not None
-                cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
+                cls.render_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
             else:
                 group = name.removesuffix("-mutated")
                 base_group, repeat_free = group.removesuffix("-no-repeat"), group.endswith("-no-repeat")
@@ -813,7 +844,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("-P", "--plots", nargs="+", choices=PLOT_CHOICES, metavar="PLOT")
     mode.add_argument("-r", "--region", dest="regions", nargs="+", action="extend", metavar="REGION")
-    parser.add_argument("-g", "--gff", type=Path)
+    parser.add_argument("-g", "--gff", type=Path, help="Exon annotations; intron-kmer analyzes strand-oriented 21-mers centered on the first intronic base at each 5' splice site")
     parser.add_argument("-o", "--out", type=Path, default=Path("plots"))
     parser.add_argument("-c", "--cwt", type=Path)
     parser.add_argument("--anno", type=Path, help="Use one CWT binary instead of running all three encodings")
