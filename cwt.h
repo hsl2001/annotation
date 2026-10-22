@@ -5,7 +5,8 @@
 
 #endif
 
-#ifdef CWT_IMPLEMENTATION
+#if defined(CWT_IMPLEMENTATION) && !defined(ANNO_CWT_IMPLEMENTATION)
+#define ANNO_CWT_IMPLEMENTATION
 
 #include <errno.h>
 #include <complex.h>
@@ -23,22 +24,12 @@
 #include <unistd.h>
 
 _Static_assert(sizeof(float) == 4 && FLT_RADIX == 2 && FLT_MANT_DIG == 24,
-               "CWT export requires binary32 floats");
+               "CWT requires binary32 floats");
 
 static double complex cwt_base_signal(char base) {
-#if defined(CWT_MAPPING_INTRON_LOW_ENERGY)
-  const double complex mapping[4] = {1.0 + I, 1.0 - I, -1.0 - I, -1.0 + I};
-#elif defined(CWT_MAPPING_BRANCHPOINT)
-  const double complex mapping[4] = {1, I, -I, -1};
-#else
   const double complex mapping[4] = {1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I};
-#endif
   int index = base_index(base);
-#if defined(CWT_MAPPING_BRANCHPOINT)
-  return index < 0 ? 0.0 : mapping[index];
-#else
   return index < 0 ? 0.0 : mapping[index] / sqrt(2.0);
-#endif
 }
 
 static double complex cwt_morlet_integral(double lower, double upper) {
@@ -264,29 +255,234 @@ static void *cwt_map_file(FILE *stream, size_t bytes, off_t start, void **mappin
   return (unsigned char *)base + prefix;
 }
 
-static float *cwt_map_output(FILE *stream, size_t count, void **mapping,
-                             size_t *mapping_size, off_t *position) {
-  if (count > SIZE_MAX / sizeof(float)) anno_fail("CWT output size overflow");
-  *position = ftello(stream);
-  return cwt_map_file(stream, count * sizeof(float), *position, mapping, mapping_size,
-                      "CWT output");
+static inline int gff_cwt_bound_basis(int rev, int kind, int slot) {
+  return GFF_REGIONS + ((rev * GFF_BOUND_KINDS + kind) * GFF_CWT_WINDOW + slot);
 }
 
-static void cwt_unmap_output(FILE *stream, float *values, size_t count, void *mapping,
-                             size_t mapping_size, off_t position) {
-  uint16_t endian = 1;
-  if (!*(unsigned char *)&endian) {
-    unsigned char *bytes = (unsigned char *)values;
-    for (size_t i = 0; i < count; i++) {
-      unsigned char first = bytes[4 * i], second = bytes[4 * i + 1];
-      bytes[4 * i] = bytes[4 * i + 3], bytes[4 * i + 1] = bytes[4 * i + 2];
-      bytes[4 * i + 2] = second, bytes[4 * i + 3] = first;
+void gff_cwt_predict(const uint8_t *label, int length, const GffCwtModel *model, float *out_cwt) {
+  if (length <= 0) return;
+  for (int i = 0; i < length; i++) {
+    int r = gff_region(label ? label[i] : 0);
+    float *dst = out_cwt + (size_t)i * CWT_CHANNELS;
+    for (int ch = 0; ch < CWT_CHANNELS; ch++)
+      dst[ch] = model->region[r][ch];
+  }
+  if (!label) return;
+  for (int b = 1; b < length; b++) {
+    int kind = boundary_kind(label[b - 1], label[b]);
+    if (kind < 0) continue;
+    int rev = boundary_rev(label[b - 1], label[b]);
+    for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
+      int delta = slot - GFF_CWT_RADIUS;
+      int i = rev ? b - delta - 1 : b + delta;
+      if (i < 0 || i >= length) continue;
+      float *dst = out_cwt + (size_t)i * CWT_CHANNELS;
+      const float *w = model->bound[rev][kind][slot];
+      for (int ch = 0; ch < CWT_CHANNELS; ch++)
+        dst[ch] += w[ch];
     }
   }
-  if (msync(mapping, mapping_size, MS_SYNC)) anno_fail("Cannot flush CWT output: %s", strerror(errno));
-  if (munmap(mapping, mapping_size)) anno_fail("Cannot unmap CWT output: %s", strerror(errno));
-  off_t end = position + (off_t)(count * sizeof(float));
-  if (fseeko(stream, end, SEEK_SET)) anno_fail("Cannot seek CWT output: %s", strerror(errno));
+}
+
+void gff_cwt_predict_soft(const double *region_marg, const double *bound_marg,
+                          int length, const GffCwtModel *model, double *out_cwt) {
+  if (length <= 0) return;
+  for (int i = 0; i < length; i++) {
+    const double *rm = region_marg + (size_t)i * GFF_REGIONS;
+    double *dst = out_cwt + (size_t)i * CWT_CHANNELS;
+    for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+      double sum = 0.0;
+      for (int r = 0; r < GFF_REGIONS; r++)
+        sum += rm[r] * (double)model->region[r][ch];
+      dst[ch] = sum;
+    }
+  }
+  if (!bound_marg) return;
+  for (int b = 1; b < length; b++) {
+    const double *bm = bound_marg + (size_t)b * (2 * GFF_BOUND_KINDS);
+    for (int rev = 0; rev < 2; rev++) {
+      for (int kind = 0; kind < GFF_BOUND_KINDS; kind++) {
+        double p = bm[rev * GFF_BOUND_KINDS + kind];
+        if (p == 0.0) continue;
+        for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
+          int delta = slot - GFF_CWT_RADIUS;
+          int i = rev ? b - delta - 1 : b + delta;
+          if (i < 0 || i >= length) continue;
+          double *dst = out_cwt + (size_t)i * CWT_CHANNELS;
+          const float *w = model->bound[rev][kind][slot];
+          for (int ch = 0; ch < CWT_CHANNELS; ch++)
+            dst[ch] += p * (double)w[ch];
+        }
+      }
+    }
+  }
+}
+
+void gff_cwt_residual_adjoint(const double *residual, int length, const GffCwtModel *model,
+                              double *grad_region, double *grad_bound) {
+  if (length <= 0) return;
+  if (grad_region) {
+    for (int i = 0; i < length; i++) {
+      const double *res = residual + (size_t)i * CWT_CHANNELS;
+      double *gr = grad_region + (size_t)i * GFF_REGIONS;
+      for (int r = 0; r < GFF_REGIONS; r++) {
+        double sum = 0.0;
+        for (int ch = 0; ch < CWT_CHANNELS; ch++)
+          sum += res[ch] * (double)model->region[r][ch];
+        gr[r] = sum;
+      }
+    }
+  }
+  if (grad_bound) {
+    memset(grad_bound, 0, (size_t)length * (2 * GFF_BOUND_KINDS) * sizeof(*grad_bound));
+    for (int b = 1; b < length; b++) {
+      double *gb = grad_bound + (size_t)b * (2 * GFF_BOUND_KINDS);
+      for (int rev = 0; rev < 2; rev++) {
+        for (int kind = 0; kind < GFF_BOUND_KINDS; kind++) {
+          double sum = 0.0;
+          for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
+            int delta = slot - GFF_CWT_RADIUS;
+            int i = rev ? b - delta - 1 : b + delta;
+            if (i < 0 || i >= length) continue;
+            const double *res = residual + (size_t)i * CWT_CHANNELS;
+            const float *w = model->bound[rev][kind][slot];
+            for (int ch = 0; ch < CWT_CHANNELS; ch++)
+              sum += res[ch] * (double)w[ch];
+          }
+          gb[rev * GFF_BOUND_KINDS + kind] = sum;
+        }
+      }
+    }
+  }
+}
+
+void gff_cwt_train(const Contig *contigs, int count, GffCwtModel *model) {
+  double *gram = anno_alloc((size_t)GFF_CWT_BASIS * GFF_CWT_BASIS, sizeof(*gram));
+  double *rhs = anno_alloc((size_t)GFF_CWT_BASIS * CWT_CHANNELS, sizeof(*rhs));
+
+  for (int c = 0; c < count; c++) {
+    const Contig *contig = contigs + c;
+    int length = contig->length;
+    if (length <= 0 || !contig->label || !contig->cwt) continue;
+    const uint8_t *y = contig->label + contig->offset;
+    const char *seq = contig->seq + contig->offset;
+    const float *cwt = contig->cwt + (size_t)contig->offset * CWT_CHANNELS;
+
+    for (int i = 0; i < length; i++) {
+      if (base_index(seq[i]) < 0) continue;
+      int active[2 * GFF_CWT_WINDOW + 4];
+      int n_active = 0;
+      active[n_active++] = gff_region(y[i]);
+
+      int b_lo = i - GFF_CWT_RADIUS - 1;
+      if (b_lo < 1) b_lo = 1;
+      int b_hi = i + GFF_CWT_RADIUS + 1;
+      if (b_hi >= length) b_hi = length - 1;
+      for (int b = b_lo; b <= b_hi; b++) {
+        int kind = boundary_kind(y[b - 1], y[b]);
+        if (kind < 0) continue;
+        int rev = boundary_rev(y[b - 1], y[b]);
+        int delta = rev ? (b - 1 - i) : (i - b);
+        if (delta < -GFF_CWT_RADIUS || delta > GFF_CWT_RADIUS) continue;
+        active[n_active++] = gff_cwt_bound_basis(rev, kind, delta + GFF_CWT_RADIUS);
+      }
+
+      const float *obs = cwt + (size_t)i * CWT_CHANNELS;
+      for (int a = 0; a < n_active; a++) {
+        int ma = active[a];
+        double *r_row = rhs + (size_t)ma * CWT_CHANNELS;
+        for (int ch = 0; ch < CWT_CHANNELS; ch++)
+          r_row[ch] += (double)obs[ch];
+        double *g_row = gram + (size_t)ma * GFF_CWT_BASIS;
+        for (int d = 0; d < n_active; d++)
+          g_row[active[d]] += 1.0;
+      }
+    }
+  }
+
+  for (int m = 0; m < GFF_CWT_BASIS; m++)
+    gram[(size_t)m * GFF_CWT_BASIS + m] += GFF_CWT_RIDGE;
+
+  /* Cholesky factorization: gram = L * L^T */
+  for (int i = 0; i < GFF_CWT_BASIS; i++) {
+    for (int j = 0; j <= i; j++) {
+      double sum = gram[(size_t)i * GFF_CWT_BASIS + j];
+      for (int k = 0; k < j; k++)
+        sum -= gram[(size_t)i * GFF_CWT_BASIS + k] * gram[(size_t)j * GFF_CWT_BASIS + k];
+      if (i == j) {
+        if (!(sum > 0.0) || !isfinite(sum))
+          anno_fail("Non-positive definite Gram matrix in GFF->CWT training");
+        gram[(size_t)i * GFF_CWT_BASIS + j] = sqrt(sum);
+      } else {
+        gram[(size_t)i * GFF_CWT_BASIS + j] = sum / gram[(size_t)j * GFF_CWT_BASIS + j];
+      }
+    }
+  }
+
+  /* Forward substitution: L * Z = rhs */
+  for (int i = 0; i < GFF_CWT_BASIS; i++) {
+    double inv_diag = 1.0 / gram[(size_t)i * GFF_CWT_BASIS + i];
+    for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+      double sum = rhs[(size_t)i * CWT_CHANNELS + ch];
+      for (int k = 0; k < i; k++)
+        sum -= gram[(size_t)i * GFF_CWT_BASIS + k] * rhs[(size_t)k * CWT_CHANNELS + ch];
+      rhs[(size_t)i * CWT_CHANNELS + ch] = sum * inv_diag;
+    }
+  }
+
+  /* Backward substitution: L^T * Phi = Z */
+  for (int i = GFF_CWT_BASIS - 1; i >= 0; i--) {
+    double inv_diag = 1.0 / gram[(size_t)i * GFF_CWT_BASIS + i];
+    for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+      double sum = rhs[(size_t)i * CWT_CHANNELS + ch];
+      for (int k = i + 1; k < GFF_CWT_BASIS; k++)
+        sum -= gram[(size_t)k * GFF_CWT_BASIS + i] * rhs[(size_t)k * CWT_CHANNELS + ch];
+      rhs[(size_t)i * CWT_CHANNELS + ch] = sum * inv_diag;
+    }
+  }
+
+  memset(model, 0, sizeof(*model));
+  for (int r = 0; r < GFF_REGIONS; r++)
+    for (int ch = 0; ch < CWT_CHANNELS; ch++)
+      model->region[r][ch] = (float)rhs[(size_t)r * CWT_CHANNELS + ch];
+  for (int rev = 0; rev < 2; rev++)
+    for (int kind = 0; kind < GFF_BOUND_KINDS; kind++)
+      for (int slot = 0; slot < GFF_CWT_WINDOW; slot++) {
+        int m = gff_cwt_bound_basis(rev, kind, slot);
+        for (int ch = 0; ch < CWT_CHANNELS; ch++)
+          model->bound[rev][kind][slot][ch] = (float)rhs[(size_t)m * CWT_CHANNELS + ch];
+      }
+
+  free(gram);
+  free(rhs);
+}
+
+double gff_cwt_eval_residual(const Contig *contigs, int count, const GffCwtModel *model,
+                             double *out_raw_energy) {
+  double res_energy = 0.0, raw_energy = 0.0;
+  for (int c = 0; c < count; c++) {
+    const Contig *contig = contigs + c;
+    int length = contig->length;
+    if (length <= 0 || !contig->cwt) continue;
+    float *pred = anno_alloc((size_t)length * CWT_CHANNELS, sizeof(*pred));
+    const uint8_t *y = contig->label ? contig->label + contig->offset : NULL;
+    gff_cwt_predict(y, length, model, pred);
+    const char *seq = contig->seq + contig->offset;
+    const float *obs = contig->cwt + (size_t)contig->offset * CWT_CHANNELS;
+    for (int i = 0; i < length; i++) {
+      if (base_index(seq[i]) < 0) continue;
+      for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+        double o = (double)obs[(size_t)i * CWT_CHANNELS + ch];
+        double p = (double)pred[(size_t)i * CWT_CHANNELS + ch];
+        double d = p - o;
+        raw_energy += 0.5 * o * o;
+        res_energy += 0.5 * d * d;
+      }
+    }
+    free(pred);
+  }
+  if (out_raw_energy) *out_raw_energy = raw_energy;
+  return res_energy;
 }
 
 #endif

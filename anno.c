@@ -22,14 +22,14 @@
 #include "rfft.h"
 #define LBFGS_IMPLEMENTATION
 #include "lbfgs.h"
-#define CRF_IMPLEMENTATION
-#include "crf.h"
-
-KSEQ_INIT(gzFile, gzread)
 
 const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #define CWT_IMPLEMENTATION
 #include "cwt.h"
+#define CRF_IMPLEMENTATION
+#include "crf.h"
+
+KSEQ_INIT(gzFile, gzread)
 
 void anno_fail(const char *format, ...) {
   va_list arguments;
@@ -73,8 +73,8 @@ static CwtStore cwt_store(Contig *contigs, int count) {
     if ((size_t)contigs[i].genome_length > SIZE_MAX - bases) anno_fail("CWT size overflow");
     bases += (size_t)contigs[i].genome_length;
   }
-  if (bases > SIZE_MAX / (WAVE_COUNT * sizeof(float))) anno_fail("CWT size overflow");
-  size_t bytes = bases * WAVE_COUNT * sizeof(float);
+  if (bases > SIZE_MAX / (CWT_CHANNELS * sizeof(float))) anno_fail("CWT size overflow");
+  size_t bytes = bases * CWT_CHANNELS * sizeof(float);
   FILE *backing = tmpfile();
   if (!backing) anno_fail("Cannot create CWT scratch file: %s", strerror(errno));
   void *mapping;
@@ -83,7 +83,7 @@ static CwtStore cwt_store(Contig *contigs, int count) {
   if (fclose(backing)) anno_fail("Cannot close CWT scratch file: %s", strerror(errno));
   size_t offset = 0;
   for (int i = 0; i < count; i++) {
-    contigs[i].cwt_power = data + offset * WAVE_COUNT;
+    contigs[i].cwt = data + offset * CWT_CHANNELS;
     offset += (size_t)contigs[i].genome_length;
   }
   return (CwtStore){data, mapping_size};
@@ -254,31 +254,36 @@ typedef struct {
   float weight;
 } ModelEntry;
 
-static void save_model(const char *path, const double *w) {
+static void save_model(const char *path, const GffCwtModel *gff_cwt, const double *w) {
   ModelEntry *entries = anno_alloc(WEIGHTS, sizeof(*entries));
-  uint32_t header[2] = {WEIGHTS, 0};
+  uint32_t header[3] = {WEIGHTS, GFF_CWT_BASIS * CWT_CHANNELS, 0};
   for (int i = 0; i < WEIGHTS; i++)
-    if ((float)w[i]) entries[header[1]++] = (ModelEntry){(uint32_t)i, (float)w[i]};
+    if ((float)w[i]) entries[header[2]++] = (ModelEntry){(uint32_t)i, (float)w[i]};
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite(header, sizeof(*header), 2, file) != 2 ||
-      fwrite(entries, sizeof(*entries), header[1], file) != header[1] || fclose(file))
+  if (!file || fwrite(header, sizeof(*header), 3, file) != 3 ||
+      fwrite(gff_cwt, sizeof(*gff_cwt), 1, file) != 1 ||
+      fwrite(entries, sizeof(*entries), header[2], file) != header[2] || fclose(file))
     anno_fail("Cannot write model: %s", path);
   free(entries);
   crf_save_weights_text("anno.weights.txt", w);
 }
 
-static void load_model(const char *path, double *w) {
-  uint32_t header[2];
+static void load_model(const char *path, GffCwtModel *gff_cwt, double *w) {
+  uint32_t header[3];
   FILE *file = fopen(path, "rb");
-  if (!file || fread(header, sizeof(*header), 2, file) != 2 || header[0] != WEIGHTS ||
-      header[1] > WEIGHTS)
+  if (!file || fread(header, sizeof(*header), 3, file) != 3 ||
+      header[0] != WEIGHTS || header[1] != GFF_CWT_BASIS * CWT_CHANNELS ||
+      header[2] > WEIGHTS || fread(gff_cwt, sizeof(*gff_cwt), 1, file) != 1)
     anno_fail("Cannot read model: %s (expected %d-weight feature layout)", path, WEIGHTS);
-  ModelEntry *entries = anno_alloc(header[1], sizeof(*entries));
-  if (fread(entries, sizeof(*entries), header[1], file) != header[1] || fgetc(file) != EOF)
+  const float *gc_floats = (const float *)gff_cwt;
+  for (size_t i = 0; i < sizeof(*gff_cwt) / sizeof(float); i++)
+    if (!isfinite(gc_floats[i])) anno_fail("Non-finite GFF->CWT weight: %s", path);
+  ModelEntry *entries = anno_alloc(header[2], sizeof(*entries));
+  if (fread(entries, sizeof(*entries), header[2], file) != header[2] || fgetc(file) != EOF)
     anno_fail("Truncated or oversized model: %s", path);
   fclose(file);
   memset(w, 0, WEIGHTS * sizeof(*w));
-  for (uint32_t i = 0; i < header[1]; i++) {
+  for (uint32_t i = 0; i < header[2]; i++) {
     if (entries[i].index >= WEIGHTS) anno_fail("Model weight index out of range: %s", path);
     if (!isfinite(entries[i].weight)) anno_fail("Non-finite model weight: %s", path);
     w[entries[i].index] = entries[i].weight;
@@ -286,56 +291,9 @@ static void load_model(const char *path, double *w) {
   free(entries);
 }
 
-static FILE *create_in(const char *directory, const char *name) {
-  char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
-  sprintf(path, "%s/%s", directory, name);
-  FILE *file = fopen(path, "w+b");
-  if (!file) anno_fail("Cannot create %s", path);
-  free(path);
-  return file;
-}
-
-/* Raw complex64 CWT export for plot_cwt.py: plus strand rows then reverse-complement rows. */
-static void export_cwt(const Wavelets *wavelets, const char *fasta,
-                       const char *directory, int threads) {
-  int count;
-  Contig *contigs = read_fasta(fasta, &count);
-  if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
-  FILE *matrix = create_in(directory, "matrix.bin"), *index = create_in(directory, "contigs.tsv");
-  fputs("# anno-cwt-v2\n# scales\t", index);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
-  fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
-  size_t rows = 0;
-  for (int c = 0; c < count; c++) {
-    Contig *g = contigs + c;
-    fprintf(index, "%s\t%d\t%zu\t%zu\n", g->name, g->length, rows, rows + g->length);
-    if ((size_t)g->length > SIZE_MAX / CWT_CHANNELS) anno_fail("CWT output size overflow");
-    size_t value_count = (size_t)g->length * CWT_CHANNELS;
-    char *reverse = anno_alloc((size_t)g->length + 1, 1);
-    for (int i = 0; i < g->length; i++) {
-      int base = base_index(g->seq[g->length - 1 - i]);
-      reverse[i] = base < 0 ? 'N' : "TGCA"[base];
-    }
-    for (int strand = 0; strand < 2; strand++) {
-      const char *bases = strand ? reverse : g->seq;
-      void *mapping;
-      size_t mapping_size;
-      off_t file_position;
-      float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
-      cwt_transform(wavelets, bases, g->length, threads, values, NULL);
-      cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
-    }
-    free(reverse);
-    rows += 2 * (size_t)g->length;
-  }
-  if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
-  free_contigs(contigs, count);
-  fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
-}
-
 static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                  "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
+  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n",
+          program);
   return status;
 }
 
@@ -363,36 +321,41 @@ int main(int argc, char **argv) {
   }
   int rest = argc - options.ind;
   char **args = argv + options.ind;
-  int export = rest == 3 && !strcmp(args[0], "cwt");
-  if (!export && (rest < 1 || rest > 2))
+  if (rest < 1 || rest > 2)
     return usage(argv[0], 1);
-  if (initial_model && (export || rest != 2))
+  if (initial_model && rest != 2)
     anno_fail("Initial model is only supported for training");
   Wavelets wavelets;
   wavelets_init(&wavelets);
-  if (export) {
-    export_cwt(&wavelets, args[1], args[2], threads);
-    wavelets_free(&wavelets);
-    return 0;
-  }
   crf_init();
+  GffCwtModel gff_cwt = {0};
   double *weights = anno_alloc(WEIGHTS, sizeof(*weights));
-  if (rest == 1) load_model(model, weights);
+  if (rest == 1) {
+    load_model(model, &gff_cwt, weights);
+    crf_set_gff_cwt(&gff_cwt);
+  }
   if (initial_model) {
-    load_model(initial_model, weights);
+    load_model(initial_model, &gff_cwt, weights);
+    crf_set_gff_cwt(&gff_cwt);
     fprintf(stderr, "Warm start from %s\n", initial_model);
   }
   int count;
   Contig *contigs = read_fasta(args[0], &count);
   CwtStore cwt = cwt_store(contigs, count);
   for (int c = 0; c < count; c++)
-    cwt_transform(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, NULL, contigs[c].cwt_power);
+    cwt_transform(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, contigs[c].cwt, NULL);
   if (rest == 2) {
     for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].genome_length, 1);
     int skipped, used = label_cds(contigs, count, args[1], &skipped);
     fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
+    gff_cwt_train(contigs, count, &gff_cwt);
+    crf_set_gff_cwt(&gff_cwt);
+    double raw_energy = 0.0;
+    double res_energy = gff_cwt_eval_residual(contigs, count, &gff_cwt, &raw_energy);
+    fprintf(stderr, "GFF->CWT model trained: raw energy %.6g, residual energy %.6g\n",
+            raw_energy, res_energy);
     crf_train(contigs, count, weights, iterations, threads);
-    save_model(model, weights);
+    save_model(model, &gff_cwt, weights);
   }
   puts("##gff-version 3");
   unsigned long genes = 0;

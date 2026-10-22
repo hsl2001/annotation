@@ -55,12 +55,12 @@ void *anno_alloc(size_t count, size_t size) {
 #include "rfft.h"
 #define LBFGS_IMPLEMENTATION
 #include "lbfgs.h"
-#define CRF_IMPLEMENTATION
-#include "crf.h"
 
 const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
 #define CWT_IMPLEMENTATION
 #include "cwt.h"
+#define CRF_IMPLEMENTATION
+#include "crf.h"
 
 static void test_cwt_transform(const Wavelets *wavelets, const char *sequence, int length,
                                int threads, double *features, float *complex_values,
@@ -230,16 +230,8 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
         int gpos = c->offset + t;
         for (int off = 0; off < BOUNDARY_KMER_COUNT; off++) {
           int k_idx = boundary_kmer_index(&site, rev, kind, off);
-          double d1_m = 0, d2_m = 0;
-          boundary_kmer_cwt_at(c, gpos, rev, off, &d1_m, &d2_m);
-          int d1_idx = bcross_d1_index(&site, rev, kind, off);
-          int d2_idx = bcross_d2_index(&site, rev, kind, off);
-          total_score += w[k_idx] + w[d1_idx] * d1_m + w[d2_idx] * d2_m;
-          if (feat_accum) {
-            feat_accum[k_idx] += scale;
-            feat_accum[d1_idx] += scale * d1_m;
-            feat_accum[d2_idx] += scale * d2_m;
-          }
+          total_score += w[k_idx];
+          if (feat_accum) feat_accum[k_idx] += scale;
         }
         for (int off = 0; off < BOUNDARY_PWM_COUNT; off++) {
           int idx = boundary_pwm_index(&site, rev, kind, off);
@@ -247,25 +239,21 @@ static double bf_score_and_accumulate_features(const double *w, const Contig *c,
           if (feat_accum) feat_accum[idx] += scale;
         }
         for (int off = 0; off < BOUNDARY_CWT_COUNT; off++) {
-          float power[WAVE_COUNT];
-          double deriv[DERIV_COUNT][WAVE_COUNT];
-          boundary_cwt_at(c, gpos, rev, off, power, deriv);
-          double d2_m = 0;
-          for (int sc = 0; sc < WAVE_COUNT; sc++) {
-            int bp_idx = bp_index(kind, off, sc);
-            total_score += w[bp_idx] * (double)power[sc];
-            if (feat_accum) feat_accum[bp_idx] += scale * (double)power[sc];
-            for (int slot = 0; slot < DERIV_COUNT; slot++) {
-              int bd_idx = derivative_index(kind, slot, off, sc);
-              total_score += w[bd_idx] * deriv[slot][sc];
-              if (feat_accum) feat_accum[bd_idx] += scale * deriv[slot][sc];
+          float values[CWT_CHANNELS];
+          uint8_t valid = 0;
+          boundary_cwt_at(c, gpos, rev, off, values, &valid);
+          if (!valid) continue;
+          for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+            double sq, res;
+            bound_cwt_features(values[ch], rev, kind, off, ch, &sq, &res);
+            int sq_idx = cwt_bound_sq_index(kind, off, ch);
+            int res_idx = cwt_bound_res_index(rev, kind, off, ch);
+            total_score += w[sq_idx] * sq + w[res_idx] * res;
+            if (feat_accum) {
+              feat_accum[sq_idx] += scale * sq;
+              feat_accum[res_idx] += scale * res;
             }
-            d2_m += deriv[1][sc];
           }
-          d2_m *= (1.0 / WAVE_COUNT);
-          int bpc_idx = bpwm_cwt_index(&site, rev, kind, off);
-          total_score += w[bpc_idx] * d2_m;
-          if (feat_accum) feat_accum[bpc_idx] += scale * d2_m;
         }
       }
     }
@@ -393,7 +381,7 @@ static void dp_extract_marginals(const double *w, const Contig *c,
 
     if (pos > 0) {
       double edge_m[STATES * STATES] = {0};
-      backward_step(&work, c->length, pos, B, NULL, NULL, NULL, 0, 0, 0, 0, edge_m);
+      backward_step(&work, c->length, pos, B, NULL, NULL, NULL, NULL, 0, edge_m);
       for (int e = 0; e < ntrans; e++)
         edge_marg[pos][trans_a[e]][trans_b[e]] += edge_m[e];
     }
@@ -455,18 +443,31 @@ static Contig make_test_contig(const char *full_seq, int offset, int length,
   c.genome_length = glen;
   c.offset = offset;
   c.length = length;
-  c.cwt_power = anno_alloc((size_t)glen * WAVE_COUNT, sizeof(float));
+  c.cwt = anno_alloc((size_t)glen * CWT_CHANNELS, sizeof(float));
   c.label = anno_alloc((size_t)glen, sizeof(uint8_t));
-  for (int i = 0; i < glen * WAVE_COUNT; i++)
-    c.cwt_power[i] = (float)(0.15 + 0.07 * sin(0.37 * (i + 1)) + 0.04 * cos(0.19 * (i + 2)));
+  for (int i = 0; i < glen * CWT_CHANNELS; i++)
+    c.cwt[i] = (float)(0.15 * sin(0.37 * (i + 1)) - 0.11 * cos(0.19 * (i + 2)));
   if (window_labels)
     memcpy(c.label + offset, window_labels, (size_t)length);
   return c;
 }
 
 static void free_test_contig(Contig *c) {
-  free(c->cwt_power);
+  free(c->cwt);
   free(c->label);
+}
+
+static void init_test_gff_cwt_model(GffCwtModel *m) {
+  memset(m, 0, sizeof(*m));
+  for (int r = 0; r < GFF_REGIONS; r++)
+    for (int ch = 0; ch < CWT_CHANNELS; ch++)
+      m->region[r][ch] = (float)(0.05 * (r - 2) * cos(0.3 * (ch + 1)));
+  for (int rev = 0; rev < 2; rev++)
+    for (int kind = 0; kind < GFF_BOUND_KINDS; kind++)
+      for (int slot = 0; slot < GFF_CWT_WINDOW; slot++)
+        for (int ch = 0; ch < CWT_CHANNELS; ch++)
+          m->bound[rev][kind][slot][ch] =
+            (float)(0.08 * sin(0.23 * (slot + 1) + 0.5 * kind + 0.7 * rev - 0.3 * ch));
 }
 
 /* =========================================================================
@@ -760,6 +761,9 @@ static void test_crf_k2_exhaustive_t1_to_t5(void) {
 
 static void test_crf_grammar_exhaustive_both_strands(void) {
   crf_init();
+  GffCwtModel gmodel;
+  init_test_gff_cwt_model(&gmodel);
+  crf_set_gff_cwt(&gmodel);
   rng_seed(2026);
 
   double *w = anno_alloc(WEIGHTS, sizeof(double));
@@ -767,7 +771,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
 
   /* Case A: Plus-strand sequence with start codon, introns (5ss & 3ss + CWT), stop codon.
      Window is "ATGTTGTAA" (T=9) embedded at offset 30 inside a 72-bp contig so all CWT
-     offsets (-27..+2) and derivative kernels are in-bounds and active, and introns in all
+     offsets (-26..+4) are in-bounds and active, and introns in all
      3 reading frames (states 4, 5, 6) are valid. */
   const char *plus_genome =
     "ACGTACGTACGTACGTACGTACGTACGTAC" /* 30 bp upstream */
@@ -812,16 +816,17 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     TEST_ASSERT_DOUBLE_WITHIN(1e-10, expected_grad, dp_grad[f]);
   }
 
-  /* Verify finite differences against dp_grad across active emission, boundary_k2, CWT power, and CWT deriv weights */
+  /* Verify finite differences against dp_grad across active emission, boundary_k2, PWM, and CWT residual weights */
   const double eps = 1e-6;
-  int checked_groups[6] = {0};
+  int checked_groups[7] = {0};
   for (int f = 0; f < WEIGHTS; f++) {
     if (fabs(dp_grad[f]) < 1e-7) continue;
     int group = (f < OFF_SPLICE_START_STOP) ? 0 :
-                (f < OFF_BP) ? 1 :
-                (f < OFF_BD) ? 2 :
-                (f < OFF_PWM) ? 3 :
-                (f < OFF_TRANSITION) ? 4 : 5;
+                (f < OFF_PWM) ? 1 :
+                (f < OFF_CWT_REG) ? 2 :
+                (f < OFF_CWT_BOUND_SQ) ? 3 :
+                (f < OFF_CWT_BOUND_RES) ? 4 :
+                (f < OFF_TRANSITION) ? 5 : 6;
     if (checked_groups[group] >= 4) continue;
     checked_groups[group]++;
 
@@ -838,7 +843,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
     double fd = (ll_p - ll_m) / (2.0 * eps);
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd, dp_grad[f]);
   }
-  for (int g = 0; g < 6; g++) TEST_ASSERT(checked_groups[g] > 0);
+  for (int g = 0; g < 7; g++) TEST_ASSERT(checked_groups[g] > 0);
 
   /* Case B: Minus-strand sequence with reverse-complement stop ("TTA"), intron (10..12), and start ("CAT") */
   const char *minus_genome =
@@ -861,6 +866,7 @@ static void test_crf_grammar_exhaustive_both_strands(void) {
   for (int f = 0; f < WEIGHTS; f++)
     TEST_ASSERT_DOUBLE_WITHIN(1e-10, gold_feat[f] - bf_minus.expected_features[f], dp_grad[f]);
 
+  crf_set_gff_cwt(NULL);
   free_test_contig(&c_plus);
   free_test_contig(&c_minus);
   free(w);
@@ -923,7 +929,7 @@ static void test_crf_length_one(void) {
   for (int i = 0; i < WEIGHTS; i++) {
     w1[i] = rng_uniform(-1.0, 1.0);
     /* w2 has identical emission weights, but wildly different transition/boundary weights */
-    w2[i] = (i < OFF_SPLICE_START_STOP || (i >= OFF_GC_DIFF && i < OFF_TRANSITION))
+    w2[i] = (i < OFF_SPLICE_START_STOP || (i >= OFF_CWT_REG && i < OFF_CWT_BOUND_SQ))
       ? w1[i] : rng_uniform(-50.0, 50.0);
   }
 
@@ -1190,8 +1196,9 @@ static void test_crf_shift_invariance(void) {
     }
     double ct = (t - 4) * 3.25 + 1.1;
     shift_sum += ct;
-    for (int state = 0; state < STATES; state++)
-      w2[emission_index(&st, 0, state)] += ct;
+    for (int es = 0; es < EMIT_STATES; es++)
+      for (int rev = 0; rev < (es == 0 ? 1 : 2); rev++)
+        w2[emit_kmer_offsets[0] + es * K3 + (int)st.kmer_emit[0][rev]] += ct;
   }
 
   double logz1 = 0.0, logz2 = 0.0;
@@ -1230,6 +1237,9 @@ static void test_crf_shift_invariance(void) {
 
 static void test_crf_objective_sign_regularization_and_scaling(void) {
   crf_init();
+  GffCwtModel gmodel;
+  init_test_gff_cwt_model(&gmodel);
+  crf_set_gff_cwt(&gmodel);
   rng_seed(909);
 
   const uint8_t gold1[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
@@ -1264,27 +1274,27 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   double *grad_unreg = anno_alloc(WEIGHTS, sizeof(double));
   for (int f = 0; f < WEIGHTS; f++) w[f] = rng_uniform(-0.25, 0.25);
 
-  /* Unregularized sum over windows via contig_gradient_f1 */
+  /* Unregularized sum over windows via contig_gradient_residual */
   Work wk = {0};
-  double ll_sum = 0.0, f1_sum = 0.0, f1_part = 0.0;
-  ll_sum += contig_gradient_f1(w, &contigs[0], &wk, grad_unreg, CRF_F1_BASE_WEIGHT, &f1_part);
-  f1_sum += f1_part;
-  ll_sum += contig_gradient_f1(w, &contigs[1], &wk, grad_unreg, CRF_F1_BASE_WEIGHT, &f1_part);
-  f1_sum += f1_part;
+  double ll_sum = 0.0, res_sum = 0.0, res_part = 0.0;
+  ll_sum += contig_gradient_residual(w, &contigs[0], &wk, grad_unreg, CRF_RESIDUAL_WEIGHT, &res_part);
+  res_sum += res_part;
+  ll_sum += contig_gradient_residual(w, &contigs[1], &wk, grad_unreg, CRF_RESIDUAL_WEIGHT, &res_part);
+  res_sum += res_part;
   work_free(&wk);
 
   /* Regularized objective via crf_objective */
   double loss = crf_objective(w, grad_obj, &obj);
   TEST_ASSERT_INT_EQ(15, obj.positions);
   TEST_ASSERT_DOUBLE_WITHIN(1e-12, ll_sum, obj.likelihood);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-12, f1_sum, obj.f1_loss);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-12, res_sum, obj.res_loss);
 
   double norm_sq = 0.0;
   for (int f = 0; f < WEIGHTS; f++) norm_sq += w[f] * w[f];
-  /* Check minimization sign, Soft F1 term, and L2 penalty: loss = -ll_sum + f1_sum + CRF_L2_C2 * ||w||^2 */
+  /* Check minimization sign, CWT residual term, and L2 penalty: loss = -ll_sum + res_sum + CRF_L2_C2 * ||w||^2 */
   TEST_ASSERT(ll_sum <= 0.0);
-  TEST_ASSERT(f1_sum >= 0.0);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-11, -ll_sum + f1_sum + CRF_L2_C2 * norm_sq, loss);
+  TEST_ASSERT(res_sum >= 0.0);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-11, -ll_sum + res_sum + CRF_L2_C2 * norm_sq, loss);
 
   for (int f = 0; f < WEIGHTS; f++) {
     double expected_g = -grad_unreg[f] + 2.0 * CRF_L2_C2 * w[f];
@@ -1301,6 +1311,7 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   for (int f = 0; f < WEIGHTS; f++)
     TEST_ASSERT_DOUBLE_WITHIN(1e-11, grad_obj[f] * obj.scale[f], grad_v[f]);
 
+  crf_set_gff_cwt(NULL);
   work_free(&worker.work);
   free(worker.gradient);
   free(obj.scale);
@@ -1315,56 +1326,156 @@ static void test_crf_objective_sign_regularization_and_scaling(void) {
   free_test_contig(&contigs[1]);
 }
 
-static void test_crf_soft_f1_loss_and_gradient(void) {
+static void test_gff_cwt_model_and_adjoint(void) {
+  Wavelets wavelets;
+  wavelets_init(&wavelets);
+  rng_seed(4242);
+
+  /* 1. Verify exact adjoint identity <R, g_Phi(gamma, xi)> == <grad_region, gamma> + <grad_bound, xi> */
+  GffCwtModel model;
+  init_test_gff_cwt_model(&model);
+  const int L = 80;
+  double *reg_m = anno_alloc((size_t)L * GFF_REGIONS, sizeof(double));
+  double *bnd_m = anno_alloc((size_t)L * (2 * GFF_BOUND_KINDS), sizeof(double));
+  double *pred_cwt = anno_alloc((size_t)L * CWT_CHANNELS, sizeof(double));
+  double *res_cwt = anno_alloc((size_t)L * CWT_CHANNELS, sizeof(double));
+  double *grad_reg = anno_alloc((size_t)L * GFF_REGIONS, sizeof(double));
+  double *grad_bnd = anno_alloc((size_t)L * (2 * GFF_BOUND_KINDS), sizeof(double));
+
+  for (int i = 0; i < L * GFF_REGIONS; i++) reg_m[i] = rng_uniform(0.0, 1.0);
+  for (int i = 2 * GFF_BOUND_KINDS; i < L * (2 * GFF_BOUND_KINDS); i++)
+    bnd_m[i] = rng_uniform(0.0, 0.5);
+  for (int i = 0; i < L * CWT_CHANNELS; i++) res_cwt[i] = rng_uniform(-1.0, 1.0);
+
+  gff_cwt_predict_soft(reg_m, bnd_m, L, &model, pred_cwt);
+  gff_cwt_residual_adjoint(res_cwt, L, &model, grad_reg, grad_bnd);
+
+  double lhs = 0.0, rhs = 0.0;
+  for (int i = 0; i < L * CWT_CHANNELS; i++) lhs += res_cwt[i] * pred_cwt[i];
+  for (int i = 0; i < L * GFF_REGIONS; i++) rhs += grad_reg[i] * reg_m[i];
+  for (int i = 0; i < L * (2 * GFF_BOUND_KINDS); i++) rhs += grad_bnd[i] * bnd_m[i];
+  TEST_ASSERT_DOUBLE_WITHIN(1e-11, lhs, rhs);
+
+  /* 2. Verify equivalence of gff_cwt_predict and gff_cwt_predict_soft on discrete GFF labels */
+  const uint8_t labels[12] = {0, 0, 1, 2, 3, 4, 4, 4, 1, 2, 3, 0};
+  float hard_cwt[12 * CWT_CHANNELS] = {0};
+  double soft_reg[12 * GFF_REGIONS] = {0};
+  double soft_bnd[12 * (2 * GFF_BOUND_KINDS)] = {0};
+  double soft_cwt[12 * CWT_CHANNELS] = {0};
+  for (int i = 0; i < 12; i++) {
+    soft_reg[i * GFF_REGIONS + gff_region(labels[i])] = 1.0;
+    if (i > 0) {
+      int kind = boundary_kind(labels[i - 1], labels[i]);
+      if (kind >= 0) {
+        int rev = boundary_rev(labels[i - 1], labels[i]);
+        soft_bnd[i * (2 * GFF_BOUND_KINDS) + rev * GFF_BOUND_KINDS + kind] = 1.0;
+      }
+    }
+  }
+  gff_cwt_predict(labels, 12, &model, hard_cwt);
+  gff_cwt_predict_soft(soft_reg, soft_bnd, 12, &model, soft_cwt);
+  for (int i = 0; i < 12 * CWT_CHANNELS; i++)
+    TEST_ASSERT_DOUBLE_WITHIN(1e-6, hard_cwt[i], soft_cwt[i]);
+
+  /* 3. Verify gff_cwt_train reduces CWT residual energy on real CWT signals */
+  const char *seq =
+    "ACGTACGTACGTACGTACGTACGTACGTAC"
+    "ATGTTGTAA"
+    "ACGTACGTACGTACGTACGTACGTACGTACGT";
+  const uint8_t gold[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
+  Contig c = make_test_contig(seq, 30, 9, gold);
+  cwt_transform(&wavelets, c.seq, c.genome_length, 1, NULL, c.cwt, NULL);
+
+  GffCwtModel trained = {0};
+  double raw_energy = 0.0;
+  double zero_res = gff_cwt_eval_residual(&c, 1, &trained, &raw_energy);
+  TEST_ASSERT_DOUBLE_WITHIN(1e-12, raw_energy, zero_res);
+  gff_cwt_train(&c, 1, &trained);
+  double fit_res = gff_cwt_eval_residual(&c, 1, &trained, NULL);
+  TEST_ASSERT(fit_res < zero_res);
+
+  free(reg_m);
+  free(bnd_m);
+  free(pred_cwt);
+  free(res_cwt);
+  free(grad_reg);
+  free(grad_bnd);
+  free_test_contig(&c);
+  wavelets_free(&wavelets);
+}
+
+static void test_crf_residual_loss_and_gradient(void) {
   crf_init();
+  GffCwtModel gmodel;
+  init_test_gff_cwt_model(&gmodel);
+  crf_set_gff_cwt(&gmodel);
   rng_seed(1337);
   double *w = anno_alloc(WEIGHTS, sizeof(double));
   for (int f = 0; f < WEIGHTS; f++) w[f] = rng_uniform(-0.3, 0.3);
 
+  const char *genome =
+    "ACGTACGTACGTACGTACGTACGTACGTAC"
+    "ATGTTGTAA"
+    "ACGTACGTACGTACGTACGTACGTACGTACGT";
   const uint8_t gold_cds[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
   const uint8_t gold_ig[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   const uint8_t *golds[2] = {gold_cds, gold_ig};
 
   for (int k = 0; k < 2; k++) {
-    Contig c = make_test_contig("ATGAAATAA", 0, 9, golds[k]);
+    Contig c = make_test_contig(genome, 30, 9, golds[k]);
     BruteForceCrf bf;
     bf_crf_solve(w, &c, &bf, 0);
 
-    double tp = 0.0, pred_pos = 0.0, gold_pos = 0.0;
+    double bf_reg[9 * GFF_REGIONS] = {0};
+    double bf_bnd[9 * (2 * GFF_BOUND_KINDS)] = {0};
+    double bf_cwt[9 * CWT_CHANNELS] = {0};
     for (int t = 0; t < c.length; t++) {
-      if (is_cds(golds[k][t])) gold_pos += 1.0;
       for (int s = 0; s < STATES; s++)
-        if (is_cds(s)) {
-          pred_pos += bf.node_marginals[t][s];
-          if (s == golds[k][t]) tp += bf.node_marginals[t][s];
-        }
+        bf_reg[t * GFF_REGIONS + gff_region(s)] += bf.node_marginals[t][s];
+      if (t > 0) {
+        for (int a = 0; a < STATES; a++)
+          for (int b = 0; b < STATES; b++) {
+            int kind = boundary_kind(a, b);
+            if (kind >= 0) {
+              int rev = boundary_rev(a, b);
+              bf_bnd[t * (2 * GFF_BOUND_KINDS) + rev * GFF_BOUND_KINDS + kind] +=
+                bf.edge_marginals[t][a][b];
+            }
+          }
+      }
     }
-    double f1_weight = 0.25;
-    double s = w[OFF_F1_WEIGHT];
-    double base_scale = gold_pos > 0.0 ? f1_weight * gold_pos : f1_weight;
-    double raw_loss = gold_pos > 0.0 ? 1.0 - 2.0 * tp / (pred_pos + gold_pos) : pred_pos;
-    double expected_f1 = base_scale * (exp(-s) * raw_loss + CRF_F1_TARGET_LOSS * exp(s));
+    gff_cwt_predict_soft(bf_reg, bf_bnd, c.length, &gmodel, bf_cwt);
+    double res_weight = 0.25, expected_res_loss = 0.0;
+    for (int t = 0; t < c.length; t++) {
+      const float *obs = c.cwt + (size_t)(c.offset + t) * CWT_CHANNELS;
+      for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+        double diff = bf_cwt[t * CWT_CHANNELS + ch] - (double)obs[ch];
+        expected_res_loss += 0.5 * res_weight * diff * diff;
+      }
+    }
 
     Work wk = {0};
-    double grad_nll[WEIGHTS] = {0}, grad_total[WEIGHTS] = {0}, f1_loss = -1.0;
+    double grad_nll[WEIGHTS] = {0}, grad_total[WEIGHTS] = {0}, res_loss = -1.0;
     double ll1 = contig_gradient(w, &c, &wk, grad_nll);
-    double ll2 = contig_gradient_f1(w, &c, &wk, grad_total, f1_weight, &f1_loss);
+    double ll2 = contig_gradient_residual(w, &c, &wk, grad_total, res_weight, &res_loss);
     TEST_ASSERT_DOUBLE_WITHIN(1e-12, ll1, ll2);
-    TEST_ASSERT_DOUBLE_WITHIN(1e-11, expected_f1, f1_loss);
+    TEST_ASSERT_DOUBLE_WITHIN(1e-11, expected_res_loss, res_loss);
 
-    for (int f = OFF_TRANSITION; f < WEIGHTS; f++) {
-      double orig = w[f], dummy[WEIGHTS] = {0}, f1_p = 0.0, f1_m = 0.0;
+    for (int f = 0; f < WEIGHTS; f++) {
+      if (fabs(grad_total[f]) < 1e-7 && f < OFF_TRANSITION) continue;
+      double orig = w[f], dummy[WEIGHTS] = {0}, res_p = 0.0, res_m = 0.0;
       w[f] = orig + 1e-6;
-      double ll_p = contig_gradient_f1(w, &c, &wk, dummy, f1_weight, &f1_p);
+      double ll_p = contig_gradient_residual(w, &c, &wk, dummy, res_weight, &res_p);
       w[f] = orig - 1e-6;
-      double ll_m = contig_gradient_f1(w, &c, &wk, dummy, f1_weight, &f1_m);
+      double ll_m = contig_gradient_residual(w, &c, &wk, dummy, res_weight, &res_m);
       w[f] = orig;
-      double fd_total = ((ll_p - f1_p) - (ll_m - f1_m)) / 2e-6;
+      double fd_total = ((ll_p - res_p) - (ll_m - res_m)) / 2e-6;
       TEST_ASSERT_DOUBLE_WITHIN(1e-7, fd_total, grad_total[f]);
     }
     work_free(&wk);
     free_test_contig(&c);
   }
+  crf_set_gff_cwt(NULL);
   free(w);
 }
 
@@ -1779,25 +1890,18 @@ static void test_cwt_repeat_calls_and_threads(void) {
   for (int i = 0; i < len_a * WAVE_COUNT; i++)
     TEST_ASSERT_DOUBLE_WITHIN(1e-7, pow_a1[i], pow_a2[i]);
 
-  /* Also verify mmap output helper (cwt_map_output / cwt_unmap_output) */
+  /* Also verify mmap scratch helper (cwt_map_file) */
   FILE *tmp_cval = tmpfile();
-  FILE *tmp_pow = tmpfile();
   TEST_ASSERT(tmp_cval != NULL);
-  TEST_ASSERT(tmp_pow != NULL);
-  void *cval_map = NULL, *pow_map = NULL;
-  size_t cval_map_sz = 0, pow_map_sz = 0;
-  off_t cval_pos = 0, pow_pos = 0;
+  void *cval_map = NULL;
+  size_t cval_map_sz = 0;
   size_t cval_cnt = (size_t)len_a * CWT_CHANNELS;
-  size_t pow_cnt = (size_t)len_a * WAVE_COUNT;
-  float *mapped_cval = cwt_map_output(tmp_cval, cval_cnt, &cval_map, &cval_map_sz, &cval_pos);
-  float *mapped_pow = cwt_map_output(tmp_pow, pow_cnt, &pow_map, &pow_map_sz, &pow_pos);
-  cwt_transform(&wavelets, seq_a, len_a, 2, NULL, mapped_cval, mapped_pow);
+  float *mapped_cval = cwt_map_file(tmp_cval, cval_cnt * sizeof(float), 0,
+                                    &cval_map, &cval_map_sz, "CWT test");
+  cwt_transform(&wavelets, seq_a, len_a, 2, NULL, mapped_cval, NULL);
   TEST_ASSERT_INT_EQ(0, memcmp(cval_a1, mapped_cval, cval_cnt * sizeof(float)));
-  TEST_ASSERT_INT_EQ(0, memcmp(pow_a1, mapped_pow, pow_cnt * sizeof(float)));
-  cwt_unmap_output(tmp_cval, mapped_cval, cval_cnt, cval_map, cval_map_sz, cval_pos);
-  cwt_unmap_output(tmp_pow, mapped_pow, pow_cnt, pow_map, pow_map_sz, pow_pos);
+  TEST_ASSERT_INT_EQ(0, munmap(cval_map, cval_map_sz));
   fclose(tmp_cval);
-  fclose(tmp_pow);
 
   free(seq_a);
   free(seq_b);
@@ -2339,13 +2443,17 @@ static double reference_gd_optimize(size_t n, double *x, lbfgs_evaluate evaluate
 static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void) {
   crf_init();
 
-  /* Step 1: Fixed small CWT features -> verify CRF objective & gradient by brute-force */
+  /* Step 1: Fixed small CWT features -> train GFF->CWT -> verify CRF objective & gradient by brute-force */
   const char *seq =
     "ACGTACGTACGTACGTACGTACGTACGTAC"
     "ATGAAATAA"
     "ACGTACGTACGTACGTACGTACGTACGTACGT";
   const uint8_t gold[9] = {1, 2, 3, 4, 4, 4, 1, 2, 3};
   Contig c = make_test_contig(seq, 30, 9, gold);
+
+  GffCwtModel gmodel;
+  gff_cwt_train(&c, 1, &gmodel);
+  crf_set_gff_cwt(&gmodel);
 
   CrfWindow *windows = NULL;
   size_t skipped = 0;
@@ -2371,18 +2479,34 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   BruteForceCrf bf0;
   bf_crf_solve(w_init, &c, &bf0, 0);
   double gold_s0 = bf_score_and_accumulate_features(w_init, &c, gold, 0.0, NULL);
-  double tp0 = 0.0, pred0 = 0.0, gold_pos0 = 0.0;
+  double bf_reg[9 * GFF_REGIONS] = {0};
+  double bf_bnd[9 * (2 * GFF_BOUND_KINDS)] = {0};
+  double bf_cwt[9 * CWT_CHANNELS] = {0};
   for (int t = 0; t < c.length; t++) {
-    if (is_cds(gold[t])) gold_pos0 += 1.0;
     for (int s = 0; s < STATES; s++)
-      if (is_cds(s)) {
-        pred0 += bf0.node_marginals[t][s];
-        if (s == gold[t]) tp0 += bf0.node_marginals[t][s];
-      }
+      bf_reg[t * GFF_REGIONS + gff_region(s)] += bf0.node_marginals[t][s];
+    if (t > 0) {
+      for (int a = 0; a < STATES; a++)
+        for (int b = 0; b < STATES; b++) {
+          int kind = boundary_kind(a, b);
+          if (kind >= 0) {
+            int rev = boundary_rev(a, b);
+            bf_bnd[t * (2 * GFF_BOUND_KINDS) + rev * GFF_BOUND_KINDS + kind] +=
+              bf0.edge_marginals[t][a][b];
+          }
+        }
+    }
   }
-  double f1_0 = CRF_F1_BASE_WEIGHT * gold_pos0 *
-                ((1.0 - 2.0 * tp0 / (pred0 + gold_pos0)) + CRF_F1_TARGET_LOSS);
-  TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf0.logz - gold_s0 + f1_0, loss0);
+  gff_cwt_predict_soft(bf_reg, bf_bnd, c.length, &gmodel, bf_cwt);
+  double res_0 = 0.0;
+  for (int t = 0; t < c.length; t++) {
+    const float *obs = c.cwt + (size_t)(c.offset + t) * CWT_CHANNELS;
+    for (int ch = 0; ch < CWT_CHANNELS; ch++) {
+      double diff = bf_cwt[t * CWT_CHANNELS + ch] - (double)obs[ch];
+      res_0 += 0.5 * CRF_RESIDUAL_WEIGHT * diff * diff;
+    }
+  }
+  TEST_ASSERT_DOUBLE_WITHIN(1e-11, bf0.logz - gold_s0 + res_0, loss0);
 
   /* Step 2: Optimize CRF objective with L-BFGS (crf_train) */
   double *w_lbfgs = anno_alloc(WEIGHTS, sizeof(double));
@@ -2414,6 +2538,7 @@ static void test_integration_fixed_features_crf_lbfgs_and_reference_solver(void)
   crf_decode(w_lbfgs, &c, decoded);
   for (int t = 0; t < 9; t++) TEST_ASSERT_INT_EQ(gold[t], decoded[t]);
 
+  crf_set_gff_cwt(NULL);
   work_free(&worker.work);
   free(worker.gradient);
   free(windows);
@@ -2431,7 +2556,7 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
   wavelets_init(&wavelets);
   crf_init();
 
-  /* Step 4: Generate real CWT features from sequence, connect to CRF, verify brute-force + L-BFGS */
+  /* Step 4: Generate real CWT (Re, Im) features from sequence, train GFF->CWT, verify brute-force + L-BFGS */
   const char *seq1 =
     "GCGTACGTACGTACGTACGTACGTACGTAC"
     "ATGAAATAA"
@@ -2450,15 +2575,20 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
   contigs_4t[0] = make_test_contig(seq1, 30, 9, gold1);
   contigs_4t[1] = make_test_contig(seq2, 30, 9, gold2);
 
-  /* Compute real CWT powers with 1 thread vs 4 threads */
+  /* Compute real CWT (Re, Im) with 1 thread vs 4 threads */
   for (int i = 0; i < 2; i++) {
     cwt_transform(&wavelets, contigs_1t[i].seq, contigs_1t[i].genome_length,
-                  1, NULL, NULL, contigs_1t[i].cwt_power);
+                  1, NULL, contigs_1t[i].cwt, NULL);
     cwt_transform(&wavelets, contigs_4t[i].seq, contigs_4t[i].genome_length,
-                  4, NULL, NULL, contigs_4t[i].cwt_power);
-    for (int k = 0; k < contigs_1t[i].genome_length * WAVE_COUNT; k++)
-      TEST_ASSERT_DOUBLE_WITHIN(1e-7, contigs_1t[i].cwt_power[k], contigs_4t[i].cwt_power[k]);
+                  4, NULL, contigs_4t[i].cwt, NULL);
+    for (int k = 0; k < contigs_1t[i].genome_length * CWT_CHANNELS; k++)
+      TEST_ASSERT_DOUBLE_WITHIN(1e-7, contigs_1t[i].cwt[k], contigs_4t[i].cwt[k]);
   }
+
+  GffCwtModel gmodel_1t, gmodel_4t;
+  gff_cwt_train(contigs_1t, 2, &gmodel_1t);
+  gff_cwt_train(contigs_4t, 2, &gmodel_4t);
+  crf_set_gff_cwt(&gmodel_1t);
 
   /* Verify brute-force oracle on real CWT-connected contig */
   double *w_probe = anno_alloc(WEIGHTS, sizeof(double));
@@ -2477,7 +2607,9 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
   /* Step 5: Train and decode with 1 thread vs multi-thread and compare stage by stage */
   double *w_1t = anno_alloc(WEIGHTS, sizeof(double));
   double *w_2t = anno_alloc(WEIGHTS, sizeof(double));
+  crf_set_gff_cwt(&gmodel_1t);
   crf_train(contigs_1t, 2, w_1t, 50, 1);
+  crf_set_gff_cwt(&gmodel_4t);
   crf_train(contigs_4t, 2, w_2t, 50, 2);
 
   /* CWT inputs differ by up to 1e-7 between thread counts, so trained weights differ slightly. */
@@ -2486,7 +2618,9 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
 
   for (int i = 0; i < 2; i++) {
     uint8_t path_1t[9] = {0}, path_2t[9] = {0};
+    crf_set_gff_cwt(&gmodel_1t);
     crf_decode(w_1t, &contigs_1t[i], path_1t);
+    crf_set_gff_cwt(&gmodel_4t);
     crf_decode(w_2t, &contigs_4t[i], path_2t);
     const uint8_t *expected_gold = (i == 0) ? gold1 : gold2;
     for (int t = 0; t < 9; t++) {
@@ -2495,6 +2629,7 @@ static void test_integration_cwt_to_crf_end_to_end_and_threads(void) {
     }
   }
 
+  crf_set_gff_cwt(NULL);
   free(w_probe);
   free(w_1t);
   free(w_2t);
@@ -2523,7 +2658,8 @@ int main(void) {
   RUN_TEST(test_crf_extreme_scores_numerical_stability);
   RUN_TEST(test_crf_shift_invariance);
   RUN_TEST(test_crf_objective_sign_regularization_and_scaling);
-  RUN_TEST(test_crf_soft_f1_loss_and_gradient);
+  RUN_TEST(test_gff_cwt_model_and_adjoint);
+  RUN_TEST(test_crf_residual_loss_and_gradient);
 
   /* 2. CWT Module */
   RUN_TEST(test_cwt_zero_signal);
