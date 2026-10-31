@@ -25,7 +25,6 @@ static const uint32_t cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 static const char model_magic[8] = {'A', 'N', 'N', 'O', '7', 'S', 'T', '1'};
 static const uint32_t model_version = 4;
 static const uint32_t model_endian = 0x01020304u;
-static const float hidden_feature_scale = 1.0f;
 
 struct AnnoModel {
   AnnoUnetConfig config;
@@ -470,9 +469,10 @@ static void cwt_values(const char *sequence, int64_t length, float *complex_valu
       }
       size_t index = ((size_t)position * ANNO_CWT_CHANNELS +
                       (size_t)scale_index) * 2;
-      complex_values[index] = normalization ? (float)(real / normalization) : 0.0f;
+      complex_values[index] = normalization > 0.0
+        ? (float)(real / normalization) : 0.0f;
       complex_values[index + 1] =
-        normalization ? (float)(imaginary / normalization) : 0.0f;
+        normalization > 0.0 ? (float)(imaginary / normalization) : 0.0f;
     }
   }
 }
@@ -814,7 +814,7 @@ static void train_cached_batch(AnnoModel *model,
         (size_t)class * per_class;
       float value = filter[base];
       for (int channel = 0; channel < base; channel++)
-        value += features[channel] * hidden_feature_scale * filter[channel];
+        value += features[channel] * filter[channel];
       logits[class] = value;
     }
     softmax(logits, config->classes, probability);
@@ -826,9 +826,9 @@ static void train_cached_batch(AnnoModel *model,
         (size_t)class * per_class;
       float *head_delta = head_gradient + (size_t)class * per_class;
       for (int channel = 0; channel < base; channel++) {
-        head_delta[channel] += error * hidden_feature_scale * features[channel];
+        head_delta[channel] += error * features[channel];
         gradient_dec[0][(size_t)position * (size_t)base + (size_t)channel] +=
-          error * hidden_feature_scale * filter[channel];
+          error * filter[channel];
       }
       head_delta[base] += error;
     }
@@ -919,79 +919,14 @@ static void train_cached_batch(AnnoModel *model,
 
 static int model_features(const AnnoModel *model, const float *input,
                           int64_t length, float **features_out) {
-  const AnnoUnetConfig *config = &model->config;
-  int base = config->base_channels;
-  int factor = 1 << (config->depth - 1);
-  if (length > INT64_MAX - factor + 1) return EOVERFLOW;
-  if ((length + factor - 1) / factor > INT64_MAX / factor) return EOVERFLOW;
-  int64_t padded = (length + factor - 1) / factor * factor;
-  float **enc = checked_calloc((size_t)config->depth, sizeof(*enc));
-  int64_t *sizes = checked_calloc((size_t)config->depth, sizeof(*sizes));
-  size_t weight_offset = 0;
-  sizes[0] = padded;
-  for (int level = 0; level < config->depth; level++) {
-    enc[level] = checked_calloc((size_t)sizes[level] * (size_t)base,
-                                sizeof(**enc));
-    if (level > 0) {
-      float *down = checked_calloc((size_t)sizes[level] * (size_t)base,
-                                   sizeof(*down));
-      for (int64_t position = 0; position < sizes[level]; position++)
-        for (int channel = 0; channel < base; channel++)
-          down[(size_t)position * (size_t)base + (size_t)channel] =
-            (enc[level - 1][(size_t)(position * 2) * (size_t)base +
-                            (size_t)channel] +
-             enc[level - 1][(size_t)(position * 2 + 1) * (size_t)base +
-                            (size_t)channel]) * 0.5f;
-      convolution(down, sizes[level], base, base, config->kernel_size,
-                  model->weights + weight_offset, enc[level], 1);
-      weight_offset += conv_parameters(base, base, config->kernel_size);
-      free(down);
-    } else {
-      float *padded_input = checked_calloc(
-        (size_t)padded * (size_t)config->input_channels, sizeof(*padded_input));
-      memcpy(padded_input, input,
-             (size_t)length * (size_t)config->input_channels *
-             sizeof(*padded_input));
-      convolution(padded_input, padded, config->input_channels, base,
-                  config->kernel_size, model->weights + weight_offset,
-                  enc[level], 1);
-      free(padded_input);
-      weight_offset += conv_parameters(config->input_channels, base,
-                                       config->kernel_size);
-    }
-    if (level + 1 < config->depth) sizes[level + 1] = sizes[level] / 2;
-  }
-  float *current = enc[config->depth - 1];
-  int64_t current_length = sizes[config->depth - 1];
-  int current_owned = 0;
-  for (int level = config->depth - 2; level >= 0; level--) {
-    float *up = checked_calloc((size_t)sizes[level] * (size_t)base, sizeof(*up));
-    float *next = checked_calloc((size_t)sizes[level] * (size_t)base, sizeof(*next));
-    for (int64_t position = 0; position < sizes[level]; position++)
-      for (int channel = 0; channel < base; channel++)
-        up[(size_t)position * (size_t)base + (size_t)channel] =
-          enc[level][(size_t)position * (size_t)base + (size_t)channel] +
-          current[(size_t)(position / 2) * (size_t)base + (size_t)channel];
-    convolution(up, sizes[level], base, base, config->kernel_size,
-                model->weights + weight_offset, next, 1);
-    weight_offset += conv_parameters(base, base, config->kernel_size);
-    free(up);
-    if (current_owned) free(current);
-    current = next;
-    current_length = sizes[level];
-    current_owned = 1;
-  }
-  float *features = checked_calloc((size_t)length * (size_t)base,
-                                   sizeof(*features));
-  memcpy(features, current, (size_t)length * (size_t)base * sizeof(*features));
-  for (size_t i = 0; i < (size_t)length * (size_t)base; i++)
-    features[i] *= hidden_feature_scale;
-  if (current_owned) free(current);
-  for (int level = 0; level < config->depth; level++) free(enc[level]);
-  free(enc);
-  free(sizes);
+  AnnoForwardCache cache = {0};
+  int status = forward_cache_create(model, input, length, &cache);
+  if (status) return status;
+  size_t values = (size_t)length * (size_t)model->config.base_channels;
+  float *features = checked_calloc(values, sizeof(*features));
+  memcpy(features, cache.dec[0], values * sizeof(*features));
+  forward_cache_free(&cache, model->config.depth);
   *features_out = features;
-  (void)current_length;
   return 0;
 }
 
@@ -1531,6 +1466,9 @@ static int emit_gff(FILE *output, const char *seqid, const char *type,
   return fprintf(output, "%s\n", attributes) >= 0;
 }
 
+static float *normalized_features(const Sequence *sequence,
+                                  const AnnoModelMetadata *metadata);
+
 static int write_decoded_block(FILE *output, const Sequence *sequence,
                                const uint8_t *path, int64_t block_start,
                                int64_t block_end, char strand,
@@ -1642,18 +1580,7 @@ static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
   for (int sequence_index_value = 0; sequence_index_value < count;
        sequence_index_value++) {
     const Sequence *sequence = &sequences[sequence_index_value];
-    float *input = checked_calloc((size_t)sequence->length *
-                                  (4 + ANNO_CWT_CHANNELS), sizeof(*input));
-    for (int64_t position = 0; position < sequence->length; position++) {
-      int base = base_index(sequence->sequence[position]);
-      for (int channel = 0; channel < 4; channel++)
-        input[(size_t)position * 7 + (size_t)channel] = base == channel;
-      for (int channel = 0; channel < ANNO_CWT_CHANNELS; channel++)
-        input[(size_t)position * 7 + 4 + (size_t)channel] =
-          (sequence->cwt[(size_t)position * ANNO_CWT_CHANNELS + (size_t)channel] -
-           model->metadata.feature_mean[4 + channel]) /
-          model->metadata.feature_std[4 + channel];
-    }
+    float *input = normalized_features(sequence, &model->metadata);
     float *probability = checked_calloc((size_t)sequence->length * ANNO_CLASSES,
                                           sizeof(*probability));
     uint8_t *path = checked_calloc((size_t)sequence->length, 1);
@@ -1666,7 +1593,8 @@ static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
         float value = -1.0f;
         for (int64_t position = 0; position <= sequence->length; position++) {
           float next = position < sequence->length
-            ? roundf(probability[(size_t)position * ANNO_CLASSES + class] *
+            ? roundf(probability[(size_t)position * ANNO_CLASSES +
+                                 (size_t)class] *
                      100000000.0f) / 100000000.0f
             : -1.0f;
           if (position == 0) {
@@ -1708,13 +1636,17 @@ static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
 
 static float *normalized_features(const Sequence *sequence,
                                   const AnnoModelMetadata *metadata) {
-  float *input = checked_calloc((size_t)sequence->length * 7, sizeof(*input));
+  const int channels = 4 + ANNO_CWT_CHANNELS;
+  float *input = checked_calloc((size_t)sequence->length * channels,
+                                sizeof(*input));
   for (int64_t position = 0; position < sequence->length; position++) {
     int base = base_index(sequence->sequence[position]);
     for (int channel = 0; channel < 4; channel++)
-      input[(size_t)position * 7 + (size_t)channel] = base == channel;
+      input[(size_t)position * (size_t)channels + (size_t)channel] =
+        base == channel;
     for (int channel = 0; channel < ANNO_CWT_CHANNELS; channel++)
-      input[(size_t)position * 7 + 4 + (size_t)channel] =
+      input[(size_t)position * (size_t)channels + 4 +
+            (size_t)channel] =
         (sequence->cwt[(size_t)position * ANNO_CWT_CHANNELS + (size_t)channel] -
          metadata->feature_mean[4 + channel]) /
         metadata->feature_std[4 + channel];
@@ -1741,8 +1673,10 @@ static void compute_metadata(Sequence *sequences, int count,
     }
   }
   for (int channel = 0; channel < 7; channel++) {
-    long double mean = total ? sums[channel] / total : 0.0;
-    long double variance = total ? squares[channel] / total - mean * mean : 1.0;
+    long double samples = (long double)total;
+    long double mean = total ? sums[channel] / samples : 0.0;
+    long double variance =
+      total ? squares[channel] / samples - mean * mean : 1.0;
     if (variance < 1e-12) variance = 1.0;
     metadata->feature_mean[channel] = (float)mean;
     metadata->feature_std[channel] = sqrtf((float)variance);
