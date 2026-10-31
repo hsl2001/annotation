@@ -23,8 +23,9 @@ static const char *const class_names[ANNO_CLASSES] = {
 };
 static const uint32_t cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 static const char model_magic[8] = {'A', 'N', 'N', 'O', '7', 'S', 'T', '1'};
-static const uint32_t model_version = 1;
+static const uint32_t model_version = 2;
 static const uint32_t model_endian = 0x01020304u;
+static const float hidden_feature_scale = 32.0f;
 
 struct AnnoModel {
   AnnoUnetConfig config;
@@ -32,6 +33,17 @@ struct AnnoModel {
   float *weights;
   float *bias;
 };
+
+typedef struct {
+  int64_t length;
+  int64_t padded;
+  int64_t *sizes;
+  float *padded_input;
+  float **enc;
+  float **down;
+  float **up;
+  float **dec;
+} AnnoForwardCache;
 
 typedef struct {
   char *name;
@@ -544,6 +556,265 @@ static void convolution(const float *input, int64_t length, int input_channels,
     }
 }
 
+static void softmax(const float *logits, int classes, float *probability);
+
+static int padded_length(const AnnoUnetConfig *config, int64_t length,
+                         int64_t *padded_out) {
+  int factor = 1 << (config->depth - 1);
+  if (length <= 0 || length > INT64_MAX - factor + 1) return EOVERFLOW;
+  if ((length + factor - 1) / factor > INT64_MAX / factor) return EOVERFLOW;
+  *padded_out = (length + factor - 1) / factor * factor;
+  return 0;
+}
+
+static void forward_cache_free(AnnoForwardCache *cache, int depth) {
+  if (!cache) return;
+  for (int level = 0; level < depth; level++) {
+    free(cache->enc[level]);
+    free(cache->down[level]);
+    if (level + 1 < depth) free(cache->dec[level]);
+    if (level + 1 < depth) free(cache->up[level]);
+  }
+  free(cache->enc);
+  free(cache->down);
+  free(cache->up);
+  free(cache->dec);
+  free(cache->sizes);
+  free(cache->padded_input);
+  *cache = (AnnoForwardCache){0};
+}
+
+static int forward_cache_create(const AnnoModel *model, const float *input,
+                                int64_t length, AnnoForwardCache *cache) {
+  const AnnoUnetConfig *config = &model->config;
+  int status = padded_length(config, length, &cache->padded);
+  if (status) return status;
+  cache->length = length;
+  cache->sizes = checked_calloc((size_t)config->depth, sizeof(*cache->sizes));
+  cache->enc = checked_calloc((size_t)config->depth, sizeof(*cache->enc));
+  cache->down = checked_calloc((size_t)config->depth, sizeof(*cache->down));
+  cache->up = checked_calloc((size_t)config->depth, sizeof(*cache->up));
+  cache->dec = checked_calloc((size_t)config->depth, sizeof(*cache->dec));
+  cache->padded_input = checked_calloc(
+    (size_t)cache->padded * (size_t)config->input_channels, sizeof(float));
+  memcpy(cache->padded_input, input,
+         (size_t)length * (size_t)config->input_channels * sizeof(float));
+  int base = config->base_channels;
+  for (int level = 0; level < config->depth; level++)
+    cache->sizes[level] = cache->padded >> level;
+  size_t offset = 0;
+  for (int level = 0; level < config->depth; level++) {
+    int64_t size = cache->sizes[level];
+    cache->enc[level] = checked_calloc((size_t)size * (size_t)base,
+                                       sizeof(**cache->enc));
+    if (!level) {
+      convolution(cache->padded_input, size, config->input_channels, base,
+                  config->kernel_size, model->weights + offset,
+                  cache->enc[level], 1);
+      offset += conv_parameters(config->input_channels, base,
+                                config->kernel_size);
+      continue;
+    }
+    cache->down[level] = checked_calloc((size_t)size * (size_t)base,
+                                        sizeof(**cache->down));
+    for (int64_t position = 0; position < size; position++)
+      for (int channel = 0; channel < base; channel++)
+        cache->down[level][(size_t)position * (size_t)base + (size_t)channel] =
+          (cache->enc[level - 1][(size_t)(position * 2) * (size_t)base +
+                                 (size_t)channel] +
+           cache->enc[level - 1][(size_t)(position * 2 + 1) * (size_t)base +
+                                 (size_t)channel]) * 0.5f;
+    convolution(cache->down[level], size, base, base, config->kernel_size,
+                model->weights + offset, cache->enc[level], 1);
+    offset += conv_parameters(base, base, config->kernel_size);
+  }
+  cache->dec[config->depth - 1] = cache->enc[config->depth - 1];
+  for (int level = config->depth - 2; level >= 0; level--) {
+    int64_t size = cache->sizes[level];
+    cache->up[level] = checked_calloc((size_t)size * (size_t)base,
+                                      sizeof(**cache->up));
+    cache->dec[level] = checked_calloc((size_t)size * (size_t)base,
+                                       sizeof(**cache->dec));
+    for (int64_t position = 0; position < size; position++)
+      for (int channel = 0; channel < base; channel++)
+        cache->up[level][(size_t)position * (size_t)base + (size_t)channel] =
+          cache->enc[level][(size_t)position * (size_t)base + (size_t)channel] +
+          cache->dec[level + 1][(size_t)(position / 2) * (size_t)base +
+                                (size_t)channel];
+    convolution(cache->up[level], size, base, base, config->kernel_size,
+                model->weights + offset, cache->dec[level], 1);
+    offset += conv_parameters(base, base, config->kernel_size);
+  }
+  return 0;
+}
+
+static void convolution_backward(const float *input, const float *output,
+                                 const float *gradient_output, int64_t length,
+                                 int input_channels, int output_channels,
+                                 int kernel, float *weights, float *gradient_input,
+                                 float learning_rate) {
+  int radius = kernel / 2;
+  size_t per_output = (size_t)input_channels * (size_t)kernel + 1;
+  for (int64_t position = 0; position < length; position++)
+    for (int output_channel = 0; output_channel < output_channels;
+         output_channel++) {
+      size_t output_index = (size_t)position * (size_t)output_channels +
+                            (size_t)output_channel;
+      float delta = output[output_index] > 0.0f
+        ? gradient_output[output_index] : 0.0f;
+      if (delta == 0.0f) continue;
+      float *filter = weights + (size_t)output_channel * per_output;
+      size_t index = 0;
+      for (int offset = -radius; offset <= radius; offset++)
+        for (int input_channel = 0; input_channel < input_channels;
+             input_channel++) {
+          int64_t source = position + offset;
+          float old_weight = filter[index];
+          if (gradient_input && source >= 0 && source < length)
+            gradient_input[(size_t)source * (size_t)input_channels +
+                           (size_t)input_channel] += delta * old_weight;
+          if (source >= 0 && source < length)
+            filter[index] -= learning_rate * delta *
+              input[(size_t)source * (size_t)input_channels +
+                    (size_t)input_channel];
+          index++;
+        }
+      filter[input_channels * kernel] -= learning_rate * delta;
+    }
+}
+
+static size_t encoder_offset(const AnnoUnetConfig *config, int level) {
+  size_t offset = 0;
+  offset += conv_parameters(config->input_channels, config->base_channels,
+                            config->kernel_size);
+  for (int current = 1; current < level; current++)
+    offset += conv_parameters(config->base_channels, config->base_channels,
+                              config->kernel_size);
+  return offset;
+}
+
+static void train_cached_batch(AnnoModel *model,
+                               const AnnoForwardCache *cache,
+                               const int64_t *order, int64_t batch_start,
+                               int64_t batch_end, const uint8_t *label,
+                               const float *class_weight, float batch_weight,
+                               float learning_rate) {
+  const AnnoUnetConfig *config = &model->config;
+  int depth = config->depth;
+  int base = config->base_channels;
+  size_t per_class = (size_t)base + 1;
+  size_t head_offset = model_head_offset(config);
+  float **gradient_dec = checked_calloc((size_t)depth, sizeof(*gradient_dec));
+  float **gradient_enc = checked_calloc((size_t)depth, sizeof(*gradient_enc));
+  float *head_gradient = checked_calloc(
+    (size_t)config->classes * per_class, sizeof(*head_gradient));
+  for (int level = 0; level < depth; level++) {
+    size_t cells = (size_t)cache->sizes[level] * (size_t)base;
+    gradient_dec[level] = checked_calloc(cells, sizeof(**gradient_dec));
+    gradient_enc[level] = checked_calloc(cells, sizeof(**gradient_enc));
+  }
+  for (int64_t batch_position = batch_start; batch_position < batch_end;
+       batch_position++) {
+    int64_t position = order[batch_position];
+    float logits[ANNO_CLASSES], probability[ANNO_CLASSES];
+    const float *features = cache->dec[0] +
+      (size_t)position * (size_t)base;
+    for (int class = 0; class < config->classes; class++) {
+      const float *filter = model->weights + head_offset +
+        (size_t)class * per_class;
+      float value = filter[base] + model->bias[class];
+      for (int channel = 0; channel < base; channel++)
+        value += features[channel] * hidden_feature_scale * filter[channel];
+      logits[class] = value;
+    }
+    softmax(logits, config->classes, probability);
+    float sample_scale = class_weight[label[position]] / batch_weight;
+    for (int class = 0; class < config->classes; class++) {
+      float error = (probability[class] -
+                     (label[position] == class ? 1.0f : 0.0f)) * sample_scale;
+      const float *filter = model->weights + head_offset +
+        (size_t)class * per_class;
+      float *head_delta = head_gradient + (size_t)class * per_class;
+      for (int channel = 0; channel < base; channel++) {
+        head_delta[channel] += error * hidden_feature_scale * features[channel];
+        gradient_dec[0][(size_t)position * (size_t)base + (size_t)channel] +=
+          error * hidden_feature_scale * filter[channel];
+      }
+      head_delta[base] += error * 0.5f;
+    }
+  }
+  size_t encoder_end = model_head_offset(config) -
+    (size_t)(depth - 1) * conv_parameters(base, base, config->kernel_size);
+  size_t decoder_offset = encoder_end;
+  for (int level = depth - 2; level >= 0; level--) {
+    size_t cells = (size_t)cache->sizes[level] * (size_t)base;
+    float *gradient_up = checked_calloc(cells, sizeof(*gradient_up));
+    convolution_backward(cache->up[level], cache->dec[level],
+                         gradient_dec[level], cache->sizes[level], base, base,
+                         config->kernel_size,
+                         model->weights + decoder_offset, gradient_up,
+                         learning_rate);
+    for (int64_t position_at_level = 0;
+         position_at_level < cache->sizes[level]; position_at_level++)
+      for (int channel = 0; channel < base; channel++) {
+        size_t index = (size_t)position_at_level * (size_t)base +
+                      (size_t)channel;
+        gradient_enc[level][index] += gradient_up[index];
+        gradient_dec[level + 1][(size_t)(position_at_level / 2) *
+                                (size_t)base + (size_t)channel] +=
+          gradient_up[index];
+      }
+    free(gradient_up);
+    decoder_offset += conv_parameters(base, base, config->kernel_size);
+  }
+  for (int channel = 0; channel < base; channel++)
+    for (int64_t position_at_level = 0;
+         position_at_level < cache->sizes[depth - 1]; position_at_level++)
+      gradient_enc[depth - 1][(size_t)position_at_level * (size_t)base +
+                              (size_t)channel] +=
+        gradient_dec[depth - 1][(size_t)position_at_level * (size_t)base +
+                                (size_t)channel];
+  for (int level = depth - 1; level >= 0; level--) {
+    float *gradient_down = NULL;
+    if (level > 0)
+      gradient_down = checked_calloc(
+        (size_t)cache->sizes[level] * (size_t)base, sizeof(*gradient_down));
+    convolution_backward(
+      level ? cache->down[level] : cache->padded_input, cache->enc[level],
+      gradient_enc[level], cache->sizes[level],
+      level ? base : config->input_channels, base, config->kernel_size,
+      model->weights + encoder_offset(config, level), gradient_down,
+      learning_rate);
+    if (level > 0) {
+      for (int64_t position_at_level = 0;
+           position_at_level < cache->sizes[level]; position_at_level++)
+        for (int channel = 0; channel < base; channel++) {
+          float gradient = gradient_down[(size_t)position_at_level *
+                                         (size_t)base + (size_t)channel] * 0.5f;
+          gradient_enc[level - 1][(size_t)(position_at_level * 2) *
+                                  (size_t)base + (size_t)channel] += gradient;
+          gradient_enc[level - 1][(size_t)(position_at_level * 2 + 1) *
+                                  (size_t)base + (size_t)channel] += gradient;
+        }
+      free(gradient_down);
+    }
+  }
+  for (int level = 0; level < depth; level++) {
+    free(gradient_dec[level]);
+    free(gradient_enc[level]);
+  }
+  for (int class = 0; class < config->classes; class++) {
+    float *filter = model->weights + head_offset + (size_t)class * per_class;
+    float *head_delta = head_gradient + (size_t)class * per_class;
+    for (size_t parameter = 0; parameter < per_class; parameter++)
+      filter[parameter] -= learning_rate * head_delta[parameter];
+    model->bias[class] -= learning_rate * head_delta[base];
+  }
+  free(head_gradient);
+  free(gradient_dec);
+  free(gradient_enc);
+}
+
 static int model_features(const AnnoModel *model, const float *input,
                           int64_t length, float **features_out) {
   const AnnoUnetConfig *config = &model->config;
@@ -611,6 +882,8 @@ static int model_features(const AnnoModel *model, const float *input,
   float *features = checked_calloc((size_t)length * (size_t)base,
                                    sizeof(*features));
   memcpy(features, current, (size_t)length * (size_t)base * sizeof(*features));
+  for (size_t i = 0; i < (size_t)length * (size_t)base; i++)
+    features[i] *= hidden_feature_scale;
   if (current_owned) free(current);
   for (int level = 0; level < config->depth; level++) free(enc[level]);
   free(enc);
@@ -671,20 +944,29 @@ int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
   if (!model || !input || !label || length <= 0 || iterations < 1 ||
       batch_size < 1 || !(learning_rate > 0.0f) || !isfinite(learning_rate))
     return EINVAL;
-  float *features = NULL;
-  int status = model_features(model, input, length, &features);
-  if (status) return status;
   int64_t *order = checked_calloc((size_t)length, sizeof(*order));
-  float probability[ANNO_CLASSES], logits[ANNO_CLASSES];
-  size_t offset = model_head_offset(&model->config);
-  size_t per_class = (size_t)model->config.base_channels + 1;
+  int64_t class_counts[ANNO_CLASSES] = {0};
+  for (int64_t position = 0; position < length; position++) {
+    if (label[position] >= ANNO_CLASSES) {
+      free(order);
+      return EINVAL;
+    }
+    class_counts[label[position]]++;
+  }
+  float class_weight[ANNO_CLASSES];
+  for (int class = 0; class < ANNO_CLASSES; class++)
+    class_weight[class] = class_counts[class]
+      ? (float)length / ((float)ANNO_CLASSES * (float)class_counts[class])
+      : 0.0f;
   for (int iteration = 0; iteration < iterations; iteration++) {
+    AnnoForwardCache cache = {0};
+    int status = forward_cache_create(model, input, length, &cache);
+    if (status) {
+      free(order);
+      return status;
+    }
     for (int64_t position = 0; position < length; position++)
-      if (label[position] >= ANNO_CLASSES) {
-        free(order);
-        free(features);
-        return EINVAL;
-      } else order[position] = position;
+      order[position] = position;
     for (int64_t position = length - 1; position > 0; position--) {
       int64_t swap = (int64_t)(random_u32(&seed) % (uint64_t)(position + 1));
       int64_t temporary = order[position];
@@ -695,36 +977,17 @@ int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
          batch_start += batch_size) {
       int64_t batch_end = batch_start + batch_size;
       if (batch_end > length) batch_end = length;
-      float scale = learning_rate / (float)(batch_end - batch_start);
+      float batch_weight = 0.0f;
       for (int64_t batch_position = batch_start; batch_position < batch_end;
-           batch_position++) {
-        int64_t position = order[batch_position];
-        const float *features_at = features +
-          (size_t)position * (size_t)model->config.base_channels;
-        for (int class = 0; class < model->config.classes; class++) {
-          const float *filter = model->weights + offset +
-            (size_t)class * per_class;
-          logits[class] = filter[model->config.base_channels] +
-            model->bias[class];
-          for (int channel = 0; channel < model->config.base_channels; channel++)
-            logits[class] += features_at[channel] * filter[channel];
-        }
-        softmax(logits, model->config.classes, probability);
-        for (int class = 0; class < model->config.classes; class++) {
-          float error = probability[class] -
-            (label[position] == class ? 1.0f : 0.0f);
-          size_t weight = offset + (size_t)class * per_class;
-          model->bias[class] -= scale * error;
-          model->weights[weight + model->config.base_channels] -= scale * error;
-          for (int channel = 0; channel < model->config.base_channels; channel++)
-            model->weights[weight + (size_t)channel] -=
-              scale * error * features_at[channel];
-        }
-      }
+           batch_position++)
+        batch_weight += class_weight[label[order[batch_position]]];
+      if (!(batch_weight > 0.0f)) continue;
+      train_cached_batch(model, &cache, order, batch_start, batch_end, label,
+                         class_weight, batch_weight, learning_rate);
     }
+    forward_cache_free(&cache, model->config.depth);
   }
   free(order);
-  free(features);
   return 0;
 }
 
@@ -828,8 +1091,7 @@ int anno_grammar_transition(uint8_t previous, uint8_t current) {
     return current == ANNO_STATE_PLUS_5UTR || current == ANNO_STATE_PLUS_EXON ||
            current == ANNO_STATE_MINUS_5UTR || current == ANNO_STATE_MINUS_EXON;
   if (current == ANNO_STATE_INTERGENIC)
-    return previous == ANNO_STATE_PLUS_EXON || previous == ANNO_STATE_PLUS_3UTR ||
-           previous == ANNO_STATE_MINUS_EXON ||
+    return previous == ANNO_STATE_PLUS_3UTR ||
            previous == ANNO_STATE_MINUS_3UTR;
   if (previous == ANNO_STATE_PLUS_5UTR) return current == ANNO_STATE_PLUS_EXON;
   if (previous == ANNO_STATE_PLUS_EXON)
@@ -914,11 +1176,12 @@ int anno_grammar_decode(const float *probability, int64_t length,
       if (state != ANNO_STATE_INTERGENIC &&
           run + 1 < (state_is_intron((uint8_t)state) ? min_intron : min_exon))
         continue;
+      if (state == ANNO_STATE_PLUS_5UTR ||
+          state == ANNO_STATE_PLUS_INTRON ||
+          state == ANNO_STATE_MINUS_5UTR ||
+          state == ANNO_STATE_MINUS_INTRON)
+        continue;
       float score = scores[CELL(length - 1, state, run)];
-      if (state != ANNO_STATE_INTERGENIC &&
-          state != ANNO_STATE_PLUS_3UTR && state != ANNO_STATE_MINUS_3UTR &&
-          state != ANNO_STATE_PLUS_EXON && state != ANNO_STATE_MINUS_EXON)
-        score -= 1.0f;
       if (score > best) {
         best = score;
         best_state = state;
@@ -1177,10 +1440,10 @@ static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
           model->metadata.feature_std[4 + channel];
     }
     float *probability = checked_calloc((size_t)sequence->length * ANNO_CLASSES,
-                                        sizeof(*probability));
+                                          sizeof(*probability));
     uint8_t *path = checked_calloc((size_t)sequence->length, 1);
     if (anno_model_predict(model, input, sequence->length, probability) ||
-        !anno_grammar_decode(probability, sequence->length, 3, 3, path))
+        !anno_grammar_decode(probability, sequence->length, 9, 3, path))
       fail("UNet decoding failed for %s", sequence->name);
     if (writer.files[0]) {
       for (int class = 0; class < ANNO_CLASSES; class++) {
@@ -1248,8 +1511,7 @@ static void compute_metadata(Sequence *sequences, int count,
   long double sums[7] = {0}, squares[7] = {0};
   uint64_t total = 0;
   for (int i = 0; i < count; i++) {
-    int64_t limit = sequences[i].length - sequences[i].length / 5;
-    for (int64_t position = 0; position < limit; position++) {
+    for (int64_t position = 0; position < sequences[i].length; position++) {
       int base = base_index(sequences[i].sequence[position]);
       total++;
       for (int channel = 0; channel < 7; channel++) {
@@ -1282,11 +1544,11 @@ static AnnoModel *train_model(const Options *options, Sequence *sequences,
   compute_metadata(sequences, count, &model->metadata);
   for (int i = 0; i < count; i++) {
     float *input = normalized_features(sequences + i, &model->metadata);
-    int64_t training_length = sequences[i].length -
-                              sequences[i].length / 5;
-    if (training_length < 1) training_length = sequences[i].length;
+    int64_t training_length = sequences[i].length;
+    int training_batch_size = training_length > INT_MAX
+      ? INT_MAX : (int)training_length;
     if (anno_model_train(model, input, sequences[i].labels, training_length,
-                         options->iterations, ANNO_CWT_WINDOW, 0.01f,
+                         options->iterations, training_batch_size, 0.05f,
                          (uint64_t)i + 1))
       fail("training failed for %s", sequences[i].name);
     free(input);
@@ -1365,21 +1627,31 @@ static int self_test(void) {
   if (!model) return 0;
   float input[17 * 7] = {0};
   float probability[17 * ANNO_CLASSES];
+  uint8_t labels[17];
+  for (int position = 0; position < 17; position++) {
+    input[position * 7 + position % 4] = 1.0f;
+    input[position * 7 + 4 + position % ANNO_CWT_CHANNELS] =
+      (float)(position + 1) / 17.0f;
+    labels[position] = (uint8_t)(position % 4);
+  }
   if (anno_model_predict(model, input, 17, probability)) {
     anno_model_destroy(model);
     return 0;
   }
+  int variable = 0;
   for (int i = 0; i < 17; i++) {
     float sum = 0.0f;
     for (int class = 0; class < ANNO_CLASSES; class++)
       sum += probability[i * ANNO_CLASSES + class];
+    if (i && fabsf(probability[i * ANNO_CLASSES] - probability[0]) > 1e-7f)
+      variable = 1;
     if (!isfinite(sum) || fabsf(sum - 1.0f) > 1e-5f) {
       anno_model_destroy(model);
       return 0;
     }
   }
-  uint8_t labels[17] = {0};
-  if (anno_model_train(model, input, labels, 17, 10, 17, 0.1f, 1) ||
+  if (!variable ||
+      anno_model_train(model, input, labels, 17, 10, 17, 0.1f, 1) ||
       anno_model_save(model, "/tmp/anno-7-state-test.model")) {
     anno_model_destroy(model);
     return 0;
