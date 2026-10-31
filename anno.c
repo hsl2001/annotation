@@ -23,15 +23,14 @@ static const char *const class_names[ANNO_CLASSES] = {
 };
 static const uint32_t cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 static const char model_magic[8] = {'A', 'N', 'N', 'O', '7', 'S', 'T', '1'};
-static const uint32_t model_version = 2;
+static const uint32_t model_version = 4;
 static const uint32_t model_endian = 0x01020304u;
-static const float hidden_feature_scale = 32.0f;
+static const float hidden_feature_scale = 1.0f;
 
 struct AnnoModel {
   AnnoUnetConfig config;
   AnnoModelMetadata metadata;
   float *weights;
-  float *bias;
 };
 
 typedef struct {
@@ -362,6 +361,37 @@ static uint8_t explicit_label(const Feature *feature) {
   return ANNO_INTERGENIC;
 }
 
+static int same_transcript(const Feature *left, const Feature *right) {
+  return left->parent && right->parent &&
+         !strcmp(left->seqid, right->seqid) &&
+         !strcmp(left->parent, right->parent) &&
+         left->strand == right->strand;
+}
+
+static int transcript_has_exon(const FeatureList *features,
+                               const Feature *target) {
+  for (size_t i = 0; i < features->count; i++)
+    if (features->items[i].kind == FEATURE_EXON &&
+        same_transcript(&features->items[i], target))
+      return 1;
+  return 0;
+}
+
+static int transcript_coding_bounds(const FeatureList *features,
+                                    const Feature *target, int64_t *start,
+                                    int64_t *end) {
+  int found = 0;
+  for (size_t i = 0; i < features->count; i++) {
+    const Feature *feature = &features->items[i];
+    if (feature->kind != FEATURE_CDS || !same_transcript(feature, target))
+      continue;
+    if (!found || feature->start < *start) *start = feature->start;
+    if (!found || feature->end > *end) *end = feature->end;
+    found = 1;
+  }
+  return found;
+}
+
 static void mark_labels(Sequence *sequences, int sequence_count,
                         const FeatureList *features) {
   for (int i = 0; i < sequence_count; i++)
@@ -375,25 +405,43 @@ static void mark_labels(Sequence *sequences, int sequence_count,
       sequences[sequence].labels[position] = label;
   }
   for (size_t i = 0; i < features->count; i++) {
-    const Feature *left = &features->items[i];
-    if (left->kind != FEATURE_EXON && left->kind != FEATURE_CDS) continue;
-    int sequence = sequence_index(sequences, sequence_count, left->seqid);
-    for (size_t j = i + 1; j < features->count; j++) {
-      const Feature *right = &features->items[j];
-      if (right->kind != left->kind || strcmp(right->seqid, left->seqid) ||
-          strcmp(right->parent, left->parent) || right->strand != left->strand)
+    const Feature *feature = &features->items[i];
+    if (feature->kind != FEATURE_EXON &&
+        (feature->kind != FEATURE_CDS || transcript_has_exon(features, feature)))
+      continue;
+    const Feature *next = NULL;
+    for (size_t j = 0; j < features->count; j++) {
+      const Feature *candidate = &features->items[j];
+      if (candidate->kind != feature->kind ||
+          !same_transcript(feature, candidate) ||
+          candidate->start < feature->end)
         continue;
-      const Feature *first = left, *second = right;
-      if (first->start > second->start) {
-        first = right;
-        second = left;
-      }
-      if (first->end >= second->start) continue;
-      uint8_t label = first->strand == '+' ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
-      for (int64_t position = first->end; position < second->start; position++)
-        if (!sequences[sequence].labels[position])
-          sequences[sequence].labels[position] = label;
-      break;
+      if (!next || candidate->start < next->start) next = candidate;
+    }
+    if (!next) continue;
+    int sequence = sequence_index(sequences, sequence_count, feature->seqid);
+    uint8_t label = feature->strand == '+'
+      ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
+    for (int64_t position = feature->end; position < next->start; position++)
+      if (!sequences[sequence].labels[position])
+        sequences[sequence].labels[position] = label;
+  }
+  for (size_t i = 0; i < features->count; i++) {
+    const Feature *feature = &features->items[i];
+    if (feature->kind != FEATURE_EXON) continue;
+    int64_t coding_start = 0, coding_end = 0;
+    if (!transcript_coding_bounds(features, feature, &coding_start, &coding_end))
+      continue;
+    int sequence = sequence_index(sequences, sequence_count, feature->seqid);
+    uint8_t five_prime = feature->strand == '+'
+      ? ANNO_PLUS_5UTR : ANNO_MINUS_5UTR;
+    uint8_t three_prime = feature->strand == '+'
+      ? ANNO_PLUS_3UTR : ANNO_MINUS_3UTR;
+    for (int64_t position = feature->start; position < feature->end; position++) {
+      uint8_t label = position < coding_start ? five_prime
+        : position >= coding_end ? three_prime : ANNO_INTERGENIC;
+      if (label && !sequences[sequence].labels[position])
+        sequences[sequence].labels[position] = label;
     }
   }
 }
@@ -497,6 +545,24 @@ static uint32_t random_u32(uint64_t *state) {
   return (uint32_t)(value * 2685821657736338717ULL >> 32);
 }
 
+static float random_uniform(uint64_t *state, float lower, float upper) {
+  float unit = (float)random_u32(state) / (float)UINT32_MAX;
+  return lower + (upper - lower) * unit;
+}
+
+static void initialize_convolution(float *weights, int input_channels,
+                                   int output_channels, int kernel,
+                                   uint64_t *seed) {
+  size_t per_output = (size_t)input_channels * (size_t)kernel + 1;
+  float bound = sqrtf(6.0f / (float)(input_channels * kernel));
+  for (int output = 0; output < output_channels; output++) {
+    float *filter = weights + (size_t)output * per_output;
+    for (int parameter = 0; parameter < input_channels * kernel; parameter++)
+      filter[parameter] = random_uniform(seed, -bound, bound);
+    filter[input_channels * kernel] = 0.0f;
+  }
+}
+
 AnnoModel *anno_model_create(const AnnoUnetConfig *config) {
   if (!valid_config(config)) return NULL;
   AnnoModel *model = checked_calloc(1, sizeof(*model));
@@ -510,18 +576,32 @@ AnnoModel *anno_model_create(const AnnoUnetConfig *config) {
              sizeof(model->metadata.class_names[class]), "%s", class_names[class]);
   size_t parameters = model_parameters(config);
   model->weights = checked_calloc(parameters, sizeof(*model->weights));
-  model->bias = checked_calloc(config->classes, sizeof(*model->bias));
   uint64_t seed = 0x853c49e6748fea9bULL;
-  for (size_t i = 0; i < parameters; i++)
-    model->weights[i] =
-      ((float)(random_u32(&seed) & 0xffffu) / 32768.0f - 1.0f) * 0.02f;
+  size_t offset = 0;
+  initialize_convolution(model->weights + offset, config->input_channels,
+                         config->base_channels, config->kernel_size, &seed);
+  offset += conv_parameters(config->input_channels, config->base_channels,
+                            config->kernel_size);
+  for (int level = 1; level < config->depth; level++) {
+    initialize_convolution(model->weights + offset, config->base_channels,
+                           config->base_channels, config->kernel_size, &seed);
+    offset += conv_parameters(config->base_channels, config->base_channels,
+                              config->kernel_size);
+  }
+  for (int level = 1; level < config->depth; level++) {
+    initialize_convolution(model->weights + offset, config->base_channels,
+                           config->base_channels, config->kernel_size, &seed);
+    offset += conv_parameters(config->base_channels, config->base_channels,
+                              config->kernel_size);
+  }
+  initialize_convolution(model->weights + offset, config->base_channels,
+                         config->classes, 1, &seed);
   return model;
 }
 
 void anno_model_destroy(AnnoModel *model) {
   if (!model) return;
   free(model->weights);
-  free(model->bias);
   free(model);
 }
 
@@ -652,7 +732,7 @@ static void convolution_backward(const float *input, const float *output,
                                  const float *gradient_output, int64_t length,
                                  int input_channels, int output_channels,
                                  int kernel, float *weights, float *gradient_input,
-                                 float learning_rate) {
+                                 float *gradient_weights) {
   int radius = kernel / 2;
   size_t per_output = (size_t)input_channels * (size_t)kernel + 1;
   for (int64_t position = 0; position < length; position++)
@@ -674,13 +754,23 @@ static void convolution_backward(const float *input, const float *output,
             gradient_input[(size_t)source * (size_t)input_channels +
                            (size_t)input_channel] += delta * old_weight;
           if (source >= 0 && source < length)
-            filter[index] -= learning_rate * delta *
-              input[(size_t)source * (size_t)input_channels +
-                    (size_t)input_channel];
+            gradient_weights[(size_t)output_channel * per_output + index] +=
+              delta * input[(size_t)source * (size_t)input_channels +
+                            (size_t)input_channel];
           index++;
         }
-      filter[input_channels * kernel] -= learning_rate * delta;
+      gradient_weights[(size_t)output_channel * per_output +
+                       (size_t)input_channels * (size_t)kernel] += delta;
     }
+}
+
+static void apply_convolution_gradient(float *weights,
+                                       const float *gradient_weights,
+                                       int input_channels, int output_channels,
+                                       int kernel, float learning_rate) {
+  size_t parameters = conv_parameters(input_channels, output_channels, kernel);
+  for (size_t parameter = 0; parameter < parameters; parameter++)
+    weights[parameter] -= learning_rate * gradient_weights[parameter];
 }
 
 static size_t encoder_offset(const AnnoUnetConfig *config, int level) {
@@ -722,7 +812,7 @@ static void train_cached_batch(AnnoModel *model,
     for (int class = 0; class < config->classes; class++) {
       const float *filter = model->weights + head_offset +
         (size_t)class * per_class;
-      float value = filter[base] + model->bias[class];
+      float value = filter[base];
       for (int channel = 0; channel < base; channel++)
         value += features[channel] * hidden_feature_scale * filter[channel];
       logits[class] = value;
@@ -740,7 +830,7 @@ static void train_cached_batch(AnnoModel *model,
         gradient_dec[0][(size_t)position * (size_t)base + (size_t)channel] +=
           error * hidden_feature_scale * filter[channel];
       }
-      head_delta[base] += error * 0.5f;
+      head_delta[base] += error;
     }
   }
   size_t encoder_end = model_head_offset(config) -
@@ -749,11 +839,16 @@ static void train_cached_batch(AnnoModel *model,
   for (int level = depth - 2; level >= 0; level--) {
     size_t cells = (size_t)cache->sizes[level] * (size_t)base;
     float *gradient_up = checked_calloc(cells, sizeof(*gradient_up));
+    size_t parameters = conv_parameters(base, base, config->kernel_size);
+    float *gradient_weights = checked_calloc(parameters, sizeof(*gradient_weights));
     convolution_backward(cache->up[level], cache->dec[level],
                          gradient_dec[level], cache->sizes[level], base, base,
                          config->kernel_size,
                          model->weights + decoder_offset, gradient_up,
-                         learning_rate);
+                         gradient_weights);
+    apply_convolution_gradient(model->weights + decoder_offset, gradient_weights,
+                               base, base, config->kernel_size, learning_rate);
+    free(gradient_weights);
     for (int64_t position_at_level = 0;
          position_at_level < cache->sizes[level]; position_at_level++)
       for (int channel = 0; channel < base; channel++) {
@@ -779,12 +874,20 @@ static void train_cached_batch(AnnoModel *model,
     if (level > 0)
       gradient_down = checked_calloc(
         (size_t)cache->sizes[level] * (size_t)base, sizeof(*gradient_down));
+    int input_channels = level ? base : config->input_channels;
+    size_t parameters = conv_parameters(input_channels, base,
+                                        config->kernel_size);
+    float *gradient_weights = checked_calloc(parameters, sizeof(*gradient_weights));
     convolution_backward(
       level ? cache->down[level] : cache->padded_input, cache->enc[level],
       gradient_enc[level], cache->sizes[level],
-      level ? base : config->input_channels, base, config->kernel_size,
+      input_channels, base, config->kernel_size,
       model->weights + encoder_offset(config, level), gradient_down,
-      learning_rate);
+      gradient_weights);
+    apply_convolution_gradient(model->weights + encoder_offset(config, level),
+                               gradient_weights, input_channels, base,
+                               config->kernel_size, learning_rate);
+    free(gradient_weights);
     if (level > 0) {
       for (int64_t position_at_level = 0;
            position_at_level < cache->sizes[level]; position_at_level++)
@@ -808,7 +911,6 @@ static void train_cached_batch(AnnoModel *model,
     float *head_delta = head_gradient + (size_t)class * per_class;
     for (size_t parameter = 0; parameter < per_class; parameter++)
       filter[parameter] -= learning_rate * head_delta[parameter];
-    model->bias[class] -= learning_rate * head_delta[base];
   }
   free(head_gradient);
   free(gradient_dec);
@@ -928,7 +1030,7 @@ int anno_model_predict(const AnnoModel *model, const float *input,
       for (int channel = 0; channel < model->config.base_channels; channel++)
         value += features[(size_t)position * (size_t)model->config.base_channels +
                           (size_t)channel] * filter[channel];
-      logits[class] = value + model->bias[class];
+      logits[class] = value;
     }
     softmax(logits, model->config.classes, values);
     memcpy(probability + (size_t)position * ANNO_CLASSES, values,
@@ -1003,8 +1105,6 @@ static uint32_t model_checksum(const AnnoModel *model) {
   checksum = checksum_update(checksum, &model->metadata, sizeof(model->metadata));
   checksum = checksum_update(checksum, model->weights,
                              model_parameters(&model->config) * sizeof(float));
-  checksum = checksum_update(checksum, model->bias,
-                             (size_t)model->config.classes * sizeof(float));
   return checksum;
 }
 
@@ -1025,9 +1125,7 @@ int anno_model_save(const AnnoModel *model, const char *path) {
   int ok = fwrite(model_magic, 1, sizeof(model_magic), file) == sizeof(model_magic) &&
            fwrite(header, sizeof(*header), 10, file) == 10 &&
            fwrite(&model->metadata, sizeof(model->metadata), 1, file) == 1 &&
-           fwrite(model->weights, sizeof(float), parameters, file) == parameters &&
-           fwrite(model->bias, sizeof(float), (size_t)model->config.classes,
-                  file) == (size_t)model->config.classes;
+           fwrite(model->weights, sizeof(float), parameters, file) == parameters;
   int close_status = fclose(file);
   return ok && close_status == 0 ? 0 : EIO;
 }
@@ -1060,8 +1158,7 @@ int anno_model_load(AnnoModel **model_out, const char *path) {
   }
   ok = fread(&model->metadata, sizeof(model->metadata), 1, file) == 1 &&
        fread(model->weights, sizeof(float), header[7], file) == header[7] &&
-       fread(model->bias, sizeof(float), (size_t)config.classes, file) ==
-         (size_t)config.classes && fgetc(file) == EOF;
+       fgetc(file) == EOF;
   int close_status = fclose(file);
   if (!ok || close_status || model->metadata.window_size != header[8] ||
       !valid_metadata(&model->metadata) ||
@@ -1092,7 +1189,9 @@ int anno_grammar_transition(uint8_t previous, uint8_t current) {
            current == ANNO_STATE_MINUS_5UTR || current == ANNO_STATE_MINUS_EXON;
   if (current == ANNO_STATE_INTERGENIC)
     return previous == ANNO_STATE_PLUS_3UTR ||
-           previous == ANNO_STATE_MINUS_3UTR;
+           previous == ANNO_STATE_MINUS_3UTR ||
+           previous == ANNO_STATE_PLUS_EXON ||
+           previous == ANNO_STATE_MINUS_EXON;
   if (previous == ANNO_STATE_PLUS_5UTR) return current == ANNO_STATE_PLUS_EXON;
   if (previous == ANNO_STATE_PLUS_EXON)
     return current == ANNO_STATE_PLUS_INTRON || current == ANNO_STATE_PLUS_3UTR;
@@ -1113,62 +1212,103 @@ int anno_grammar_decode(const float *probability, int64_t length,
   if (!probability || !path || length < 1 || min_exon < 1 || min_intron < 1)
     return 0;
   int max_run = min_exon > min_intron ? min_exon : min_intron;
-  size_t cells = (size_t)length * ANNO_DECODED_STATES * (size_t)max_run;
-  if ((size_t)length > SIZE_MAX / ANNO_DECODED_STATES ||
-      cells > SIZE_MAX / sizeof(float) || cells > SIZE_MAX / sizeof(int16_t))
+  size_t row_cells = (size_t)ANNO_DECODED_STATES * (size_t)max_run;
+  if (max_run > UINT16_MAX / ANNO_DECODED_STATES ||
+      row_cells > SIZE_MAX / sizeof(float))
     return 0;
-  float *scores = malloc(cells * sizeof(*scores));
-  int16_t *backs = malloc(cells * sizeof(*backs));
-  if (!scores || !backs) {
-    free(scores);
+  const int64_t block_size = 8192;
+  int64_t block_count = (length + block_size - 1) / block_size;
+  if ((size_t)block_count > SIZE_MAX / row_cells ||
+      (size_t)block_count * row_cells > SIZE_MAX / sizeof(float))
+    return 0;
+  float *checkpoints = malloc((size_t)block_count * row_cells *
+                              sizeof(*checkpoints));
+  float *previous = malloc(row_cells * sizeof(*previous));
+  float *current = malloc(row_cells * sizeof(*current));
+  if (block_size > SIZE_MAX / row_cells ||
+      (size_t)block_size * row_cells > SIZE_MAX / sizeof(uint16_t)) {
+    free(checkpoints);
+    free(previous);
+    free(current);
+    return 0;
+  }
+  size_t block_cells = (size_t)block_size * row_cells;
+  uint16_t *backs = malloc(block_cells * sizeof(*backs));
+  if (!checkpoints || !previous || !current || !backs) {
+    free(checkpoints);
+    free(previous);
+    free(current);
     free(backs);
     return 0;
   }
-#define CELL(position, state, run) \
-  (((size_t)(position) * ANNO_DECODED_STATES + (state)) * (size_t)max_run + \
-   (size_t)(run))
-  for (size_t i = 0; i < cells; i++) {
-    scores[i] = -INFINITY;
-    backs[i] = -1;
-  }
-  for (int state = 0; state < ANNO_DECODED_STATES; state++) {
-    if (state != ANNO_STATE_INTERGENIC && state != ANNO_STATE_PLUS_5UTR &&
-        state != ANNO_STATE_PLUS_EXON && state != ANNO_STATE_MINUS_5UTR &&
-        state != ANNO_STATE_MINUS_EXON)
-      continue;
-    int class = anno_class_for_state((uint8_t)state);
-    float value = probability[class] > FLT_MIN && isfinite(probability[class])
-      ? probability[class] : FLT_MIN;
-    scores[CELL(0, state, 0)] = logf(value);
-  }
-  for (int64_t position = 1; position < length; position++)
-    for (int state = 0; state < ANNO_DECODED_STATES; state++) {
-      int class = anno_class_for_state((uint8_t)state);
-      float value = probability[(size_t)position * ANNO_CLASSES + (size_t)class];
-      float node = logf(value > FLT_MIN && isfinite(value) ? value : FLT_MIN);
-      for (int previous = 0; previous < ANNO_DECODED_STATES; previous++)
-        for (int run = 0; run < max_run; run++) {
-          float previous_score = scores[CELL(position - 1, previous, run)];
-          if (!isfinite(previous_score)) continue;
-          if (state == previous) {
-            int next_run = run + 1 < max_run ? run + 1 : max_run - 1;
-            size_t cell = CELL(position, state, next_run);
-            if (previous_score + node > scores[cell]) {
-              scores[cell] = previous_score + node;
-              backs[cell] = (int16_t)(previous * max_run + run);
+  size_t row_bytes = row_cells * sizeof(*previous);
+  for (int64_t block = 0; block < block_count; block++) {
+    int64_t start = block * block_size;
+    int64_t end = start + block_size;
+    if (end > length) end = length;
+    if (!block) {
+      for (size_t cell = 0; cell < row_cells; cell++) previous[cell] = -INFINITY;
+      for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+        if (state != ANNO_STATE_INTERGENIC &&
+            state != ANNO_STATE_PLUS_5UTR &&
+            state != ANNO_STATE_PLUS_EXON &&
+            state != ANNO_STATE_MINUS_5UTR &&
+            state != ANNO_STATE_MINUS_EXON)
+          continue;
+        int class = anno_class_for_state((uint8_t)state);
+        float value = probability[class] > FLT_MIN &&
+          isfinite(probability[class]) ? probability[class] : FLT_MIN;
+        previous[(size_t)state * (size_t)max_run] = logf(value);
+      }
+      start++;
+    } else {
+      memcpy(previous, checkpoints + (size_t)(block - 1) * row_cells, row_bytes);
+    }
+    for (int64_t position = start; position < end; position++) {
+      for (size_t cell = 0; cell < row_cells; cell++) {
+        current[cell] = -INFINITY;
+        backs[(size_t)(position - block * block_size) * row_cells + cell] =
+          UINT16_MAX;
+      }
+      for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+        int class = anno_class_for_state((uint8_t)state);
+        float value = probability[(size_t)position * ANNO_CLASSES +
+                                  (size_t)class];
+        float node = logf(value > FLT_MIN && isfinite(value) ? value : FLT_MIN);
+        for (int previous_state = 0;
+             previous_state < ANNO_DECODED_STATES; previous_state++)
+          for (int run = 0; run < max_run; run++) {
+            size_t previous_cell = (size_t)previous_state * (size_t)max_run +
+                                   (size_t)run;
+            float previous_score = previous[previous_cell];
+            if (!isfinite(previous_score)) continue;
+            int next_run = -1;
+            if (state == previous_state) {
+              next_run = run + 1 < max_run ? run + 1 : max_run - 1;
+            } else if (anno_grammar_transition((uint8_t)previous_state,
+                                                (uint8_t)state) &&
+                       (previous_state == ANNO_STATE_INTERGENIC ||
+                        run + 1 >=
+                          (state_is_intron((uint8_t)previous_state)
+                             ? min_intron : min_exon))) {
+              next_run = 0;
             }
-          } else if (anno_grammar_transition((uint8_t)previous, (uint8_t)state) &&
-                     (previous == ANNO_STATE_INTERGENIC ||
-                      run + 1 >= (state_is_intron((uint8_t)previous)
-                                    ? min_intron : min_exon))) {
-            size_t cell = CELL(position, state, 0);
-            if (previous_score + node > scores[cell]) {
-              scores[cell] = previous_score + node;
-              backs[cell] = (int16_t)(previous * max_run + run);
+            if (next_run < 0) continue;
+            size_t cell = (size_t)state * (size_t)max_run +
+                          (size_t)next_run;
+            if (previous_score + node > current[cell]) {
+              current[cell] = previous_score + node;
+              backs[(size_t)(position - block * block_size) * row_cells + cell] =
+                (uint16_t)(previous_state * max_run + run);
             }
           }
-        }
+      }
+      float *swap = previous;
+      previous = current;
+      current = swap;
     }
+    memcpy(checkpoints + (size_t)block * row_cells, previous, row_bytes);
+  }
   int best_state = ANNO_STATE_INTERGENIC, best_run = 0;
   float best = -INFINITY;
   for (int state = 0; state < ANNO_DECODED_STATES; state++)
@@ -1181,7 +1321,8 @@ int anno_grammar_decode(const float *probability, int64_t length,
           state == ANNO_STATE_MINUS_5UTR ||
           state == ANNO_STATE_MINUS_INTRON)
         continue;
-      float score = scores[CELL(length - 1, state, run)];
+      float score = checkpoints[(size_t)(block_count - 1) * row_cells +
+                               (size_t)state * (size_t)max_run + (size_t)run];
       if (score > best) {
         best = score;
         best_state = state;
@@ -1189,25 +1330,99 @@ int anno_grammar_decode(const float *probability, int64_t length,
       }
     }
   if (!isfinite(best)) {
-    free(scores);
+    free(checkpoints);
+    free(previous);
+    free(current);
     free(backs);
     return 0;
   }
-  for (int64_t position = length - 1; position >= 0; position--) {
-    path[position] = (uint8_t)best_state;
-    if (!position) break;
-    int16_t back = backs[CELL(position, best_state, best_run)];
-    if (back < 0) {
-      free(scores);
-      free(backs);
-      return 0;
+  for (int64_t block = block_count - 1; block >= 0; block--) {
+    int64_t start = block * block_size;
+    int64_t end = start + block_size;
+    if (end > length) end = length;
+    if (!block) {
+      for (size_t cell = 0; cell < row_cells; cell++) previous[cell] = -INFINITY;
+      for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+        if (state != ANNO_STATE_INTERGENIC &&
+            state != ANNO_STATE_PLUS_5UTR &&
+            state != ANNO_STATE_PLUS_EXON &&
+            state != ANNO_STATE_MINUS_5UTR &&
+            state != ANNO_STATE_MINUS_EXON)
+          continue;
+        int class = anno_class_for_state((uint8_t)state);
+        float value = probability[class] > FLT_MIN &&
+          isfinite(probability[class]) ? probability[class] : FLT_MIN;
+        previous[(size_t)state * (size_t)max_run] = logf(value);
+      }
+      start++;
+    } else {
+      memcpy(previous, checkpoints + (size_t)(block - 1) * row_cells, row_bytes);
     }
-    best_state = back / max_run;
-    best_run = back % max_run;
+    for (int64_t position = start; position < end; position++) {
+      for (size_t cell = 0; cell < row_cells; cell++) {
+        current[cell] = -INFINITY;
+        backs[(size_t)(position - block * block_size) * row_cells + cell] =
+          UINT16_MAX;
+      }
+      for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+        int class = anno_class_for_state((uint8_t)state);
+        float value = probability[(size_t)position * ANNO_CLASSES +
+                                  (size_t)class];
+        float node = logf(value > FLT_MIN && isfinite(value) ? value : FLT_MIN);
+        for (int previous_state = 0;
+             previous_state < ANNO_DECODED_STATES; previous_state++)
+          for (int run = 0; run < max_run; run++) {
+            size_t previous_cell = (size_t)previous_state * (size_t)max_run +
+                                   (size_t)run;
+            float previous_score = previous[previous_cell];
+            if (!isfinite(previous_score)) continue;
+            int next_run = -1;
+            if (state == previous_state) {
+              next_run = run + 1 < max_run ? run + 1 : max_run - 1;
+            } else if (anno_grammar_transition((uint8_t)previous_state,
+                                                (uint8_t)state) &&
+                       (previous_state == ANNO_STATE_INTERGENIC ||
+                        run + 1 >=
+                          (state_is_intron((uint8_t)previous_state)
+                             ? min_intron : min_exon))) {
+              next_run = 0;
+            }
+            if (next_run < 0) continue;
+            size_t cell = (size_t)state * (size_t)max_run +
+                          (size_t)next_run;
+            if (previous_score + node > current[cell]) {
+              current[cell] = previous_score + node;
+              backs[(size_t)(position - block * block_size) * row_cells + cell] =
+                (uint16_t)(previous_state * max_run + run);
+            }
+          }
+      }
+      float *swap = previous;
+      previous = current;
+      current = swap;
+    }
+    for (int64_t position = end - 1; position >= block * block_size;
+         position--) {
+      path[position] = (uint8_t)best_state;
+      if (!position) break;
+      uint16_t back = backs[(size_t)(position - block * block_size) * row_cells +
+                            (size_t)best_state * (size_t)max_run +
+                            (size_t)best_run];
+      if (back == UINT16_MAX) {
+        free(checkpoints);
+        free(previous);
+        free(current);
+        free(backs);
+        return 0;
+      }
+      best_state = back / (uint16_t)max_run;
+      best_run = back % (uint16_t)max_run;
+    }
   }
-  free(scores);
+  free(checkpoints);
+  free(previous);
+  free(current);
   free(backs);
-#undef CELL
   return 1;
 }
 
@@ -1451,14 +1666,15 @@ static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
         float value = -1.0f;
         for (int64_t position = 0; position <= sequence->length; position++) {
           float next = position < sequence->length
-            ? roundf(probability[(size_t)position * ANNO_CLASSES + class] * 10000.0f) / 10000.0f
+            ? roundf(probability[(size_t)position * ANNO_CLASSES + class] *
+                     100000000.0f) / 100000000.0f
             : -1.0f;
           if (position == 0) {
             value = next;
             continue;
           }
           if (position < sequence->length && next == value) continue;
-          fprintf(writer.files[class], "%s\t%lld\t%lld\t%.4f\n",
+          fprintf(writer.files[class], "%s\t%lld\t%lld\t%.8f\n",
                   sequence->name, (long long)start, (long long)position, value);
           start = position;
           value = next;
@@ -1665,6 +1881,7 @@ static int self_test(void) {
   uint8_t path[] = {0, 1, 2, 2, 3, 3, 2, 4, 0};
   if (!anno_grammar_transition(0, 2) ||
       !anno_grammar_transition(2, 3) ||
+      !anno_grammar_transition(2, 0) ||
       anno_class_for_state(ANNO_STATE_MINUS_INTRON) != ANNO_MINUS_INTRON ||
       path[0] != ANNO_STATE_INTERGENIC)
     return 0;
