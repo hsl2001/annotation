@@ -346,6 +346,101 @@ def scores(tp, fp, fn):
     return precision, recall, f1
 
 
+def _feature_models(path, feature):
+    """Return transcript feature intervals without requiring a valid CDS."""
+    return transcript_intervals(path, feature)
+
+
+def _segment_set(models):
+    return {
+        (seqid, strand, start, end)
+        for _, (_, seqid, strand, intervals) in models.items()
+        for _, _, start, end in intervals
+    }
+
+
+def _locus_set(models):
+    spans = {}
+    for _, (gene, seqid, strand, intervals) in models.items():
+        key = (gene, seqid, strand)
+        start = min(interval[2] for interval in intervals)
+        end = max(interval[3] for interval in intervals)
+        previous = spans.get(key)
+        spans[key] = (min(start, previous[0]), max(end, previous[1])) if previous else (start, end)
+    return {(seqid, strand, start, end) for (_, seqid, strand), (start, end) in spans.items()}
+
+
+def _merged_intervals(models):
+    grouped = defaultdict(list)
+    for _, (_, seqid, strand, intervals) in models.items():
+        grouped[(seqid, strand)].extend((start, end) for _, _, start, end in intervals)
+    merged = []
+    for key, intervals in grouped.items():
+        intervals.sort()
+        for start, end in intervals:
+            if merged and merged[-1][0] == key and start <= merged[-1][2] + 1:
+                merged[-1] = (key[0], key[1], merged[-1][2], max(merged[-1][3], end))
+            else:
+                merged.append((key[0], key[1], start, end))
+    return merged
+
+
+def _covered_length(intervals):
+    return sum(end - start + 1 for _, _, start, end in intervals)
+
+
+def _overlap_length(reference, query):
+    ref_by_key = defaultdict(list)
+    query_by_key = defaultdict(list)
+    for seqid, strand, start, end in reference:
+        ref_by_key[(seqid, strand)].append((start, end))
+    for seqid, strand, start, end in query:
+        query_by_key[(seqid, strand)].append((start, end))
+    overlap = 0
+    for key, refs in ref_by_key.items():
+        queries = query_by_key.get(key, [])
+        i = j = 0
+        while i < len(refs) and j < len(queries):
+            overlap += max(0, min(refs[i][1], queries[j][1]) -
+                           max(refs[i][0], queries[j][0]) + 1)
+            if refs[i][1] < queries[j][1]:
+                i += 1
+            else:
+                j += 1
+    return overlap
+
+
+def annotation_metrics(reference, query):
+    """Compute exact segment, locus, and nucleotide metrics for GFF annotations."""
+    result = {}
+    for feature in ("exon", "cds", "five_prime_utr", "three_prime_utr"):
+        reference_models = _feature_models(reference, feature)
+        query_models = _feature_models(query, feature)
+        reference_segments = _segment_set(reference_models)
+        query_segments = _segment_set(query_models)
+        result[f"{feature}-segment"] = scores(
+            len(reference_segments & query_segments),
+            len(query_segments - reference_segments),
+            len(reference_segments - query_segments),
+        )
+        reference_bases = _merged_intervals(reference_models)
+        query_bases = _merged_intervals(query_models)
+        result[f"{feature}-nt"] = scores(
+            _overlap_length(reference_bases, query_bases),
+            _covered_length(query_bases) - _overlap_length(reference_bases, query_bases),
+            _covered_length(reference_bases) - _overlap_length(reference_bases, query_bases),
+        )
+    reference_loci = _locus_set(_feature_models(reference, "exon"))
+    query_loci = _locus_set(_feature_models(query, "exon"))
+    result["locus"] = scores(
+        len(reference_loci & query_loci),
+        len(query_loci - reference_loci),
+        len(reference_loci - query_loci),
+    )
+    result["nt"] = result["exon-nt"]
+    return result
+
+
 def genome_fasta(genome, workdir):
     """Return a plain, gffread-indexable FASTA path (decompressing .gz if needed)."""
     if str(genome).endswith(".gz"):
@@ -730,13 +825,22 @@ def main():
         exon_gff = scores(0, query_count, reference_count)
         locus_gff = scores(0, query_count, reference_count)
         matching_loci = 0
+        metrics = annotation_metrics(args.reference, args.query)
         if reference_count and query_count:
-            gffcompare_stats = run_gffcompare(
-                reference_longest, query_cds, workdir, "gffcompare_exon"
-            )
-            exon_gff = gffcompare_stats["exon"]
-            locus_gff = gffcompare_stats["locus"]
-            matching_loci = gffcompare_stats["matching_loci"]
+            try:
+                gffcompare_stats = run_gffcompare(
+                    reference_longest, query_cds, workdir, "gffcompare_exon"
+                )
+            except FileNotFoundError:
+                gffcompare_stats = None
+            if gffcompare_stats:
+                exon_gff = gffcompare_stats["exon"]
+                locus_gff = gffcompare_stats["locus"]
+                matching_loci = gffcompare_stats["matching_loci"]
+            else:
+                exon_gff = metrics["cds-segment"]
+                locus_gff = metrics["locus"]
+                matching_loci = int(round(locus_gff[0] * query_count))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.error(str(error))
     finally:
@@ -750,6 +854,10 @@ def main():
         f"F1={locus_gff[2]:.2%} precision={locus_gff[0]:.1%} recall={locus_gff[1]:.1%}"
     )
     print(f"  filtered transcripts: TP={matching_loci:,} reference={reference_count:,} query={query_count:,}")
+    for name in ("exon-segment", "locus", "nt", "cds-segment",
+                 "five_prime_utr-segment", "three_prime_utr-segment"):
+        precision, recall, f1 = metrics[name]
+        print(f"{name}: F1={f1:.2%} precision={precision:.2%} recall={recall:.2%}")
     return 0
 
 

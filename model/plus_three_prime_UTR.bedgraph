@@ -1,0 +1,4 @@
+track type=bedGraph name="plus_three_prime_UTR probability"
+Chr5	0	512715	0.0198
+Chr5	512715	512716	0.0199
+Chr5	512716	3000000	0.0198

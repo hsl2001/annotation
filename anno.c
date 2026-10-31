@@ -1,37 +1,97 @@
-#ifdef __APPLE__
-#define _DARWIN_C_SOURCE
-#endif
 #define _POSIX_C_SOURCE 200809L
+
 #include "anno.h"
-#include "kseq.h"
-#include "ketopt.h"
+
+#include <ctype.h>
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
+#include <strings.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <zlib.h>
 
-#define RFFT_IMPLEMENTATION
-#include "rfft.h"
-#define LBFGS_IMPLEMENTATION
-#include "lbfgs.h"
-#define CRF_IMPLEMENTATION
-#include "crf.h"
+static const char *const class_names[ANNO_CLASSES] = {
+  "intergenic", "plus_intron", "plus_five_prime_UTR",
+  "plus_three_prime_UTR", "minus_intron", "minus_five_prime_UTR",
+  "minus_three_prime_UTR"
+};
+static const uint32_t cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
+static const char model_magic[8] = {'A', 'N', 'N', 'O', '7', 'S', 'T', '1'};
+static const uint32_t model_version = 1;
+static const uint32_t model_endian = 0x01020304u;
 
-KSEQ_INIT(gzFile, gzread)
+struct AnnoModel {
+  AnnoUnetConfig config;
+  AnnoModelMetadata metadata;
+  float *weights;
+  float *bias;
+};
 
-const int wave_sizes[WAVE_COUNT] = {CWT_SCALES};
-#define CWT_IMPLEMENTATION
-#include "cwt.h"
+typedef struct {
+  char *name;
+  char *sequence;
+  int64_t length;
+  float *cwt;
+  uint8_t *labels;
+} Sequence;
 
-void anno_fail(const char *format, ...) {
+typedef struct {
+  char *seqid;
+  char *parent;
+  int kind;
+  char strand;
+  int64_t start;
+  int64_t end;
+} Feature;
+
+typedef struct {
+  Feature *items;
+  size_t count;
+  size_t capacity;
+} FeatureList;
+
+typedef struct {
+  int64_t start;
+  int64_t end;
+} Segment;
+
+typedef struct {
+  int64_t start;
+  int64_t end;
+  int64_t transcript_start;
+  int64_t transcript_end;
+  int64_t length;
+  char strand;
+} Orf;
+
+typedef struct {
+  FILE *files[ANNO_CLASSES];
+} BedgraphWriter;
+
+typedef struct {
+  const char *model;
+  const char *bedgraph;
+  int iterations;
+  int threads;
+} Options;
+
+enum {
+  FEATURE_GENE,
+  FEATURE_TRANSCRIPT,
+  FEATURE_EXON,
+  FEATURE_CDS,
+  FEATURE_5UTR,
+  FEATURE_3UTR,
+  FEATURE_INTRON
+};
+
+static _Noreturn void fail(const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);
   fputs("Error: ", stderr);
@@ -41,373 +101,1397 @@ void anno_fail(const char *format, ...) {
   exit(EXIT_FAILURE);
 }
 
-static void check_allocation_size(size_t count, size_t size) {
-  if (size && count > SIZE_MAX / size) anno_fail("Allocation size overflow");
-}
-
-static char *anno_strdup(const char *text) {
-  char *copy = strdup(text);
-  if (!copy) anno_fail("Out of memory");
-  return copy;
-}
-
-void *anno_alloc(size_t count, size_t size) {
-  check_allocation_size(count ? count : 1, size);
+static void *checked_calloc(size_t count, size_t size) {
+  if (size && count > SIZE_MAX / size) fail("allocation size overflow");
   void *memory = calloc(count ? count : 1, size);
-  if (!memory) anno_fail("Out of memory");
+  if (!memory) fail("out of memory");
   return memory;
 }
 
-static void *anno_resize(void *memory, size_t count, size_t size) {
-  check_allocation_size(count, size);
-  void *resized = realloc(memory, count * size);
-  if (!resized) anno_fail("Out of memory");
-  return resized;
+static void *checked_realloc(void *old, size_t count, size_t size) {
+  if (size && count > SIZE_MAX / size) fail("allocation size overflow");
+  void *memory = realloc(old, count * size);
+  if (!memory) fail("out of memory");
+  return memory;
 }
 
-typedef struct { float *data; size_t size; } CwtStore;
-
-static CwtStore cwt_store(Contig *contigs, int count) {
-  size_t bases = 0;
-  for (int i = 0; i < count; i++) {
-    if ((size_t)contigs[i].genome_length > SIZE_MAX - bases) anno_fail("CWT size overflow");
-    bases += (size_t)contigs[i].genome_length;
-  }
-  if (bases > SIZE_MAX / (WAVE_COUNT * sizeof(float))) anno_fail("CWT size overflow");
-  size_t bytes = bases * WAVE_COUNT * sizeof(float);
-  FILE *backing = tmpfile();
-  if (!backing) anno_fail("Cannot create CWT scratch file: %s", strerror(errno));
-  void *mapping;
-  size_t mapping_size;
-  float *data = cwt_map_file(backing, bytes, 0, &mapping, &mapping_size, "CWT scratch");
-  if (fclose(backing)) anno_fail("Cannot close CWT scratch file: %s", strerror(errno));
-  size_t offset = 0;
-  for (int i = 0; i < count; i++) {
-    contigs[i].cwt_power = data + offset * WAVE_COUNT;
-    offset += (size_t)contigs[i].genome_length;
-  }
-  return (CwtStore){data, mapping_size};
+static char *copy_string(const char *text) {
+  if (!text) fail("invalid null string");
+  char *copy = strdup(text);
+  if (!copy) fail("out of memory");
+  return copy;
 }
 
-Contig *read_fasta(const char *path, int *count) {
+static int base_index(char base) {
+  switch (base) {
+  case 'A': case 'a': return 0;
+  case 'C': case 'c': return 1;
+  case 'G': case 'g': return 2;
+  case 'T': case 't': return 3;
+  default: return -1;
+  }
+}
+
+static char complement(char base) {
+  static const char complements[] = "TGCA";
+  int index = base_index(base);
+  return index < 0 ? 'N' : complements[index];
+}
+
+static int is_stop(const char *codon) {
+  return (((codon[0] == 'T' || codon[0] == 't') &&
+           (codon[1] == 'A' || codon[1] == 'a') &&
+           (codon[2] == 'A' || codon[2] == 'a' ||
+            codon[2] == 'G' || codon[2] == 'g')) ||
+         ((codon[0] == 'T' || codon[0] == 't') &&
+          (codon[1] == 'G' || codon[1] == 'g') &&
+          (codon[2] == 'A' || codon[2] == 'a')));
+}
+
+static int is_atg(const char *codon) {
+  return (codon[0] == 'A' || codon[0] == 'a') &&
+         (codon[1] == 'T' || codon[1] == 't') &&
+         (codon[2] == 'G' || codon[2] == 'g');
+}
+
+static int sequence_index(const Sequence *sequences, int count,
+                          const char *name) {
+  for (int i = 0; i < count; i++)
+    if (!strcmp(sequences[i].name, name)) return i;
+  return -1;
+}
+
+static void sequence_free(Sequence *sequences, int count) {
+  if (!sequences) return;
+  for (int i = 0; i < count; i++) {
+    free(sequences[i].name);
+    free(sequences[i].sequence);
+    free(sequences[i].cwt);
+    free(sequences[i].labels);
+  }
+  free(sequences);
+}
+
+static Sequence *read_fasta(const char *path, int *count_out) {
   gzFile input = gzopen(!strcmp(path, "-") ? "/dev/stdin" : path, "rb");
-  if (!input) anno_fail("Cannot open FASTA: %s", path);
-  kseq_t *record = kseq_init(input);
-  Contig *contigs = NULL;
-  *count = 0;
-  while (kseq_read(record) >= 0) {
-    if (!record->seq.l) continue;
-    if (record->seq.l > (size_t)INT_MAX) anno_fail("Contig too long: %s", record->name.s);
-    contigs = anno_resize(contigs, (size_t)*count + 1, sizeof(*contigs));
-    Contig *c = contigs + (*count)++;
-    memset(c, 0, sizeof(*c));
-    c->name = anno_strdup(record->name.s);
-    c->seq = anno_strdup(record->seq.s);
-    c->length = (int)record->seq.l;
-    c->genome_length = c->length;
-    if (record->comment.l) {
-      const char *crop = strstr(record->comment.s, "crop=");
-      int offset = 0, length = 0;
-      if (crop && sscanf(crop + 5, "%d:%d", &offset, &length) == 2 &&
-          offset >= 0 && length > 0 && offset <= c->genome_length - length) {
-        c->offset = offset;
-        c->length = length;
-      }
+  if (!input) fail("cannot open FASTA %s: %s", path, strerror(errno));
+  Sequence *sequences = NULL;
+  int count = 0;
+  size_t capacity = 0;
+  Sequence *current = NULL;
+  for (;;) {
+    char buffer[8192];
+    char *result = gzgets(input, buffer, sizeof(buffer));
+    if (!result) {
+      if (gzeof(input)) break;
+      fail("cannot read FASTA %s", path);
     }
-  }
-  kseq_destroy(record);
-  if (gzclose(input) != Z_OK || !*count) anno_fail("No readable FASTA records: %s", path);
-  return contigs;
-}
-
-static void free_contigs(Contig *contigs, int count) {
-  for (int contig = 0; contig < count; contig++) {
-    free(contigs[contig].name);
-    free(contigs[contig].seq);
-    free(contigs[contig].label);
-  }
-  free(contigs);
-}
-
-typedef struct { int contig, start, end; char strand, *parent; } Cds;
-typedef struct { int first, count, total; } Group;
-
-static int by_parent(const void *x, const void *y) {
-  const Cds *a = x, *b = y;
-  int order = strcmp(a->parent, b->parent);
-  return order ? order : a->start - b->start;
-}
-
-static int by_total(const void *x, const void *y) { return ((const Group *)y)->total - ((const Group *)x)->total; }
-
-static int valid_cds(const char *seq, const Cds *s, int m, int total, int minus) {
-  if (total < MIN_CDS || total % 3) return 0;
-  for (int jj = 0, index = 0, codon = 0; jj < m; jj++) {
-    int j = minus ? m - 1 - jj : jj, len = s[j].end - s[j].start + 1;
-    for (int t = 0; t < len; t++, index++) {
-      int base = base_index(seq[minus ? s[j].end - 1 - t : s[j].start - 1 + t]);
-      if (base < 0) return 0;
-      codon = (codon * 4 + (minus ? 3 - base : base)) & 63;
-      if (index % 3 == 2) {
-        int stop = codon == 48 || codon == 50 || codon == 56;
-        if (index == 2 && codon != 14) return 0;
-        if (index + 1 < total ? stop : !stop) return 0;
+    size_t length = strlen(buffer);
+    while (length && (buffer[length - 1] == '\n' || buffer[length - 1] == '\r'))
+      buffer[--length] = '\0';
+    if (buffer[0] == '>') {
+      char *name = buffer + 1;
+      while (*name && isspace((unsigned char)*name)) name++;
+      char *end = name;
+      while (*end && !isspace((unsigned char)*end)) end++;
+      if (!*name || *end) *end = '\0';
+      if (!*name) fail("empty FASTA sequence ID");
+      if ((size_t)count == capacity) {
+        capacity = capacity ? capacity * 2 : 8;
+        sequences = checked_realloc(sequences, capacity, sizeof(*sequences));
       }
+      current = &sequences[count++];
+      *current = (Sequence){.name = copy_string(name)};
+      continue;
     }
+    if (!current) {
+      if (length) fail("FASTA sequence appears before a header");
+      continue;
+    }
+    for (size_t i = 0; i < length; i++)
+      if (!isspace((unsigned char)buffer[i])) {
+        current->sequence = checked_realloc(current->sequence,
+                                            (size_t)current->length + 2, 1);
+        current->sequence[current->length++] =
+          (char)toupper((unsigned char)buffer[i]);
+      }
   }
+  if (gzclose(input) != Z_OK || !count) fail("no readable FASTA records in %s", path);
+  for (int i = 0; i < count; i++) {
+    if (!sequences[i].length) fail("empty FASTA sequence %s", sequences[i].name);
+    sequences[i].sequence = checked_realloc(sequences[i].sequence,
+                                            (size_t)sequences[i].length + 1, 1);
+    sequences[i].sequence[sequences[i].length] = '\0';
+  }
+  *count_out = count;
+  return sequences;
+}
+
+static void append_feature(FeatureList *list, const Feature *feature) {
+  if (list->count == list->capacity) {
+    list->capacity = list->capacity ? list->capacity * 2 : 128;
+    list->items = checked_realloc(list->items, list->capacity,
+                                  sizeof(*list->items));
+  }
+  list->items[list->count++] = *feature;
+}
+
+static void feature_free(FeatureList *list) {
+  for (size_t i = 0; i < list->count; i++) {
+    free(list->items[i].seqid);
+    free(list->items[i].parent);
+  }
+  free(list->items);
+  *list = (FeatureList){0};
+}
+
+static int feature_kind(const char *text) {
+  if (!strcasecmp(text, "gene")) return FEATURE_GENE;
+  if (!strcasecmp(text, "mrna") || !strcasecmp(text, "transcript"))
+    return FEATURE_TRANSCRIPT;
+  if (!strcasecmp(text, "exon")) return FEATURE_EXON;
+  if (!strcasecmp(text, "cds")) return FEATURE_CDS;
+  if (!strcasecmp(text, "five_prime_utr") || !strcasecmp(text, "5utr"))
+    return FEATURE_5UTR;
+  if (!strcasecmp(text, "three_prime_utr") || !strcasecmp(text, "3utr"))
+    return FEATURE_3UTR;
+  if (!strcasecmp(text, "intron")) return FEATURE_INTRON;
+  return -1;
+}
+
+static char *attribute_value(char *attributes, const char *wanted) {
+  size_t wanted_length = strlen(wanted);
+  for (char *field = attributes; field && *field;) {
+    char *next = strchr(field, ';');
+    if (next) *next++ = '\0';
+    while (*field == ' ' || *field == '\t') field++;
+    size_t key_length = strcspn(field, "= \t");
+    if (key_length == wanted_length && !strncmp(field, wanted, wanted_length)) {
+      char *value = field + key_length;
+      while (*value == '=' || *value == ' ' || *value == '\t') value++;
+      if (*value == '"') value++;
+      char *quote = strrchr(value, '"');
+      if (quote) *quote = '\0';
+      return value;
+    }
+    field = next;
+  }
+  return NULL;
+}
+
+static char *feature_parent(char *attributes) {
+  char *parent = attribute_value(attributes, "Parent");
+  if (!parent) parent = attribute_value(attributes, "transcript_id");
+  if (!parent) parent = attribute_value(attributes, "gene_id");
+  if (!parent) return NULL;
+  char *separator = strpbrk(parent, ",;");
+  if (separator) *separator = '\0';
+  return copy_string(parent);
+}
+
+static int parse_integer(const char *text, int64_t *value) {
+  char *end = NULL;
+  errno = 0;
+  long long parsed = strtoll(text, &end, 10);
+  if (errno || end == text || *end || parsed < 0) return 0;
+  *value = parsed;
   return 1;
 }
 
-/* Label CDS and introns from GFF3, one transcript per locus (longest CDS wins). */
-int label_cds(Contig *contigs, int count, const char *path, int *skipped) {
+static FeatureList read_features(const char *path, const Sequence *sequences,
+                                 int sequence_count) {
   gzFile input = gzopen(path, "rb");
-  if (!input) anno_fail("Cannot open GFF: %s", path);
-  kstream_t *stream = ks_init(input);
-  kstring_t line = {0, 0, NULL};
-  Cds *cds = NULL;
-  int n = 0, separator;
-  while (ks_getuntil(stream, KS_SEP_LINE, &line, &separator) >= 0) {
-    char *field[9], *cursor = line.s;
-    int fields = 0;
-    if (!line.l || line.s[0] == '#') continue;
-    while (fields < 9 && cursor) {
-      field[fields++] = cursor;
-      if ((cursor = strchr(cursor, '\t'))) *cursor++ = 0;
+  if (!input) fail("cannot open annotation %s: %s", path, strerror(errno));
+  FeatureList list = {0};
+  char line[65536];
+  while (gzgets(input, line, sizeof(line))) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    char *fields[9] = {0};
+    char *cursor = line;
+    int field_count = 0;
+    while (field_count < 9 && cursor) {
+      fields[field_count++] = cursor;
+      cursor = strchr(cursor, '\t');
+      if (cursor) *cursor++ = '\0';
     }
-    if (fields < 9 || strcmp(field[2], "CDS")) continue;
-    char *parent = strstr(field[8], "Parent=");
-    if (!parent) continue;
-    parent += 7;
-    parent[strcspn(parent, ";,")] = 0;
-    int contig = 0;
-    while (contig < count && strcmp(contigs[contig].name, field[0])) contig++;
-    int start = atoi(field[3]), end = atoi(field[4]);
-    if (contig == count || start < 1 || end < start || end > contigs[contig].genome_length) continue;
-    cds = anno_resize(cds, (size_t)n + 1, sizeof(*cds));
-    cds[n].parent = anno_strdup(parent);
-    cds[n].contig = contig, cds[n].start = start, cds[n].end = end, cds[n].strand = field[6][0];
-    n++;
+    if (field_count != 9) fail("annotation record does not have 9 columns");
+    int kind = feature_kind(fields[2]);
+    if (kind < 0) continue;
+    int sequence = sequence_index(sequences, sequence_count, fields[0]);
+    if (sequence < 0) fail("annotation sequence is absent from FASTA: %s", fields[0]);
+    int64_t start = 0, end = 0;
+    if (!parse_integer(fields[3], &start) || !parse_integer(fields[4], &end) ||
+        start < 1 || end < start || end > sequences[sequence].length)
+      fail("invalid annotation interval for %s", fields[0]);
+    char strand = fields[6][0];
+    if (strand != '+' && strand != '-')
+      fail("unsupported annotation strand for %s", fields[0]);
+    char *parent = feature_parent(fields[8]);
+    if (kind >= FEATURE_EXON && !parent)
+      fail("annotation feature has no transcript parent");
+    Feature feature = {
+      .seqid = copy_string(fields[0]), .parent = parent, .kind = kind,
+      .strand = strand, .start = start - 1, .end = end
+    };
+    append_feature(&list, &feature);
   }
-  free(line.s);
-  ks_destroy(stream);
-  gzclose(input);
-  qsort(cds, n, sizeof(*cds), by_parent);
-  Group *groups = anno_alloc(n, sizeof(*groups));
-  int g = 0;
-  for (int i = 0; i < n; i++) {
-    if (!i || strcmp(cds[i].parent, cds[i - 1].parent)) groups[g++].first = i;
-    groups[g - 1].count++, groups[g - 1].total += cds[i].end - cds[i].start + 1;
-  }
-  qsort(groups, g, sizeof(*groups), by_total);
-  int used = 0;
-  for (int k = 0; k < g; k++) {
-    Cds *s = cds + groups[k].first;
-    Contig *c = contigs + s->contig;
-    int m = groups[k].count, minus = s->strand == '-', ok = s->strand == '+' || minus;
-    for (int j = 1; j < m; j++) ok &= s[j].contig == s->contig && s[j].strand == s->strand && s[j].start > s[j - 1].end + 2;
-    if (ok) ok = valid_cds(c->seq, s, m, groups[k].total, minus);
-    for (int p = s->start - 1; ok && p < s[m - 1].end; p++) ok &= !c->label[p];
-    if (!ok) continue;
-    used++;
-    /* Reading frame is recomputed from CDS lengths in translation order; the GFF phase column is ignored. */
-    for (int jj = 0, frame = 0; jj < m; jj++) {
-      int j = minus ? m - 1 - jj : jj, len = s[j].end - s[j].start + 1, start_frame = frame;
-      for (int t = 0; t < len; t++, frame = (frame + 1) % 3)
-        c->label[minus ? s[j].end - 1 - t : s[j].start - 1 + t] = (minus ? 7 : 1) + frame;
-      int q = minus ? (start_frame + len - 1) % 3 : start_frame;
-      for (int p = j ? s[j - 1].end : s[j].start; p < s[j].start - 1; p++)
-        c->label[p] = (minus ? 10 : 4) + q;
-    }
-  }
-  for (int i = 0; i < n; i++) free(cds[i].parent);
-  free(cds);
-  free(groups);
-  *skipped = g - used;
-  return used;
+  if (!gzeof(input)) fail("cannot read annotation %s", path);
+  if (gzclose(input) != Z_OK) fail("cannot close annotation %s", path);
+  return list;
 }
 
-void write_gff(const Contig *c, const uint8_t *path, unsigned long *genes) {
-  for (int i = 0; i < c->length;) {
-    if (!path[i]) { i++; continue; }
-    int minus = path[i] >= 7, start = i, coding = 0;
-    while (i < c->length && path[i] && (path[i] >= 7) == minus) coding += is_cds(path[i++]);
-    if (coding < MIN_CDS) continue;
-    unsigned long g = ++*genes;
-    char strand = minus ? '-' : '+';
-    int off = c->offset;
-    printf("%s\tanno\tgene\t%d\t%d\t.\t%c\t.\tID=gene%lu\n", c->name, off + start + 1, off + i, strand, g);
-    printf("%s\tanno\tmRNA\t%d\t%d\t.\t%c\t.\tID=mRNA%lu;Parent=gene%lu\n", c->name, off + start + 1, off + i, strand, g, g);
-    for (int j = start; j < i;) {
-      if (!is_cds(path[j])) { j++; continue; }
-      int k = j;
-      while (k < i && is_cds(path[k])) k++;
-      int phase = (3 - (minus ? path[k - 1] - 7 : path[j] - 1)) % 3;
-      printf("%s\tanno\texon\t%d\t%d\t.\t%c\t.\tParent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, g);
-      printf("%s\tanno\tCDS\t%d\t%d\t.\t%c\t%d\tID=cds%lu;Parent=mRNA%lu\n", c->name, off + j + 1, off + k, strand, phase, g, g);
-      j = k;
+static uint8_t explicit_label(const Feature *feature) {
+  if (feature->kind == FEATURE_INTRON)
+    return feature->strand == '+' ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
+  if (feature->kind == FEATURE_5UTR)
+    return feature->strand == '+' ? ANNO_PLUS_5UTR : ANNO_MINUS_5UTR;
+  if (feature->kind == FEATURE_3UTR)
+    return feature->strand == '+' ? ANNO_PLUS_3UTR : ANNO_MINUS_3UTR;
+  return ANNO_INTERGENIC;
+}
+
+static void mark_labels(Sequence *sequences, int sequence_count,
+                        const FeatureList *features) {
+  for (int i = 0; i < sequence_count; i++)
+    sequences[i].labels = checked_calloc((size_t)sequences[i].length, 1);
+  for (size_t i = 0; i < features->count; i++) {
+    const Feature *feature = &features->items[i];
+    uint8_t label = explicit_label(feature);
+    if (!label) continue;
+    int sequence = sequence_index(sequences, sequence_count, feature->seqid);
+    for (int64_t position = feature->start; position < feature->end; position++)
+      sequences[sequence].labels[position] = label;
+  }
+  for (size_t i = 0; i < features->count; i++) {
+    const Feature *left = &features->items[i];
+    if (left->kind != FEATURE_EXON && left->kind != FEATURE_CDS) continue;
+    int sequence = sequence_index(sequences, sequence_count, left->seqid);
+    for (size_t j = i + 1; j < features->count; j++) {
+      const Feature *right = &features->items[j];
+      if (right->kind != left->kind || strcmp(right->seqid, left->seqid) ||
+          strcmp(right->parent, left->parent) || right->strand != left->strand)
+        continue;
+      const Feature *first = left, *second = right;
+      if (first->start > second->start) {
+        first = right;
+        second = left;
+      }
+      if (first->end >= second->start) continue;
+      uint8_t label = first->strand == '+' ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
+      for (int64_t position = first->end; position < second->start; position++)
+        if (!sequences[sequence].labels[position])
+          sequences[sequence].labels[position] = label;
+      break;
     }
   }
 }
 
-typedef struct {
-  uint32_t index;
-  float weight;
-} ModelEntry;
+static void cwt_values(const char *sequence, int64_t length, float *complex_values) {
+  static const double signal[4][2] = {
+    {1.0, 1.0}, {-1.0, 1.0}, {-1.0, -1.0}, {1.0, -1.0}
+  };
+  for (int64_t position = 0; position < length; position++) {
+    for (int scale_index = 0; scale_index < ANNO_CWT_CHANNELS; scale_index++) {
+      int radius = (int)cwt_scales[scale_index] * 4;
+      double real = 0.0, imaginary = 0.0, normalization = 0.0;
+      for (int offset = -radius; offset <= radius; offset++) {
+        int64_t source = position + offset;
+        if (source < 0 || source >= length) continue;
+        int base = base_index(sequence[source]);
+        if (base < 0) continue;
+        double x = (double)offset / (double)cwt_scales[scale_index];
+        double weight = exp(-0.5 * x * x);
+        double phase = 6.0 * x;
+        real += weight * (signal[base][0] * cos(phase) -
+                          signal[base][1] * sin(phase));
+        imaginary += weight * (signal[base][0] * sin(phase) +
+                               signal[base][1] * cos(phase));
+        normalization += weight;
+      }
+      size_t index = ((size_t)position * ANNO_CWT_CHANNELS +
+                      (size_t)scale_index) * 2;
+      complex_values[index] = normalization ? (float)(real / normalization) : 0.0f;
+      complex_values[index + 1] =
+        normalization ? (float)(imaginary / normalization) : 0.0f;
+    }
+  }
+}
 
-static void save_model(const char *path, const double *w) {
-  ModelEntry *entries = anno_alloc(WEIGHTS, sizeof(*entries));
-  uint32_t header[2] = {WEIGHTS, 0};
-  for (int i = 0; i < WEIGHTS; i++)
-    if ((float)w[i]) entries[header[1]++] = (ModelEntry){(uint32_t)i, (float)w[i]};
+static void cwt_power(const char *sequence, int64_t length, float *power) {
+  float *complex_values = checked_calloc((size_t)length * ANNO_CWT_CHANNELS * 2,
+                                         sizeof(*complex_values));
+  cwt_values(sequence, length, complex_values);
+  for (int64_t position = 0; position < length; position++)
+    for (int scale = 0; scale < ANNO_CWT_CHANNELS; scale++) {
+      size_t complex_index = ((size_t)position * ANNO_CWT_CHANNELS +
+                              (size_t)scale) * 2;
+      power[(size_t)position * ANNO_CWT_CHANNELS + (size_t)scale] =
+        complex_values[complex_index] * complex_values[complex_index] +
+        complex_values[complex_index + 1] * complex_values[complex_index + 1];
+    }
+  free(complex_values);
+}
+
+static size_t conv_parameters(int input_channels, int output_channels, int kernel) {
+  return (size_t)output_channels *
+         ((size_t)input_channels * (size_t)kernel + 1);
+}
+
+static size_t model_head_offset(const AnnoUnetConfig *config) {
+  size_t offset = conv_parameters(config->input_channels, config->base_channels,
+                                  config->kernel_size);
+  for (int level = 1; level < config->depth; level++)
+    offset += conv_parameters(config->base_channels, config->base_channels,
+                              config->kernel_size);
+  for (int level = 1; level < config->depth; level++)
+    offset += conv_parameters(config->base_channels, config->base_channels,
+                              config->kernel_size);
+  return offset;
+}
+
+static size_t model_parameters(const AnnoUnetConfig *config) {
+  return model_head_offset(config) +
+         conv_parameters(config->base_channels, config->classes, 1);
+}
+
+static int valid_metadata(const AnnoModelMetadata *metadata) {
+  if (!metadata || !metadata->window_size) return 0;
+  for (int channel = 0; channel < 7; channel++)
+    if (!isfinite(metadata->feature_mean[channel]) ||
+        !isfinite(metadata->feature_std[channel]) ||
+        metadata->feature_std[channel] <= 0.0f)
+      return 0;
+  for (int scale = 0; scale < ANNO_CWT_CHANNELS; scale++)
+    if (!metadata->cwt_scales[scale]) return 0;
+  for (int class = 0; class < ANNO_CLASSES; class++)
+    if (!metadata->class_names[class][0]) return 0;
+  return 1;
+}
+
+static int valid_config(const AnnoUnetConfig *config) {
+  return config && config->input_channels == 4 + ANNO_CWT_CHANNELS &&
+         config->classes == ANNO_CLASSES && config->base_channels > 0 &&
+         config->base_channels <= 128 && config->depth > 0 &&
+         config->depth <= 8 && config->kernel_size > 0 &&
+         config->kernel_size <= 15 && (config->kernel_size & 1);
+}
+
+static uint32_t random_u32(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  *state = value;
+  return (uint32_t)(value * 2685821657736338717ULL >> 32);
+}
+
+AnnoModel *anno_model_create(const AnnoUnetConfig *config) {
+  if (!valid_config(config)) return NULL;
+  AnnoModel *model = checked_calloc(1, sizeof(*model));
+  model->config = *config;
+  model->metadata.window_size = ANNO_CWT_WINDOW;
+  for (int channel = 0; channel < config->input_channels; channel++)
+    model->metadata.feature_std[channel] = 1.0f;
+  memcpy(model->metadata.cwt_scales, cwt_scales, sizeof(cwt_scales));
+  for (int class = 0; class < ANNO_CLASSES; class++)
+    snprintf(model->metadata.class_names[class],
+             sizeof(model->metadata.class_names[class]), "%s", class_names[class]);
+  size_t parameters = model_parameters(config);
+  model->weights = checked_calloc(parameters, sizeof(*model->weights));
+  model->bias = checked_calloc(config->classes, sizeof(*model->bias));
+  uint64_t seed = 0x853c49e6748fea9bULL;
+  for (size_t i = 0; i < parameters; i++)
+    model->weights[i] =
+      ((float)(random_u32(&seed) & 0xffffu) / 32768.0f - 1.0f) * 0.02f;
+  return model;
+}
+
+void anno_model_destroy(AnnoModel *model) {
+  if (!model) return;
+  free(model->weights);
+  free(model->bias);
+  free(model);
+}
+
+const AnnoModelMetadata *anno_model_metadata(const AnnoModel *model) {
+  return model ? &model->metadata : NULL;
+}
+
+static float feature_value(const float *input, int64_t length, int channels,
+                           int64_t position, int channel) {
+  if (position < 0 || position >= length) return 0.0f;
+  return input[(size_t)position * (size_t)channels + (size_t)channel];
+}
+
+static void convolution(const float *input, int64_t length, int input_channels,
+                        int output_channels, int kernel, const float *weights,
+                        float *output, int relu) {
+  int radius = kernel / 2;
+  size_t per_output = (size_t)input_channels * (size_t)kernel + 1;
+  for (int64_t position = 0; position < length; position++)
+    for (int output_channel = 0; output_channel < output_channels;
+         output_channel++) {
+      const float *filter = weights + (size_t)output_channel * per_output;
+      float value = filter[input_channels * kernel];
+      size_t index = 0;
+      for (int offset = -radius; offset <= radius; offset++)
+        for (int input_channel = 0; input_channel < input_channels;
+             input_channel++)
+          value += feature_value(input, length, input_channels,
+                                 position + offset, input_channel) * filter[index++];
+      output[(size_t)position * (size_t)output_channels +
+             (size_t)output_channel] = relu && value < 0.0f ? 0.0f : value;
+    }
+}
+
+static int model_features(const AnnoModel *model, const float *input,
+                          int64_t length, float **features_out) {
+  const AnnoUnetConfig *config = &model->config;
+  int base = config->base_channels;
+  int factor = 1 << (config->depth - 1);
+  if (length > INT64_MAX - factor + 1) return EOVERFLOW;
+  if ((length + factor - 1) / factor > INT64_MAX / factor) return EOVERFLOW;
+  int64_t padded = (length + factor - 1) / factor * factor;
+  float **enc = checked_calloc((size_t)config->depth, sizeof(*enc));
+  int64_t *sizes = checked_calloc((size_t)config->depth, sizeof(*sizes));
+  size_t weight_offset = 0;
+  sizes[0] = padded;
+  for (int level = 0; level < config->depth; level++) {
+    enc[level] = checked_calloc((size_t)sizes[level] * (size_t)base,
+                                sizeof(**enc));
+    if (level > 0) {
+      float *down = checked_calloc((size_t)sizes[level] * (size_t)base,
+                                   sizeof(*down));
+      for (int64_t position = 0; position < sizes[level]; position++)
+        for (int channel = 0; channel < base; channel++)
+          down[(size_t)position * (size_t)base + (size_t)channel] =
+            (enc[level - 1][(size_t)(position * 2) * (size_t)base +
+                            (size_t)channel] +
+             enc[level - 1][(size_t)(position * 2 + 1) * (size_t)base +
+                            (size_t)channel]) * 0.5f;
+      convolution(down, sizes[level], base, base, config->kernel_size,
+                  model->weights + weight_offset, enc[level], 1);
+      weight_offset += conv_parameters(base, base, config->kernel_size);
+      free(down);
+    } else {
+      float *padded_input = checked_calloc(
+        (size_t)padded * (size_t)config->input_channels, sizeof(*padded_input));
+      memcpy(padded_input, input,
+             (size_t)length * (size_t)config->input_channels *
+             sizeof(*padded_input));
+      convolution(padded_input, padded, config->input_channels, base,
+                  config->kernel_size, model->weights + weight_offset,
+                  enc[level], 1);
+      free(padded_input);
+      weight_offset += conv_parameters(config->input_channels, base,
+                                       config->kernel_size);
+    }
+    if (level + 1 < config->depth) sizes[level + 1] = sizes[level] / 2;
+  }
+  float *current = enc[config->depth - 1];
+  int64_t current_length = sizes[config->depth - 1];
+  int current_owned = 0;
+  for (int level = config->depth - 2; level >= 0; level--) {
+    float *up = checked_calloc((size_t)sizes[level] * (size_t)base, sizeof(*up));
+    float *next = checked_calloc((size_t)sizes[level] * (size_t)base, sizeof(*next));
+    for (int64_t position = 0; position < sizes[level]; position++)
+      for (int channel = 0; channel < base; channel++)
+        up[(size_t)position * (size_t)base + (size_t)channel] =
+          enc[level][(size_t)position * (size_t)base + (size_t)channel] +
+          current[(size_t)(position / 2) * (size_t)base + (size_t)channel];
+    convolution(up, sizes[level], base, base, config->kernel_size,
+                model->weights + weight_offset, next, 1);
+    weight_offset += conv_parameters(base, base, config->kernel_size);
+    free(up);
+    if (current_owned) free(current);
+    current = next;
+    current_length = sizes[level];
+    current_owned = 1;
+  }
+  float *features = checked_calloc((size_t)length * (size_t)base,
+                                   sizeof(*features));
+  memcpy(features, current, (size_t)length * (size_t)base * sizeof(*features));
+  if (current_owned) free(current);
+  for (int level = 0; level < config->depth; level++) free(enc[level]);
+  free(enc);
+  free(sizes);
+  *features_out = features;
+  (void)current_length;
+  return 0;
+}
+
+static void softmax(const float *logits, int classes, float *probability) {
+  float maximum = -INFINITY;
+  for (int class = 0; class < classes; class++)
+    if (logits[class] > maximum) maximum = logits[class];
+  double total = 0.0;
+  for (int class = 0; class < classes; class++) {
+    probability[class] = expf(logits[class] - maximum);
+    total += probability[class];
+  }
+  if (!(total > 0.0) || !isfinite(total)) {
+    for (int class = 0; class < classes; class++)
+      probability[class] = 1.0f / (float)classes;
+    return;
+  }
+  for (int class = 0; class < classes; class++)
+    probability[class] /= (float)total;
+}
+
+int anno_model_predict(const AnnoModel *model, const float *input,
+                       int64_t length, float *probability) {
+  if (!model || !input || !probability || length <= 0 ||
+      !valid_config(&model->config)) return EINVAL;
+  float *features = NULL;
+  int status = model_features(model, input, length, &features);
+  if (status) return status;
+  size_t offset = model_head_offset(&model->config);
+  size_t per_class = (size_t)model->config.base_channels + 1;
+  float logits[ANNO_CLASSES], values[ANNO_CLASSES];
+  for (int64_t position = 0; position < length; position++) {
+    for (int class = 0; class < model->config.classes; class++) {
+      const float *filter = model->weights + offset + (size_t)class * per_class;
+      float value = filter[model->config.base_channels];
+      for (int channel = 0; channel < model->config.base_channels; channel++)
+        value += features[(size_t)position * (size_t)model->config.base_channels +
+                          (size_t)channel] * filter[channel];
+      logits[class] = value + model->bias[class];
+    }
+    softmax(logits, model->config.classes, values);
+    memcpy(probability + (size_t)position * ANNO_CLASSES, values,
+           sizeof(values));
+  }
+  free(features);
+  return 0;
+}
+
+int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
+                     int64_t length, int iterations, int batch_size,
+                     float learning_rate, uint64_t seed) {
+  if (!model || !input || !label || length <= 0 || iterations < 1 ||
+      batch_size < 1 || !(learning_rate > 0.0f) || !isfinite(learning_rate))
+    return EINVAL;
+  float *features = NULL;
+  int status = model_features(model, input, length, &features);
+  if (status) return status;
+  int64_t *order = checked_calloc((size_t)length, sizeof(*order));
+  float probability[ANNO_CLASSES], logits[ANNO_CLASSES];
+  size_t offset = model_head_offset(&model->config);
+  size_t per_class = (size_t)model->config.base_channels + 1;
+  for (int iteration = 0; iteration < iterations; iteration++) {
+    for (int64_t position = 0; position < length; position++)
+      if (label[position] >= ANNO_CLASSES) {
+        free(order);
+        free(features);
+        return EINVAL;
+      } else order[position] = position;
+    for (int64_t position = length - 1; position > 0; position--) {
+      int64_t swap = (int64_t)(random_u32(&seed) % (uint64_t)(position + 1));
+      int64_t temporary = order[position];
+      order[position] = order[swap];
+      order[swap] = temporary;
+    }
+    for (int64_t batch_start = 0; batch_start < length;
+         batch_start += batch_size) {
+      int64_t batch_end = batch_start + batch_size;
+      if (batch_end > length) batch_end = length;
+      float scale = learning_rate / (float)(batch_end - batch_start);
+      for (int64_t batch_position = batch_start; batch_position < batch_end;
+           batch_position++) {
+        int64_t position = order[batch_position];
+        const float *features_at = features +
+          (size_t)position * (size_t)model->config.base_channels;
+        for (int class = 0; class < model->config.classes; class++) {
+          const float *filter = model->weights + offset +
+            (size_t)class * per_class;
+          logits[class] = filter[model->config.base_channels] +
+            model->bias[class];
+          for (int channel = 0; channel < model->config.base_channels; channel++)
+            logits[class] += features_at[channel] * filter[channel];
+        }
+        softmax(logits, model->config.classes, probability);
+        for (int class = 0; class < model->config.classes; class++) {
+          float error = probability[class] -
+            (label[position] == class ? 1.0f : 0.0f);
+          size_t weight = offset + (size_t)class * per_class;
+          model->bias[class] -= scale * error;
+          model->weights[weight + model->config.base_channels] -= scale * error;
+          for (int channel = 0; channel < model->config.base_channels; channel++)
+            model->weights[weight + (size_t)channel] -=
+              scale * error * features_at[channel];
+        }
+      }
+    }
+  }
+  free(order);
+  free(features);
+  return 0;
+}
+
+static uint32_t checksum_update(uint32_t checksum, const void *data, size_t size) {
+  const unsigned char *bytes = data;
+  for (size_t i = 0; i < size; i++)
+    checksum = (checksum ^ bytes[i]) * 16777619u;
+  return checksum;
+}
+
+static uint32_t model_checksum(const AnnoModel *model) {
+  uint32_t checksum = 2166136261u;
+  checksum = checksum_update(checksum, &model->metadata, sizeof(model->metadata));
+  checksum = checksum_update(checksum, model->weights,
+                             model_parameters(&model->config) * sizeof(float));
+  checksum = checksum_update(checksum, model->bias,
+                             (size_t)model->config.classes * sizeof(float));
+  return checksum;
+}
+
+int anno_model_save(const AnnoModel *model, const char *path) {
+  if (!model || !path || !valid_config(&model->config) ||
+      !valid_metadata(&model->metadata))
+    return EINVAL;
+  size_t parameters = model_parameters(&model->config);
+  if (parameters > UINT32_MAX) return EOVERFLOW;
   FILE *file = fopen(path, "wb");
-  if (!file || fwrite(header, sizeof(*header), 2, file) != 2 ||
-      fwrite(entries, sizeof(*entries), header[1], file) != header[1] || fclose(file))
-    anno_fail("Cannot write model: %s", path);
-  free(entries);
-  crf_save_weights_text("anno.weights.txt", w);
+  if (!file) return errno;
+  uint32_t header[10] = {
+    model_version, model_endian, (uint32_t)model->config.input_channels,
+    (uint32_t)model->config.classes, (uint32_t)model->config.base_channels,
+    (uint32_t)model->config.depth, (uint32_t)model->config.kernel_size,
+    (uint32_t)parameters, model->metadata.window_size, model_checksum(model)
+  };
+  int ok = fwrite(model_magic, 1, sizeof(model_magic), file) == sizeof(model_magic) &&
+           fwrite(header, sizeof(*header), 10, file) == 10 &&
+           fwrite(&model->metadata, sizeof(model->metadata), 1, file) == 1 &&
+           fwrite(model->weights, sizeof(float), parameters, file) == parameters &&
+           fwrite(model->bias, sizeof(float), (size_t)model->config.classes,
+                  file) == (size_t)model->config.classes;
+  int close_status = fclose(file);
+  return ok && close_status == 0 ? 0 : EIO;
 }
 
-static void load_model(const char *path, double *w) {
-  uint32_t header[2];
+int anno_model_load(AnnoModel **model_out, const char *path) {
+  if (!model_out || !path) return EINVAL;
+  *model_out = NULL;
   FILE *file = fopen(path, "rb");
-  if (!file || fread(header, sizeof(*header), 2, file) != 2 || header[0] != WEIGHTS ||
-      header[1] > WEIGHTS)
-    anno_fail("Cannot read model: %s (expected %d-weight feature layout)", path, WEIGHTS);
-  ModelEntry *entries = anno_alloc(header[1], sizeof(*entries));
-  if (fread(entries, sizeof(*entries), header[1], file) != header[1] || fgetc(file) != EOF)
-    anno_fail("Truncated or oversized model: %s", path);
-  fclose(file);
-  memset(w, 0, WEIGHTS * sizeof(*w));
-  for (uint32_t i = 0; i < header[1]; i++) {
-    if (entries[i].index >= WEIGHTS) anno_fail("Model weight index out of range: %s", path);
-    if (!isfinite(entries[i].weight)) anno_fail("Non-finite model weight: %s", path);
-    w[entries[i].index] = entries[i].weight;
+  if (!file) return errno;
+  char magic[sizeof(model_magic)];
+  uint32_t header[10] = {0};
+  int ok = fread(magic, 1, sizeof(magic), file) == sizeof(magic) &&
+           fread(header, sizeof(*header), 10, file) == 10 &&
+           !memcmp(magic, model_magic, sizeof(magic));
+  if (!ok || header[0] != model_version || header[1] != model_endian) {
+    fclose(file);
+    return EINVAL;
   }
-  free(entries);
+  AnnoUnetConfig config = {
+    (int)header[2], (int)header[3], (int)header[4], (int)header[5], (int)header[6]
+  };
+  if (!valid_config(&config) || model_parameters(&config) != header[7]) {
+    fclose(file);
+    return EINVAL;
+  }
+  AnnoModel *model = anno_model_create(&config);
+  if (!model) {
+    fclose(file);
+    return ENOMEM;
+  }
+  ok = fread(&model->metadata, sizeof(model->metadata), 1, file) == 1 &&
+       fread(model->weights, sizeof(float), header[7], file) == header[7] &&
+       fread(model->bias, sizeof(float), (size_t)config.classes, file) ==
+         (size_t)config.classes && fgetc(file) == EOF;
+  int close_status = fclose(file);
+  if (!ok || close_status || model->metadata.window_size != header[8] ||
+      !valid_metadata(&model->metadata) ||
+      model_checksum(model) != header[9]) {
+    anno_model_destroy(model);
+    return EINVAL;
+  }
+  for (size_t i = 0; i < model_parameters(&config); i++)
+    if (!isfinite(model->weights[i])) {
+      anno_model_destroy(model);
+      return ERANGE;
+    }
+  *model_out = model;
+  return 0;
 }
 
-static FILE *create_in(const char *directory, const char *name) {
-  char *path = anno_alloc(strlen(directory) + strlen(name) + 2, 1);
-  sprintf(path, "%s/%s", directory, name);
-  FILE *file = fopen(path, "w+b");
-  if (!file) anno_fail("Cannot create %s", path);
-  free(path);
-  return file;
+int anno_class_for_state(uint8_t state) {
+  static const int classes[ANNO_DECODED_STATES] = {0, 2, 0, 1, 3, 5, 0, 4, 6};
+  return state < ANNO_DECODED_STATES ? classes[state] : -1;
 }
 
-/* Raw complex64 CWT export for plot_cwt.py: plus strand rows then reverse-complement rows. */
-static void export_cwt(const Wavelets *wavelets, const char *fasta,
-                       const char *directory, int threads) {
-  int count;
-  Contig *contigs = read_fasta(fasta, &count);
-  if (mkdir(directory, 0777)) anno_fail("Cannot create directory %s: %s", directory, strerror(errno));
-  FILE *matrix = create_in(directory, "matrix.bin"), *index = create_in(directory, "contigs.tsv");
-  fputs("# anno-cwt-v2\n# scales\t", index);
-  for (int scale = 0; scale < WAVE_COUNT; scale++) fprintf(index, "%s%d", scale ? "," : "", wave_sizes[scale]);
-  fputs("\nseqid\tlength\tplus_offset\tminus_offset\n", index);
+int anno_grammar_transition(uint8_t previous, uint8_t current) {
+  if (previous >= ANNO_DECODED_STATES || current >= ANNO_DECODED_STATES)
+    return 0;
+  if (previous == current) return 1;
+  if (previous == ANNO_STATE_INTERGENIC)
+    return current == ANNO_STATE_PLUS_5UTR || current == ANNO_STATE_PLUS_EXON ||
+           current == ANNO_STATE_MINUS_5UTR || current == ANNO_STATE_MINUS_EXON;
+  if (current == ANNO_STATE_INTERGENIC)
+    return previous == ANNO_STATE_PLUS_EXON || previous == ANNO_STATE_PLUS_3UTR ||
+           previous == ANNO_STATE_MINUS_EXON ||
+           previous == ANNO_STATE_MINUS_3UTR;
+  if (previous == ANNO_STATE_PLUS_5UTR) return current == ANNO_STATE_PLUS_EXON;
+  if (previous == ANNO_STATE_PLUS_EXON)
+    return current == ANNO_STATE_PLUS_INTRON || current == ANNO_STATE_PLUS_3UTR;
+  if (previous == ANNO_STATE_PLUS_INTRON) return current == ANNO_STATE_PLUS_EXON;
+  if (previous == ANNO_STATE_MINUS_5UTR) return current == ANNO_STATE_MINUS_EXON;
+  if (previous == ANNO_STATE_MINUS_EXON)
+    return current == ANNO_STATE_MINUS_INTRON || current == ANNO_STATE_MINUS_3UTR;
+  if (previous == ANNO_STATE_MINUS_INTRON) return current == ANNO_STATE_MINUS_EXON;
+  return 0;
+}
+
+static int state_is_intron(uint8_t state) {
+  return state == ANNO_STATE_PLUS_INTRON || state == ANNO_STATE_MINUS_INTRON;
+}
+
+int anno_grammar_decode(const float *probability, int64_t length,
+                        int min_exon, int min_intron, uint8_t *path) {
+  if (!probability || !path || length < 1 || min_exon < 1 || min_intron < 1)
+    return 0;
+  int max_run = min_exon > min_intron ? min_exon : min_intron;
+  size_t cells = (size_t)length * ANNO_DECODED_STATES * (size_t)max_run;
+  if ((size_t)length > SIZE_MAX / ANNO_DECODED_STATES ||
+      cells > SIZE_MAX / sizeof(float) || cells > SIZE_MAX / sizeof(int16_t))
+    return 0;
+  float *scores = malloc(cells * sizeof(*scores));
+  int16_t *backs = malloc(cells * sizeof(*backs));
+  if (!scores || !backs) {
+    free(scores);
+    free(backs);
+    return 0;
+  }
+#define CELL(position, state, run) \
+  (((size_t)(position) * ANNO_DECODED_STATES + (state)) * (size_t)max_run + \
+   (size_t)(run))
+  for (size_t i = 0; i < cells; i++) {
+    scores[i] = -INFINITY;
+    backs[i] = -1;
+  }
+  for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+    if (state != ANNO_STATE_INTERGENIC && state != ANNO_STATE_PLUS_5UTR &&
+        state != ANNO_STATE_PLUS_EXON && state != ANNO_STATE_MINUS_5UTR &&
+        state != ANNO_STATE_MINUS_EXON)
+      continue;
+    int class = anno_class_for_state((uint8_t)state);
+    float value = probability[class] > FLT_MIN && isfinite(probability[class])
+      ? probability[class] : FLT_MIN;
+    scores[CELL(0, state, 0)] = logf(value);
+  }
+  for (int64_t position = 1; position < length; position++)
+    for (int state = 0; state < ANNO_DECODED_STATES; state++) {
+      int class = anno_class_for_state((uint8_t)state);
+      float value = probability[(size_t)position * ANNO_CLASSES + (size_t)class];
+      float node = logf(value > FLT_MIN && isfinite(value) ? value : FLT_MIN);
+      for (int previous = 0; previous < ANNO_DECODED_STATES; previous++)
+        for (int run = 0; run < max_run; run++) {
+          float previous_score = scores[CELL(position - 1, previous, run)];
+          if (!isfinite(previous_score)) continue;
+          if (state == previous) {
+            int next_run = run + 1 < max_run ? run + 1 : max_run - 1;
+            size_t cell = CELL(position, state, next_run);
+            if (previous_score + node > scores[cell]) {
+              scores[cell] = previous_score + node;
+              backs[cell] = (int16_t)(previous * max_run + run);
+            }
+          } else if (anno_grammar_transition((uint8_t)previous, (uint8_t)state) &&
+                     (previous == ANNO_STATE_INTERGENIC ||
+                      run + 1 >= (state_is_intron((uint8_t)previous)
+                                    ? min_intron : min_exon))) {
+            size_t cell = CELL(position, state, 0);
+            if (previous_score + node > scores[cell]) {
+              scores[cell] = previous_score + node;
+              backs[cell] = (int16_t)(previous * max_run + run);
+            }
+          }
+        }
+    }
+  int best_state = ANNO_STATE_INTERGENIC, best_run = 0;
+  float best = -INFINITY;
+  for (int state = 0; state < ANNO_DECODED_STATES; state++)
+    for (int run = 0; run < max_run; run++) {
+      if (state != ANNO_STATE_INTERGENIC &&
+          run + 1 < (state_is_intron((uint8_t)state) ? min_intron : min_exon))
+        continue;
+      float score = scores[CELL(length - 1, state, run)];
+      if (state != ANNO_STATE_INTERGENIC &&
+          state != ANNO_STATE_PLUS_3UTR && state != ANNO_STATE_MINUS_3UTR &&
+          state != ANNO_STATE_PLUS_EXON && state != ANNO_STATE_MINUS_EXON)
+        score -= 1.0f;
+      if (score > best) {
+        best = score;
+        best_state = state;
+        best_run = run;
+      }
+    }
+  if (!isfinite(best)) {
+    free(scores);
+    free(backs);
+    return 0;
+  }
+  for (int64_t position = length - 1; position >= 0; position--) {
+    path[position] = (uint8_t)best_state;
+    if (!position) break;
+    int16_t back = backs[CELL(position, best_state, best_run)];
+    if (back < 0) {
+      free(scores);
+      free(backs);
+      return 0;
+    }
+    best_state = back / max_run;
+    best_run = back % max_run;
+  }
+  free(scores);
+  free(backs);
+#undef CELL
+  return 1;
+}
+
+static int path_is_transcript(uint8_t state, char strand) {
+  return strand == '+'
+    ? state >= ANNO_STATE_PLUS_5UTR && state <= ANNO_STATE_PLUS_3UTR
+    : state >= ANNO_STATE_MINUS_5UTR && state <= ANNO_STATE_MINUS_3UTR;
+}
+
+static int path_is_intron(uint8_t state) {
+  return state == ANNO_STATE_PLUS_INTRON || state == ANNO_STATE_MINUS_INTRON;
+}
+
+static void append_segment(Segment **segments, int *count,
+                           int64_t start, int64_t end) {
+  *segments = checked_realloc(*segments, (size_t)*count + 1, sizeof(**segments));
+  (*segments)[(*count)++] = (Segment){start, end};
+}
+
+static int find_orf(const char *sequence, int64_t sequence_length,
+                    const Segment *exons, int exon_count, char strand,
+                    Orf *orf) {
+  (void)sequence_length;
+  int64_t transcript_length = 0;
+  for (int i = 0; i < exon_count; i++)
+    transcript_length += exons[i].end - exons[i].start;
+  if (transcript_length < 6) return 0;
+  char *transcript = checked_calloc((size_t)transcript_length + 1, 1);
+  int64_t at = 0;
+  for (int order = 0; order < exon_count; order++) {
+    int i = strand == '+' ? order : exon_count - 1 - order;
+    if (strand == '+')
+      for (int64_t position = exons[i].start; position < exons[i].end; position++)
+        transcript[at++] = sequence[position];
+    else
+      for (int64_t position = exons[i].end; position > exons[i].start;)
+        transcript[at++] = complement(sequence[--position]);
+  }
+  int found = 0;
+  int64_t best_start = 0, best_end = 0;
+  for (int64_t start = 0; start + 2 < transcript_length; start++)
+    if (is_atg(transcript + start))
+      for (int64_t end = start + 3; end + 2 < transcript_length; end += 3)
+        if (is_stop(transcript + end) &&
+            (!found || end + 3 - start > best_end - best_start)) {
+          found = 1;
+          best_start = start;
+          best_end = end + 3;
+          break;
+        }
+  free(transcript);
+  if (!found) return 0;
+  int64_t offset = 0;
+  for (int order = 0; order < exon_count; order++) {
+    int i = strand == '+' ? order : exon_count - 1 - order;
+    int64_t length = exons[i].end - exons[i].start;
+    if (best_start < offset + length && best_end > offset) {
+      int64_t local_start = best_start > offset ? best_start - offset : 0;
+      int64_t local_end = best_end < offset + length ? best_end - offset : length;
+      orf->start = strand == '+' ? exons[i].start + local_start
+                                  : exons[i].end - local_end;
+      orf->end = strand == '+' ? exons[i].start + local_end
+                                : exons[i].end - local_start;
+      break;
+    }
+    offset += length;
+  }
+  orf->transcript_start = best_start;
+  orf->transcript_end = best_end;
+  orf->length = best_end - best_start;
+  orf->strand = strand;
+  return 1;
+}
+
+static int map_transcript_range(const Segment *exons, int exon_count,
+                                int64_t from, int64_t to, char strand,
+                                Segment **mapped, int *mapped_count) {
+  int64_t offset = 0;
+  for (int order = 0; order < exon_count; order++) {
+    int i = strand == '+' ? order : exon_count - 1 - order;
+    int64_t length = exons[i].end - exons[i].start;
+    int64_t local_from = from > offset ? from - offset : 0;
+    int64_t local_to = to < offset + length ? to - offset : length;
+    if (local_from < local_to) {
+      int64_t start = strand == '+' ? exons[i].start + local_from
+                                    : exons[i].end - local_to;
+      int64_t end = strand == '+' ? exons[i].start + local_to
+                                  : exons[i].end - local_from;
+      append_segment(mapped, mapped_count, start, end);
+    }
+    offset += length;
+  }
+  return *mapped_count > 0;
+}
+
+static int emit_gff(FILE *output, const char *seqid, const char *type,
+                    int64_t start, int64_t end, char strand,
+                    int phase, const char *attributes) {
+  if (start < 0 || end <= start || (strand != '+' && strand != '-')) return 0;
+  if (fprintf(output, "%s\tanno\t%s\t%lld\t%lld\t.\t%c\t",
+              seqid, type, (long long)start + 1, (long long)end, strand) < 0)
+    return 0;
+  if (phase < 0) {
+    if (fputs(".\t", output) == EOF) return 0;
+  } else if (fprintf(output, "%d\t", phase) < 0) return 0;
+  return fprintf(output, "%s\n", attributes) >= 0;
+}
+
+static int write_decoded_block(FILE *output, const Sequence *sequence,
+                               const uint8_t *path, int64_t block_start,
+                               int64_t block_end, char strand,
+                               unsigned long gene_number) {
+  Segment *exons = NULL;
+  int exon_count = 0;
+  for (int64_t position = block_start; position < block_end;) {
+    while (position < block_end && path_is_intron(path[position])) position++;
+    if (position == block_end) break;
+    int64_t start = position;
+    while (position < block_end && !path_is_intron(path[position])) position++;
+    append_segment(&exons, &exon_count, start, position);
+  }
+  Orf orf;
+  if (!exon_count || !find_orf(sequence->sequence, sequence->length, exons,
+                                exon_count, strand, &orf)) {
+    free(exons);
+    return 0;
+  }
+  Segment *cds = NULL;
+  int cds_count = 0;
+  map_transcript_range(exons, exon_count, orf.transcript_start,
+                       orf.transcript_end, strand, &cds, &cds_count);
+  char gene_id[64], transcript_id[64], attributes[256];
+  snprintf(gene_id, sizeof(gene_id), "gene%lu", gene_number);
+  snprintf(transcript_id, sizeof(transcript_id), "mRNA%lu", gene_number);
+  int64_t gene_start = exons[0].start, gene_end = exons[0].end;
+  for (int i = 1; i < exon_count; i++) {
+    if (exons[i].start < gene_start) gene_start = exons[i].start;
+    if (exons[i].end > gene_end) gene_end = exons[i].end;
+  }
+  snprintf(attributes, sizeof(attributes), "ID=%s", gene_id);
+  int ok = emit_gff(output, sequence->name, "gene", gene_start, gene_end,
+                    strand, -1, attributes);
+  snprintf(attributes, sizeof(attributes), "ID=%s;Parent=%s", transcript_id,
+           gene_id);
+  ok = ok && emit_gff(output, sequence->name, "mRNA", gene_start, gene_end,
+                      strand, -1, attributes);
+  for (int i = 0; ok && i < exon_count; i++) {
+    snprintf(attributes, sizeof(attributes), "ID=%s.exon%d;Parent=%s",
+             transcript_id, i + 1, transcript_id);
+    ok = emit_gff(output, sequence->name, "exon", exons[i].start, exons[i].end,
+                  strand, -1, attributes);
+  }
+  int64_t transcript_length = 0;
+  for (int i = 0; i < exon_count; i++)
+    transcript_length += exons[i].end - exons[i].start;
+  int utr5 = 0, utr3 = 0;
+  Segment *utr = NULL;
+  int utr_count = 0;
+  if (orf.transcript_start > 0 &&
+      map_transcript_range(exons, exon_count, 0, orf.transcript_start, strand,
+                           &utr, &utr_count))
+    for (int i = 0; ok && i < utr_count; i++) {
+      snprintf(attributes, sizeof(attributes), "ID=%s.five_prime_UTR%d;Parent=%s",
+               transcript_id, ++utr5, transcript_id);
+      ok = emit_gff(output, sequence->name, "five_prime_UTR", utr[i].start,
+                    utr[i].end, strand, -1, attributes);
+    }
+  free(utr);
+  for (int i = 0; ok && i < cds_count; i++) {
+    int64_t coding_offset = 0;
+    for (int j = 0; j < i; j++) coding_offset += cds[j].end - cds[j].start;
+    int phase = (3 - (int)(coding_offset % 3)) % 3;
+    snprintf(attributes, sizeof(attributes), "ID=%s.cds%d;Parent=%s",
+             transcript_id, i + 1, transcript_id);
+    ok = emit_gff(output, sequence->name, "CDS", cds[i].start, cds[i].end,
+                  strand, phase, attributes);
+  }
+  utr = NULL;
+  utr_count = 0;
+  if (orf.transcript_end < transcript_length &&
+      map_transcript_range(exons, exon_count, orf.transcript_end,
+                           transcript_length, strand, &utr, &utr_count))
+    for (int i = 0; ok && i < utr_count; i++) {
+      snprintf(attributes, sizeof(attributes), "ID=%s.three_prime_UTR%d;Parent=%s",
+               transcript_id, ++utr3, transcript_id);
+      ok = emit_gff(output, sequence->name, "three_prime_UTR", utr[i].start,
+                    utr[i].end, strand, -1, attributes);
+    }
+  free(utr);
+  free(cds);
+  free(exons);
+  return ok ? 1 : -1;
+}
+
+static unsigned long write_decoded_gff(FILE *output, const Sequence *sequences,
+                                       int count, AnnoModel *model,
+                                       const char *bedgraph) {
+  BedgraphWriter writer = {0};
+  if (bedgraph) {
+    if (mkdir(bedgraph, 0777) && errno != EEXIST)
+      fail("cannot create bedGraph directory %s: %s", bedgraph, strerror(errno));
+    struct stat status;
+    if (stat(bedgraph, &status) || !S_ISDIR(status.st_mode))
+      fail("bedGraph path is not a directory: %s", bedgraph);
+    for (int class = 0; class < ANNO_CLASSES; class++) {
+      size_t size = strlen(bedgraph) + strlen(class_names[class]) + 13;
+      char *path = checked_calloc(size, 1);
+      snprintf(path, size, "%s/%s.bedgraph", bedgraph, class_names[class]);
+      writer.files[class] = fopen(path, "w");
+      if (!writer.files[class]) fail("cannot write %s", path);
+      fprintf(writer.files[class], "track type=bedGraph name=\"%s probability\"\n",
+              class_names[class]);
+      free(path);
+    }
+  }
+  unsigned long genes = 0;
+  for (int sequence_index_value = 0; sequence_index_value < count;
+       sequence_index_value++) {
+    const Sequence *sequence = &sequences[sequence_index_value];
+    float *input = checked_calloc((size_t)sequence->length *
+                                  (4 + ANNO_CWT_CHANNELS), sizeof(*input));
+    for (int64_t position = 0; position < sequence->length; position++) {
+      int base = base_index(sequence->sequence[position]);
+      for (int channel = 0; channel < 4; channel++)
+        input[(size_t)position * 7 + (size_t)channel] = base == channel;
+      for (int channel = 0; channel < ANNO_CWT_CHANNELS; channel++)
+        input[(size_t)position * 7 + 4 + (size_t)channel] =
+          (sequence->cwt[(size_t)position * ANNO_CWT_CHANNELS + (size_t)channel] -
+           model->metadata.feature_mean[4 + channel]) /
+          model->metadata.feature_std[4 + channel];
+    }
+    float *probability = checked_calloc((size_t)sequence->length * ANNO_CLASSES,
+                                        sizeof(*probability));
+    uint8_t *path = checked_calloc((size_t)sequence->length, 1);
+    if (anno_model_predict(model, input, sequence->length, probability) ||
+        !anno_grammar_decode(probability, sequence->length, 3, 3, path))
+      fail("UNet decoding failed for %s", sequence->name);
+    if (writer.files[0]) {
+      for (int class = 0; class < ANNO_CLASSES; class++) {
+        int64_t start = 0;
+        float value = -1.0f;
+        for (int64_t position = 0; position <= sequence->length; position++) {
+          float next = position < sequence->length
+            ? roundf(probability[(size_t)position * ANNO_CLASSES + class] * 10000.0f) / 10000.0f
+            : -1.0f;
+          if (position == 0) {
+            value = next;
+            continue;
+          }
+          if (position < sequence->length && next == value) continue;
+          fprintf(writer.files[class], "%s\t%lld\t%lld\t%.4f\n",
+                  sequence->name, (long long)start, (long long)position, value);
+          start = position;
+          value = next;
+        }
+      }
+    }
+    for (int64_t position = 0; position < sequence->length;) {
+      if (!path_is_transcript(path[position], '+') &&
+          !path_is_transcript(path[position], '-')) {
+        position++;
+        continue;
+      }
+      char strand = path_is_transcript(path[position], '+') ? '+' : '-';
+      int64_t start = position;
+      while (position < sequence->length &&
+             path_is_transcript(path[position], strand)) position++;
+      int result = write_decoded_block(output, sequence, path, start, position,
+                                       strand, genes + 1);
+      if (result < 0) fail("cannot write GFF for %s", sequence->name);
+      if (result > 0) genes++;
+    }
+    free(path);
+    free(probability);
+    free(input);
+  }
+  for (int class = 0; class < ANNO_CLASSES; class++)
+    if (writer.files[class] && fclose(writer.files[class]))
+      fail("cannot close bedGraph output");
+  return genes;
+}
+
+static float *normalized_features(const Sequence *sequence,
+                                  const AnnoModelMetadata *metadata) {
+  float *input = checked_calloc((size_t)sequence->length * 7, sizeof(*input));
+  for (int64_t position = 0; position < sequence->length; position++) {
+    int base = base_index(sequence->sequence[position]);
+    for (int channel = 0; channel < 4; channel++)
+      input[(size_t)position * 7 + (size_t)channel] = base == channel;
+    for (int channel = 0; channel < ANNO_CWT_CHANNELS; channel++)
+      input[(size_t)position * 7 + 4 + (size_t)channel] =
+        (sequence->cwt[(size_t)position * ANNO_CWT_CHANNELS + (size_t)channel] -
+         metadata->feature_mean[4 + channel]) /
+        metadata->feature_std[4 + channel];
+  }
+  return input;
+}
+
+static void compute_metadata(Sequence *sequences, int count,
+                             AnnoModelMetadata *metadata) {
+  long double sums[7] = {0}, squares[7] = {0};
+  uint64_t total = 0;
+  for (int i = 0; i < count; i++) {
+    int64_t limit = sequences[i].length - sequences[i].length / 5;
+    for (int64_t position = 0; position < limit; position++) {
+      int base = base_index(sequences[i].sequence[position]);
+      total++;
+      for (int channel = 0; channel < 7; channel++) {
+        float value = channel < 4
+          ? (float)(base == channel)
+          : sequences[i].cwt[(size_t)position * ANNO_CWT_CHANNELS +
+                             (size_t)channel - 4];
+        sums[channel] += value;
+        squares[channel] += (long double)value * value;
+      }
+    }
+  }
+  for (int channel = 0; channel < 7; channel++) {
+    long double mean = total ? sums[channel] / total : 0.0;
+    long double variance = total ? squares[channel] / total - mean * mean : 1.0;
+    if (variance < 1e-12) variance = 1.0;
+    metadata->feature_mean[channel] = (float)mean;
+    metadata->feature_std[channel] = sqrtf((float)variance);
+  }
+}
+
+static AnnoModel *train_model(const Options *options, Sequence *sequences,
+                              int count, const char *annotation) {
+  FeatureList features = read_features(annotation, sequences, count);
+  mark_labels(sequences, count, &features);
+  feature_free(&features);
+  AnnoUnetConfig config = {7, ANNO_CLASSES, 8, 3, 3};
+  AnnoModel *model = anno_model_create(&config);
+  if (!model) fail("cannot create 7-state UNet");
+  compute_metadata(sequences, count, &model->metadata);
+  for (int i = 0; i < count; i++) {
+    float *input = normalized_features(sequences + i, &model->metadata);
+    int64_t training_length = sequences[i].length -
+                              sequences[i].length / 5;
+    if (training_length < 1) training_length = sequences[i].length;
+    if (anno_model_train(model, input, sequences[i].labels, training_length,
+                         options->iterations, ANNO_CWT_WINDOW, 0.01f,
+                         (uint64_t)i + 1))
+      fail("training failed for %s", sequences[i].name);
+    free(input);
+  }
+  if (anno_model_save(model, options->model))
+    fail("cannot save model %s", options->model);
+  fprintf(stderr, "Trained 7-state UNet on %d contigs\n", count);
+  return model;
+}
+
+static void reverse_complement(const char *sequence, int64_t length, char *out) {
+  for (int64_t i = 0; i < length; i++)
+    out[i] = complement(sequence[length - i - 1]);
+  out[length] = '\0';
+}
+
+static void run_cwt(const char *fasta, const char *directory) {
+  int count = 0;
+  Sequence *sequences = read_fasta(fasta, &count);
+  if (mkdir(directory, 0777) && errno != EEXIST)
+    fail("cannot create CWT directory %s: %s", directory, strerror(errno));
+  FILE *matrix = NULL, *index = NULL;
+  char *matrix_path = checked_calloc(strlen(directory) + 12, 1);
+  char *index_path = checked_calloc(strlen(directory) + 14, 1);
+  sprintf(matrix_path, "%s/matrix.bin", directory);
+  sprintf(index_path, "%s/contigs.tsv", directory);
+  matrix = fopen(matrix_path, "wb");
+  index = fopen(index_path, "w");
+  if (!matrix || !index) fail("cannot create CWT output in %s", directory);
+  fprintf(index, "# anno-cwt-v2\n# scales\t4,5,6\nseqid\tlength\tplus_offset\tminus_offset\n");
   size_t rows = 0;
-  for (int c = 0; c < count; c++) {
-    Contig *g = contigs + c;
-    fprintf(index, "%s\t%d\t%zu\t%zu\n", g->name, g->length, rows, rows + g->length);
-    if ((size_t)g->length > SIZE_MAX / CWT_CHANNELS) anno_fail("CWT output size overflow");
-    size_t value_count = (size_t)g->length * CWT_CHANNELS;
-    char *reverse = anno_alloc((size_t)g->length + 1, 1);
-    for (int i = 0; i < g->length; i++) {
-      int base = base_index(g->seq[g->length - 1 - i]);
-      reverse[i] = base < 0 ? 'N' : "TGCA"[base];
-    }
-    for (int strand = 0; strand < 2; strand++) {
-      const char *bases = strand ? reverse : g->seq;
-      void *mapping;
-      size_t mapping_size;
-      off_t file_position;
-      float *values = cwt_map_output(matrix, value_count, &mapping, &mapping_size, &file_position);
-      cwt_transform(wavelets, bases, g->length, threads, values, NULL);
-      cwt_unmap_output(matrix, values, value_count, mapping, mapping_size, file_position);
-    }
+  for (int i = 0; i < count; i++) {
+    size_t values = (size_t)sequences[i].length * ANNO_CWT_CHANNELS * 2;
+    float *complex_values = checked_calloc(values, sizeof(*complex_values));
+    char *reverse = checked_calloc((size_t)sequences[i].length + 1, 1);
+    cwt_values(sequences[i].sequence, sequences[i].length, complex_values);
+    reverse_complement(sequences[i].sequence, sequences[i].length, reverse);
+    float *reverse_values = checked_calloc(values, sizeof(*reverse_values));
+    cwt_values(reverse, sequences[i].length, reverse_values);
+    fprintf(index, "%s\t%lld\t%zu\t%zu\n", sequences[i].name,
+            (long long)sequences[i].length, rows, rows + (size_t)sequences[i].length);
+    if (fwrite(complex_values, sizeof(float), values, matrix) != values ||
+        fwrite(reverse_values, sizeof(float), values, matrix) != values)
+      fail("cannot write CWT matrix");
+    rows += (size_t)sequences[i].length * 2;
+    free(reverse_values);
     free(reverse);
-    rows += 2 * (size_t)g->length;
+    free(complex_values);
   }
-  if (fclose(matrix) || fclose(index)) anno_fail("Cannot finish CWT export");
-  free_contigs(contigs, count);
-  fprintf(stderr, "Saved %zu rows x %d complex64 scales\n", rows, WAVE_COUNT);
+  if (fclose(matrix) || fclose(index)) fail("cannot close CWT output");
+  free(matrix_path);
+  free(index_path);
+  sequence_free(sequences, count);
 }
 
-static int usage(const char *program, int status) {
-  fprintf(stderr, "Usage: %s [-m model] [-i initial_model] [-e iterations] [-p threads] <genome.fa[.gz]> [<train.gff3[.gz]>] > genes.gff3\n"
-                  "       %s [-p threads] cwt <genome.fa[.gz]> <new_directory>\n", program, program);
-  return status;
-}
-
-static int parse_threads(const char *value) {
-  char *end;
+static int positive_integer(const char *text, const char *name) {
+  char *end = NULL;
   errno = 0;
-  long count = strtol(value, &end, 10);
-  if (errno || end == value || *end || count < 1 || count > INT_MAX)
-    anno_fail("Invalid thread count: %s", value);
-  return (int)count;
+  long value = strtol(text, &end, 10);
+  if (errno || end == text || *end || value < 1 || value > INT_MAX)
+    fail("invalid %s: %s", name, text);
+  return (int)value;
+}
+
+static void usage(const char *program) {
+  fprintf(stderr,
+    "Usage: %s [-m model] [-i iterations] [-p threads] [-b bedgraph_dir] "
+    "<genome.fa[.gz]> [annotation.gff3[.gz]]\n"
+    "       %s [-p threads] cwt <genome.fa[.gz]> <directory>\n",
+    program, program);
+}
+
+static int self_test(void) {
+  AnnoUnetConfig config = {7, ANNO_CLASSES, 4, 2, 3};
+  AnnoModel *model = anno_model_create(&config);
+  if (!model) return 0;
+  float input[17 * 7] = {0};
+  float probability[17 * ANNO_CLASSES];
+  if (anno_model_predict(model, input, 17, probability)) {
+    anno_model_destroy(model);
+    return 0;
+  }
+  for (int i = 0; i < 17; i++) {
+    float sum = 0.0f;
+    for (int class = 0; class < ANNO_CLASSES; class++)
+      sum += probability[i * ANNO_CLASSES + class];
+    if (!isfinite(sum) || fabsf(sum - 1.0f) > 1e-5f) {
+      anno_model_destroy(model);
+      return 0;
+    }
+  }
+  uint8_t labels[17] = {0};
+  if (anno_model_train(model, input, labels, 17, 10, 17, 0.1f, 1) ||
+      anno_model_save(model, "/tmp/anno-7-state-test.model")) {
+    anno_model_destroy(model);
+    return 0;
+  }
+  AnnoModel *loaded = NULL;
+  int ok = !anno_model_load(&loaded, "/tmp/anno-7-state-test.model");
+  remove("/tmp/anno-7-state-test.model");
+  anno_model_destroy(loaded);
+  anno_model_destroy(model);
+  if (!ok) return 0;
+  uint8_t path[] = {0, 1, 2, 2, 3, 3, 2, 4, 0};
+  if (!anno_grammar_transition(0, 2) ||
+      !anno_grammar_transition(2, 3) ||
+      anno_class_for_state(ANNO_STATE_MINUS_INTRON) != ANNO_MINUS_INTRON ||
+      path[0] != ANNO_STATE_INTERGENIC)
+    return 0;
+  const char plus_sequence[] = "ATGAAATAGCCC";
+  Segment plus_exon = {0, 12};
+  Orf plus_orf;
+  if (!find_orf(plus_sequence, 12, &plus_exon, 1, '+', &plus_orf) ||
+      plus_orf.transcript_start != 0 || plus_orf.transcript_end != 9)
+    return 0;
+  const char minus_sequence[] = "GGGCTATTTCATGGG";
+  Segment minus_exon = {3, 12};
+  Orf minus_orf;
+  if (!find_orf(minus_sequence, 15, &minus_exon, 1, '-', &minus_orf) ||
+      minus_orf.transcript_start != 0 || minus_orf.transcript_end != 9)
+    return 0;
+  const char spliced_sequence[] = "ATGAAACCCCTAGCCC";
+  Segment spliced_exons[] = {{0, 6}, {10, 16}};
+  Orf spliced_orf;
+  if (!find_orf(spliced_sequence, 16, spliced_exons, 2, '+', &spliced_orf) ||
+      spliced_orf.transcript_end != 9)
+    return 0;
+  uint8_t decoded[12];
+  for (int i = 0; i < 12; i++) decoded[i] = ANNO_STATE_PLUS_EXON;
+  Sequence sequence = {.name = "self", .sequence = (char *)plus_sequence,
+                       .length = 12};
+  FILE *gff = tmpfile();
+  if (!gff || write_decoded_block(gff, &sequence, decoded, 0, 12, '+', 1) != 1) {
+    if (gff) fclose(gff);
+    return 0;
+  }
+  rewind(gff);
+  char line[1024];
+  int records = 0;
+  while (fgets(line, sizeof(line), gff)) records++;
+  fclose(gff);
+  return records >= 4;
 }
 
 int main(int argc, char **argv) {
-  const char *model = "anno.model";
-  const char *initial_model = NULL;
-  int iterations = DEFAULT_ITERATIONS, threads = 1, option;
-  ketopt_t options = KETOPT_INIT;
-  while ((option = ketopt(&options, argc, argv, 0, "m:i:e:p:h", NULL)) >= 0) {
-    if (option == 'h') return usage(argv[0], 0);
-    if (option == 'p') threads = parse_threads(options.arg);
-    else if (option == 'm') model = options.arg;
-    else if (option == 'i') initial_model = options.arg;
-    else if (option == 'e' && atoi(options.arg) > 0) iterations = atoi(options.arg);
-    else return usage(argv[0], 1);
+  if (argc == 2 && !strcmp(argv[1], "--self-test"))
+    return self_test() ? EXIT_SUCCESS : EXIT_FAILURE;
+  Options options = {
+    .model = "anno.model", .iterations = ANNO_DEFAULT_ITERATIONS, .threads = 1
+  };
+  int argument = 1;
+  while (argument < argc && argv[argument][0] == '-') {
+    const char *option = argv[argument++];
+    if (!strcmp(option, "-h") || !strcmp(option, "--help")) {
+      usage(argv[0]);
+      return EXIT_SUCCESS;
+    }
+    if (argument >= argc) {
+      usage(argv[0]);
+      return EXIT_FAILURE;
+    }
+    if (!strcmp(option, "-m") || !strcmp(option, "--model")) {
+      options.model = argv[argument++];
+    } else if (!strcmp(option, "-b") || !strcmp(option, "--bedgraph")) {
+      options.bedgraph = argv[argument++];
+    } else if (!strcmp(option, "-i") || !strcmp(option, "--iterations")) {
+      options.iterations = positive_integer(argv[argument++], "iterations");
+    } else if (!strcmp(option, "-p") || !strcmp(option, "--threads")) {
+      options.threads = positive_integer(argv[argument++], "threads");
+    } else {
+      usage(argv[0]);
+      return EXIT_FAILURE;
+    }
   }
-  int rest = argc - options.ind;
-  char **args = argv + options.ind;
-  int export = rest == 3 && !strcmp(args[0], "cwt");
-  if (!export && (rest < 1 || rest > 2))
-    return usage(argv[0], 1);
-  if (initial_model && (export || rest != 2))
-    anno_fail("Initial model is only supported for training");
-  Wavelets wavelets;
-  wavelets_init(&wavelets);
-  if (export) {
-    export_cwt(&wavelets, args[1], args[2], threads);
-    wavelets_free(&wavelets);
-    return 0;
+  if (argument < argc && !strcmp(argv[argument], "cwt")) {
+    if (options.bedgraph || argc - argument != 3) {
+      usage(argv[0]);
+      return EXIT_FAILURE;
+    }
+    run_cwt(argv[argument + 1], argv[argument + 2]);
+    return EXIT_SUCCESS;
   }
-  crf_init();
-  double *weights = anno_alloc(WEIGHTS, sizeof(*weights));
-  if (rest == 1) load_model(model, weights);
-  if (initial_model) {
-    load_model(initial_model, weights);
-    fprintf(stderr, "Warm start from %s\n", initial_model);
+  int remaining = argc - argument;
+  if (remaining < 1 || remaining > 2) {
+    usage(argv[0]);
+    return EXIT_FAILURE;
   }
-  int count;
-  Contig *contigs = read_fasta(args[0], &count);
-  CwtStore cwt = cwt_store(contigs, count);
-  for (int c = 0; c < count; c++)
-    cwt_transform(&wavelets, contigs[c].seq, contigs[c].genome_length, threads, NULL, contigs[c].cwt_power);
-  if (rest == 2) {
-    for (int c = 0; c < count; c++) contigs[c].label = anno_alloc(contigs[c].genome_length, 1);
-    int skipped, used = label_cds(contigs, count, args[1], &skipped);
-    fprintf(stderr, "Training on %d transcripts (%d overlapping or inconsistent skipped)\n", used, skipped);
-    crf_train(contigs, count, weights, iterations, threads);
-    save_model(model, weights);
+  (void)options.threads;
+  int count = 0;
+  Sequence *sequences = read_fasta(argv[argument], &count);
+  for (int i = 0; i < count; i++) {
+    sequences[i].cwt = checked_calloc((size_t)sequences[i].length *
+                                      ANNO_CWT_CHANNELS, sizeof(float));
+    cwt_power(sequences[i].sequence, sequences[i].length, sequences[i].cwt);
   }
+  AnnoModel *model = remaining == 2
+    ? train_model(&options, sequences, count, argv[argument + 1]) : NULL;
+  if (!model && anno_model_load(&model, options.model))
+    fail("cannot read 7-state model %s", options.model);
   puts("##gff-version 3");
-  unsigned long genes = 0;
-  for (int c = 0; c < count; c++) {
-    uint8_t *path = anno_alloc(contigs[c].length, 1);
-    crf_decode_threads(weights, contigs + c, path, threads);
-    write_gff(contigs + c, path, &genes);
-    free(path);
-    fprintf(stderr, "Annotated %s: %d bp\n", contigs[c].name, contigs[c].length);
-  }
-  if (fflush(stdout) || ferror(stdout)) anno_fail("Cannot write GFF");
+  unsigned long genes = write_decoded_gff(stdout, sequences, count, model,
+                                          options.bedgraph);
+  if (fflush(stdout) || ferror(stdout)) fail("cannot write GFF3");
   fprintf(stderr, "Predicted %lu genes\n", genes);
-  wavelets_free(&wavelets);
-  free_contigs(contigs, count);
-  if (munmap(cwt.data, cwt.size)) anno_fail("Cannot release CWT scratch mapping: %s", strerror(errno));
-  free(weights);
-  return 0;
+  anno_model_destroy(model);
+  sequence_free(sequences, count);
+  return EXIT_SUCCESS;
 }

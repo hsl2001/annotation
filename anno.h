@@ -1,54 +1,69 @@
 #ifndef ANNO_H
 #define ANNO_H
 
-#include <complex.h>
-#include <limits.h>
-#include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
-#define CWT_SCALES 4, 5, 6
-#define WAVE_COUNT 3
-#define CWT_WINDOW_SIZE 1024
-#define CWT_CHANNELS (2 * WAVE_COUNT)
+#define ANNO_CLASSES 7
+#define ANNO_DECODED_STATES 9
+#define ANNO_CWT_CHANNELS 3
+#define ANNO_CWT_WINDOW 1024
+#define ANNO_DEFAULT_ITERATIONS 300
 
-#define MIN_CDS 6
-#define DEFAULT_ITERATIONS 300
+typedef enum {
+  ANNO_INTERGENIC = 0,
+  ANNO_PLUS_INTRON = 1,
+  ANNO_PLUS_5UTR = 2,
+  ANNO_PLUS_3UTR = 3,
+  ANNO_MINUS_INTRON = 4,
+  ANNO_MINUS_5UTR = 5,
+  ANNO_MINUS_3UTR = 6
+} AnnoClass;
+
+typedef enum {
+  ANNO_STATE_INTERGENIC = 0,
+  ANNO_STATE_PLUS_5UTR = 1,
+  ANNO_STATE_PLUS_EXON = 2,
+  ANNO_STATE_PLUS_INTRON = 3,
+  ANNO_STATE_PLUS_3UTR = 4,
+  ANNO_STATE_MINUS_5UTR = 5,
+  ANNO_STATE_MINUS_EXON = 6,
+  ANNO_STATE_MINUS_INTRON = 7,
+  ANNO_STATE_MINUS_3UTR = 8
+} AnnoDecodedState;
 
 typedef struct {
-   double _Complex *kernel[WAVE_COUNT];
-   int widths[WAVE_COUNT], max_width;
-} Wavelets;
+  int input_channels;
+  int classes;
+  int base_channels;
+  int depth;
+  int kernel_size;
+} AnnoUnetConfig;
+
 typedef struct {
-   char *name, *seq;
-   int length, genome_length, offset;
-   float *cwt_power;
-   uint8_t *label;
-} Contig;
+  float feature_mean[ANNO_CWT_CHANNELS + 4];
+  float feature_std[ANNO_CWT_CHANNELS + 4];
+  uint32_t window_size;
+  uint32_t cwt_scales[ANNO_CWT_CHANNELS];
+  char class_names[ANNO_CLASSES][24];
+} AnnoModelMetadata;
 
-extern const int wave_sizes[WAVE_COUNT];
-void anno_fail(const char *format, ...);
-void *anno_alloc(size_t count, size_t size);
+typedef struct AnnoModel AnnoModel;
 
-static inline int base_index(char base) {
-  switch (base) {
-  case 'A': case 'a': return 0;
-  case 'C': case 'c': return 1;
-  case 'G': case 'g': return 2;
-  case 'T': case 't': return 3;
-  default: return -1;
-  }
-}
+int anno_class_for_state(uint8_t state);
+int anno_grammar_transition(uint8_t previous, uint8_t current);
+int anno_grammar_decode(const float *probability, int64_t length,
+                        int min_exon, int min_intron, uint8_t *path);
 
-static inline int is_cds(int state) {
-  return (state >= 1 && state <= 3) || (state >= 7 && state <= 9);
-}
-
-static inline int is_intron(int state) {
-  return (state >= 4 && state <= 6) || (state >= 10 && state <= 12);
-}
-
-Contig *read_fasta(const char *path, int *count);
-int label_cds(Contig *contigs, int count, const char *gff, int *skipped);
-void write_gff(const Contig *contig, const uint8_t *path, unsigned long *genes);
+AnnoModel *anno_model_create(const AnnoUnetConfig *config);
+void anno_model_destroy(AnnoModel *model);
+int anno_model_predict(const AnnoModel *model, const float *input,
+                        int64_t length, float *probability);
+int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
+                     int64_t length, int iterations, int batch_size,
+                     float learning_rate, uint64_t seed);
+int anno_model_save(const AnnoModel *model, const char *path);
+int anno_model_load(AnnoModel **model, const char *path);
+const AnnoModelMetadata *anno_model_metadata(const AnnoModel *model);
 
 #endif

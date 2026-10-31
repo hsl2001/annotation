@@ -1,0 +1,331 @@
+annotation anno 7-state 순수 C UNet 재구현 계획
+============================================
+
+목표
+----
+기존 anno의 외부 실행 API와 입력/출력 형식을 유지한다.
+내부의 수작업 emission feature 계산은 1D UNet 확률 기반으로 교체한다.
+최종 gene structure decoding은 7-state grammar/Viterbi 제약으로 수행한다.
+구현은 순수 C11로 작성하며 Python, PyTorch, FANN 런타임 의존성을 추가하지 않는다.
+
+기존 API 보존
+------------
+
+다음 anno 명령 형식을 유지한다.
+
+  ./anno [options] genome.fasta annotation.gff3
+
+기존 옵션과 의미를 유지한다.
+
+  -p N       thread 수
+  -i N       학습 iteration 수
+  -m FILE    model 파일 경로
+  -h         도움말
+
+기존 동작을 유지한다.
+
+  - annotation이 제공되면 training mode
+  - annotation이 없거나 기존 prediction mode 조건이면 decoding mode
+  - 결과 GFF3는 stdout으로 출력
+  - `-b DIR` 또는 `--bedgraph DIR` 지정 시 UNet 7-class 확률을
+    class별 bedGraph 파일로 출력
+  - 로그와 오류는 stderr로 출력
+  - FASTA/GFF3 gzip 입력 지원
+  - 기존 exit status와 오류 처리 규약 유지
+  - plot.py를 위한 cwt 서브커맨드 유지. 
+    - plot.py는 최신 ../annotation-poc의 plot.py에 추가된 기능들을 이 코드베이스에 재도입. 
+
+기존 API와 호환되지 않는 새 CLI를 만들지 않는다.
+모델 파일은 UNet binary checkpoint 형식만 지원한다.
+
+최종 파이프라인
+----------------
+
+FASTA
+  -> C sequence encoder + CWT feature
+  -> 순수 C 1D UNet
+  -> position별 7-class probability
+  -> log probability emission
+  -> C 7-state grammar/Viterbi decoding
+  -> transcript exon 구조
+  -> transcript별 최장 ORF 선택
+  -> gene/mRNA/exon/5'UTR/CDS/3'UTR GFF3
+
+출력 class
+----------
+
+UNet은 한 번의 genomic sequence 추론으로 다음 class를 출력한다.
+
+  0 intergenic
+  1 plus_intron
+  2 plus_five_prime_UTR
+  3 plus_three_prime_UTR
+  4 minus_intron
+  5 minus_five_prime_UTR
+  6 minus_three_prime_UTR
+
+reverse-complement sequence를 별도로 다시 추론하지 않는다.
+reverse strand는 strand별 출력 class와 CRF grammar 상태로 처리한다.
+
+순수 C 구현 원칙
+----------------
+
+  - C11 표준만 사용한다.
+  - 외부 ML runtime을 사용하지 않는다.
+  - 기존 zlib 의존성은 gzip FASTA/GFF 처리를 위해 유지한다.
+  - CWT와 UNet 실행 경로는 anno.c에 함께 둔다.
+  - malloc/free 소유권을 명확히 한다.
+  - sequence length에 비례하는 메모리 사용량을 문서화한다.
+  - NaN/Inf, overflow, integer overflow를 명시적으로 검사한다.
+  - thread worker마다 임시 buffer를 독립적으로 둔다.
+  - stdout은 GFF3 결과 전용, stderr는 로그 전용으로 유지한다.
+
+파일 계획
+---------
+
+  anno.h       7-state public API와 model 자료구조
+  anno.c       CLI, FASTA/GFF 입력, CWT, UNet, grammar, ORF, GFF3
+  Makefile     단일 production binary와 self-test
+
+legacy CRF model, CRF header, 분리 module source는 지원하지 않는다.
+
+1. 입력과 label vector
+----------------------
+
+기존 GFF parser를 확장해 다음 feature를 읽는다.
+
+  gene, mRNA/transcript, exon, CDS,
+  five_prime_UTR, three_prime_UTR, intron
+
+내부 좌표:
+
+  - GFF 입력: 1-based inclusive
+  - C 배열: 0-based half-open
+
+FASTA와 GFF의 sequence ID/길이를 검증한다.
+지원하지 않는 strand, 역좌표, 범위 밖 좌표는 오류로 처리한다.
+
+training label은 strand-aware 7-class vector로 만든다.
+겹치는 annotation은 다음 우선순위를 사용한다.
+
+  explicit UTR/intron > inferred intron > intergenic
+
+CDS/exon은 UNet class로 직접 분리하지 않는다.
+문법 decoder가 UTR과 intron 사이의 exon 후보를 만들고,
+ORF resolver가 그 안에서 CDS를 결정한다.
+
+2. minisplice 방식의 1D CNN 블록
+--------------------------------
+
+minisplice의 1D convolution 설계를 참고하되 코드는 C로 재작성한다.
+
+입력 channel:
+
+  - A/C/G/T one-hot
+  - 기존 CWT channel
+  - 필요한 경우 donor/acceptor motif channel
+
+첫 구현에서는 sequence one-hot + CWT만 사용한다.
+추가 motif channel은 baseline 성능 검증 후 넣는다.
+
+각 convolution layer:
+
+  - 1D same convolution
+  - 명시적 padding
+  - ReLU 또는 지정된 activation
+  - weight/bias float32
+
+3. 1D UNet
+----------
+
+encoder:
+
+  - convolution block
+  - downsampling
+  - 넓은 genomic context 확보
+
+bottleneck:
+
+  - 가장 낮은 resolution에서 convolution block
+
+decoder:
+
+  - upsampling 또는 transposed convolution
+  - encoder skip connection
+  - 원래 sequence length로 복원
+
+head:
+
+  - 1x1 convolution
+  - 7 logits
+  - stable softmax
+
+API 예:
+
+  Unet *unet_create(const UnetConfig *config);
+  void unet_destroy(Unet *unet);
+  int unet_predict(const Unet *unet, const float *input,
+                   int64_t length, float *probability);
+  int unet_load(const char *path, Unet **out);
+  int unet_save(const char *path, const Unet *unet);
+
+입력 길이가 pooling 배수와 맞지 않을 때 explicit padding 후 원래 길이로 crop한다.
+prediction 결과 length는 항상 FASTA sequence length와 같아야 한다.
+
+4. C 학습
+---------
+
+기존 anno의 training API를 유지하되 내부 objective를 UNet에 맞춘다.
+
+  - mini-batch window sampling
+  - train/validation 분리
+  - feature mean/std를 train 영역에서만 계산
+  - weighted cross entropy 또는 focal loss
+  - seed 지정
+  - best validation checkpoint 저장
+  - thread 수는 기존 -p 옵션으로 제어
+
+학습용 model 파일에는 다음 metadata를 저장한다.
+
+  - magic/version
+  - endian marker
+  - architecture configuration
+  - class count/names
+  - CWT parameters
+  - normalization mean/std
+  - window size
+  - weights
+  - checksum
+
+prediction에서는 binary model을 기본 사용한다.
+
+5. CRF grammar decoding
+-----------------------
+
+UNet probability를 다음 emission으로 변환한다.
+
+  emission(state, position) = log(probability[class] + epsilon)
+
+CRF transition은 다음 biological grammar를 표현한다.
+
+  INTERGENIC
+  PLUS_5UTR -> PLUS_EXON -> PLUS_INTRON -> PLUS_EXON -> PLUS_3UTR
+  MINUS_5UTR -> MINUS_EXON -> MINUS_INTRON -> MINUS_EXON -> MINUS_3UTR
+
+허용 조건:
+
+  - 단일 exon transcript
+  - 여러 exon transcript
+  - intron 최소 길이
+  - exon 최소 길이
+  - UTR 순서
+  - strand 방향
+  - donor/acceptor motif bonus
+  - transcript 시작/종료 penalty
+
+intergenic에서 intron으로 직접 진입하지 않는다.
+5'UTR과 3'UTR을 직접 연결하지 않는다.
+최종 경로는 기존 CRF의 Viterbi 출력 경계를 유지한다.
+
+6. 최장 ORF
+-----------
+
+decoded exon을 transcript 방향으로 정렬한다.
+
+  - plus: genomic ascending
+  - minus: genomic descending 후 reverse-complement
+
+spliced transcript sequence에서 모든 reading frame과 ATG 후보를 검사한다.
+
+유효 ORF:
+
+  - ATG로 시작
+  - in-frame stop codon으로 종료
+  - stop codon 포함
+  - 유효 후보 중 가장 긴 것 선택
+
+유효 ORF가 없으면 해당 transcript는 기본적으로 GFF에 출력하지 않는다.
+
+7. GFF3 출력
+------------
+
+각 선택 transcript에 대해 다음 feature를 출력한다.
+
+  gene
+  mRNA
+  exon
+  five_prime_UTR
+  CDS
+  three_prime_UTR
+
+exon은 UTR/CDS 경계를 기준으로 분할할 수 있다.
+각 CDS segment는 transcript 방향 기준으로 phase를 계산한다.
+모든 ID/Parent 관계를 검증한 뒤 stdout에 GFF3를 출력한다.
+
+8. accuracy.py
+--------------
+
+accuracy만 유일하게 Python을 활용한다. 
+
+필수 지표:
+
+  - exon-segment
+  - locus
+  - nt
+
+추가 지표:
+
+  - CDS-segment
+  - five_prime_UTR-segment
+  - three_prime_UTR-segment
+
+9. 테스트
+--------
+
+Makefile target:
+
+  make
+  make test
+
+필수 테스트:
+
+  - UNet layer shape와 output length
+  - padding/crop 경계
+  - finite probability와 softmax 합 1
+  - 작은 synthetic 데이터 overfit
+  - plus/minus ORF
+  - 여러 exon에 걸친 ORF
+  - stop codon 없는 후보
+  - GFF ID/Parent/phase 유효성
+  - GFF -> vector -> GFF round-trip
+  - self-comparison accuracy 100%
+  - empty prediction의 0 metric 처리
+  - 기존 anno command line invocation
+
+10. 구현 순서
+------------
+
+  1) 현재 anno API와 Makefile target을 고정하고 regression test 작성
+  2) C label vector와 GFF writer 구현
+  3) minisplice 방식 1D convolution primitive 구현
+  4) 1D UNet forward와 binary model load/save 구현
+  5) synthetic input으로 UNet shape/finite 테스트
+  6) UNet output을 기존 CRF emission 인터페이스에 연결
+  7) CRF grammar와 Viterbi 경로 검증
+  8) ORF resolver와 CDS phase 구현
+  9) gene/mRNA/exon/UTR/CDS GFF 출력 구현
+ 10) accuracy evaluator와 end-to-end test 추가
+ 11) UNet-only emission 성능 확인
+
+완료 조건
+--------
+
+  - 현재 anno 명령/API로 실행 가능
+  - 전체 runtime이 순수 C11 + 기존 zlib/math/pthread 범위
+  - reverse strand 별도 재추론 없음
+  - UNet이 position별 7-class probability 생성
+  - CRF/Viterbi가 최종 구조를 결정
+  - transcript별 최장 ATG-to-stop ORF가 CDS로 출력
+  - 5'UTR, CDS, 3'UTR, exon, gene이 유효한 GFF3로 출력
+  - self round-trip accuracy 100%
+  - synthetic, ORF, grammar, GFF 테스트 통과
