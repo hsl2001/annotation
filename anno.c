@@ -696,7 +696,7 @@ typedef struct {
 
 UnetConfig unet_default_config(void) {
   return (UnetConfig){.depth = 4, .kernel = 9, .pool = 4,
-                      .channels = {32, 64, 96, 128}};
+                      .channels = {64, 72, 128, 256}};
 }
 
 /** @brief Channels entering level l. */
@@ -1089,10 +1089,10 @@ static void level_backward(const Unet *unet, Workspace *w, int level,
 }
 
 /**
- * @brief ANNEVO-style loss of one window: focal cross entropy (gamma 2)
- *        plus per-class soft-F1 (dice) of every non-intergenic class; a
- *        class absent from the window contributes its mean false-positive
- *        probability. Writes scale * dL/dlogits to w->glogits.
+ * @brief ANNEVO-style loss of one window: per-class soft-F1 (dice) of every
+ *        non-intergenic class; a class absent from the window contributes
+ *        its mean false-positive probability. Writes scale * dL/dlogits to
+ *        w->glogits.
  * @param valid labelled positions; padding beyond it gets zero gradient.
  * @return unscaled loss.
  */
@@ -1122,12 +1122,12 @@ static double window_loss(Workspace *w, int64_t valid, int64_t n, float scale) {
     if (sum_y[j] > 0) {
       double u = sum_p[j] + sum_y[j] + ANNO_DICE_EPSILON;
       double top = 2.0 * intersection[j] + ANNO_DICE_EPSILON;
-      loss += ANNO_DICE_WEIGHT * (1.0 - top / u);
+      loss += (1.0 - top / u);
       slope[j] = -2.0 / u;           /* times y_i */
       offset[j] = top / (u * u);     /* every position */
     } else {
       double count = fp_count[j] > 1 ? fp_count[j] : 1.0;
-      loss += ANNO_DICE_WEIGHT * fp_sum[j] / count;
+      loss += fp_sum[j] / count;
       fp_weight[j] = 1.0 / count;
     }
   }
@@ -1137,19 +1137,14 @@ static double window_loss(Workspace *w, int64_t valid, int64_t n, float scale) {
     float *g = w->glogits + (size_t)i * ANNO_CLASSES;
     int t = y[i], top = 0;
     for (int j = 1; j < ANNO_CLASSES; j++) if (row[j] > row[top]) top = j;
-    double pt = row[t] > 1e-12f ? row[t] : 1e-12;
-    double miss = 1.0 - pt;
-    loss += -miss * miss * log(pt) / (double)valid;
-    /* d/dz of -(1-pt)^2 log pt: (2(1-pt) pt log pt - (1-pt)^2)(delta - p) */
-    double a = (ANNO_FOCAL_GAMMA * miss * pt * log(pt) - miss * miss) / (double)valid;
     double gp[ANNO_CLASSES], dot = 0.0;
     for (int j = 0; j < ANNO_CLASSES; j++) {
-      gp[j] = ANNO_DICE_WEIGHT * (slope[j] * (t == j) + offset[j] +
+      gp[j] = (slope[j] * (t == j) + offset[j] +
                                   (top == j && top != t ? fp_weight[j] : 0.0));
       dot += gp[j] * row[j];
     }
     for (int j = 0; j < ANNO_CLASSES; j++)
-      g[j] = scale * (float)(a * ((t == j) - row[j]) + row[j] * (gp[j] - dot));
+      g[j] = scale * (float)(row[j] * (gp[j] - dot));
   }
   return loss;
 }

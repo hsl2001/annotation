@@ -339,7 +339,7 @@ static void test_gradient(void) {
   double worst = 0.0;
   for (size_t k = 0; k < unet->parameters; k += 5) {
     float original = unet->weights[k];
-    const double h = 1e-3;
+    const double h = 1e-4;
     unet->weights[k] = original + (float)h;
     unet_forward(unet, w, n);
     double plus = window_loss(w, n, n, 1.0f);
@@ -348,7 +348,8 @@ static void test_gradient(void) {
     double minus = window_loss(w, n, n, 1.0f);
     unet->weights[k] = original;
     double numeric = (plus - minus) / (2 * h), analytic = w->gradient[k];
-    worst = fmax(worst, fabs(numeric - analytic) / (fabs(numeric) + fabs(analytic) + 1e-3));
+    worst = fmax(worst, fabs(numeric - analytic) /
+                         (fabs(numeric) + fabs(analytic) + 1e-3));
   }
   CHECK(worst < 0.05);
   workspace_destroy(w);

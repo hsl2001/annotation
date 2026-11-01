@@ -36,11 +36,9 @@
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS 4
+#define ANNO_BATCH_WINDOWS 8
 #define ANNO_LEARNING_RATE 3e-3f
-#define ANNO_FOCAL_GAMMA 2.0f
 #define ANNO_DICE_EPSILON 1e-5f
-#define ANNO_DICE_WEIGHT 1.0     /**< weight of the soft-F1(dice) term vs focal(ce) */
 #define ANNO_GRADIENT_CLIP 1.0f
 #define ANNO_SEED 2026u
 /**@}*/

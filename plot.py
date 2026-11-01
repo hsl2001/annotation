@@ -4,24 +4,27 @@
 # dependencies = [
 #     "matplotlib",
 #     "numpy",
+#     "numba",
 # ]
 # ///
 
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-import csv
 from dataclasses import dataclass
 import gzip
+import hashlib
 import json
+import logging
+import math
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from typing import Any, Callable, Iterator, Sequence, TextIO
+from typing import Any, Callable, Iterable, Iterator, Literal, Sequence, TextIO, TypeVar
 
 import matplotlib
 matplotlib.use("Agg")
@@ -30,10 +33,14 @@ from matplotlib.patches import PathPatch
 import matplotlib.pyplot as plt
 from matplotlib.textpath import TextPath
 from matplotlib.transforms import Affine2D
+from numba import njit
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import DTypeLike, NDArray
 
 plt.rcParams["svg.fonttype"] = "none"
+
+T = TypeVar("T")
+R = TypeVar("R")
 
 Interval = tuple[str, int, int, str]
 KmerHit = tuple[str, str]
@@ -60,6 +67,318 @@ SINGLE_STRAND_DNA_ALPH = (
     'N "Any base" = ACGT\n'
 )
 DNA_COMPLEMENT = str.maketrans("ACGTRYMKBDHVN", "TGCAYRKMVHDBN")
+
+PERIODS: tuple[float, ...] = (2.0, 3.0, 4.0)
+W0: float = 6.0
+MORLET_LIMIT: float = 8.0
+
+NODES = np.array(
+    [
+        0.09501250983763744,
+        0.2816035507792589,
+        0.4580167776572274,
+        0.6178762444026438,
+        0.7554044083550030,
+        0.8656312023878318,
+        0.9445750230732326,
+        0.9894009349916499,
+    ]
+)
+
+WEIGHTS = np.array(
+    [
+        0.1894506104550685,
+        0.1826034150449236,
+        0.1691565193950025,
+        0.1495959888165767,
+        0.1246289712555339,
+        0.0951585116824928,
+        0.0622535239386479,
+        0.0271524594117541,
+    ]
+)
+
+BASE = np.array(
+    [
+        (1.0 + 1.0j) / math.sqrt(2.0),
+        (-1.0 - 1.0j) / math.sqrt(2.0),
+        (-1.0 + 1.0j) / math.sqrt(2.0),
+        (1.0 - 1.0j) / math.sqrt(2.0),
+        0.0j,
+    ],
+    dtype=np.complex64,
+)
+
+LUT = np.full(256, 4, np.uint8)
+for _code, _val in zip(b"ACGTacgt", (0, 1, 2, 3, 0, 1, 2, 3)):
+    LUT[_code] = _val
+
+def parallel_map(
+    function: Callable[[T], R], items: Iterable[T], threads: int = 1
+) -> Iterator[R]:
+    """Ordered reduction with at most one outstanding chunk per worker."""
+    if threads < 1:
+        raise ValueError("threads must be positive")
+    if threads == 1:
+        yield from map(function, items)
+        return
+    iterator = iter(items)
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        pending = deque()
+        for _ in range(threads):
+            try:
+                item = next(iterator)
+            except StopIteration:
+                break
+            pending.append(executor.submit(function, item))
+        while pending:
+            yield pending.popleft().result()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                continue
+            pending.append(executor.submit(function, item))
+
+
+def compiled(function):
+    return njit(cache=True, nogil=True)(function)
+
+
+def info(message):
+    logging.getLogger(__name__).info(message)
+
+
+def new_map(path, shape, dtype: DTypeLike = np.float32) -> np.memmap:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return np.lib.format.open_memmap(path, mode="w+", dtype=dtype, shape=shape)
+
+@dataclass(frozen=True)
+class Record:
+    sid: str
+    key: str
+    codes: NDArray[np.uint8]
+    energy: NDArray[np.float32]
+    mask: NDArray[np.bool_]
+
+
+def op_text(path):
+    return (
+        gzip.open(path, "rt")
+        if str(path).endswith(".gz")
+        else open(path, encoding="utf-8")
+    )
+
+
+def read_fasta(path, max_len=0):
+    out, name, lines = {}, None, []
+
+    def put():
+        if name is None:
+            return
+        if name in out:
+            raise ValueError(f"FASTA duplicated ID: {name}")
+        b = "".join(lines).encode("ascii", errors="replace")
+        a = LUT[np.frombuffer(b, np.uint8)]
+        if max_len:
+            a = a[:max_len]
+        if not len(a):
+            raise ValueError
+        out[name] = a
+
+    with op_text(path) as f:
+        for line in f:
+            if line.startswith(">"):
+                put()
+                name, lines = line[1:].split()[0], []
+            elif line.strip():
+                if name is None:
+                    raise ValueError
+                lines.append("".join(line.split()))
+    put()
+    if not out:
+        raise ValueError
+    return out
+
+@dataclass(frozen=True)
+class CWTSpec:
+    periods: tuple[float, ...] = PERIODS
+    w0: float = W0
+
+    def __post_init__(self):
+        if not self.periods or any(not math.isfinite(p) or p < 2 for p in self.periods):
+            raise ValueError("CWT period > 2bp")
+        if not math.isfinite(self.w0) or self.w0 <= 0:
+            raise ValueError("w0 should be finite positive value")
+
+    @property
+    def halo(self):
+        return math.ceil(MORLET_LIMIT * max(self.periods) + 0.5)
+
+
+def cwt_morlet_integral(lower: float, upper: float, w0: float = W0) -> complex:
+    lower = max(lower, -MORLET_LIMIT)
+    upper = min(upper, MORLET_LIMIT)
+    if lower >= upper:
+        return 0.0
+
+    squared_frequency = w0 * w0
+    norm_squared = (
+        -math.expm1(-squared_frequency)
+        + 2.0 * math.exp(-0.75 * squared_frequency)
+        * math.expm1(-0.25 * squared_frequency)
+    )
+    norm = 1.0 / math.sqrt(math.sqrt(math.pi) * norm_squared)
+    correction = math.exp(-0.5 * squared_frequency)
+    segments = math.ceil((upper - lower) * 2.0)
+    step = (upper - lower) / segments
+    integral = 0.0
+
+    for seg in range(segments):
+        middle = lower + (seg + 0.5) * step
+        for node, weight in zip(NODES, WEIGHTS):
+            left = middle - node * step / 2.0
+            right = middle + node * step / 2.0
+
+            val_l = math.exp(-0.5 * left**2) * (
+                np.exp(-1j * w0 * left) - correction
+            )
+            val_r = math.exp(-0.5 * right**2) * (
+                np.exp(-1j * w0 * right) - correction
+            )
+            integral += weight * (step / 2.0) * (val_l + val_r)
+
+    return norm * integral
+
+
+def build_kernel(dilation: float, w0: float = 6.0) -> np.ndarray:
+    """Integrate the corrected Morlet wavelet over bases at the given dilation."""
+    radius = int(math.ceil(8.0 * dilation + 0.5))
+    width = 2 * radius + 1
+    kernel = np.zeros(width, dtype=np.complex128)
+
+    for tap in range(width):
+        disp = tap - radius
+        kernel[tap] = math.sqrt(dilation) * cwt_morlet_integral(
+            (disp - 0.5) / dilation, (disp + 0.5) / dilation, w0
+        )
+    return kernel
+
+
+def compute_cwt_channels(
+    codes: np.ndarray,
+    spec: CWTSpec,
+    chunk: int = 65536,
+) -> np.ndarray:
+    """Return real and imaginary CWT channels for every configured period."""
+    if codes.ndim != 1 or not np.issubdtype(codes.dtype, np.integer):
+        raise ValueError("codes must be a one-dimensional integer vector")
+    if np.any((codes < 0) | (codes >= len(BASE))):
+        raise ValueError("codes must contain only values from 0 to 4")
+    if chunk < 1:
+        raise ValueError("chunk must be positive")
+
+    n = len(codes)
+    if n == 0:
+        raise ValueError("codes must not be empty")
+    kernels = [build_kernel(period, spec.w0) for period in spec.periods]
+    output = np.empty((2 * len(kernels), n), dtype=np.float32)
+
+    for start in range(0, n, chunk):
+        end = min(n, start + chunk)
+        for scale_index, kernel in enumerate(kernels):
+            width = len(kernel)
+            radius = width // 2
+            input_start = max(0, start - radius)
+            input_end = min(n, end + radius)
+            input_length = input_end - input_start
+            required = input_length + width - 1
+            fft_size = 1 << (required - 1).bit_length()
+
+            signal = np.zeros(fft_size, dtype=np.complex128)
+            signal[:input_length] = BASE[codes[input_start:input_end]]
+            kernel_buffer = np.zeros(fft_size, dtype=np.complex128)
+            kernel_buffer[:width] = kernel[::-1]
+            convolution = np.fft.ifft(np.fft.fft(signal) * np.fft.fft(kernel_buffer))
+
+            offset = radius - input_start
+            indices = np.arange(start, end) + offset
+            coefficients = convolution[indices]
+            output[2 * scale_index, start:end] = coefficients.real
+            output[2 * scale_index + 1, start:end] = coefficients.imag
+
+    return output
+
+
+def compute_energy(codes, path, spec: CWTSpec, chunk, threads):
+    n = len(codes)
+    kernels = [build_kernel(p, spec.w0) for p in spec.periods]
+    widths = [len(k) for k in kernels]
+    num_scales = len(spec.periods)
+
+    result = new_map(path, (n,))
+
+    def compute_chunk(start):
+        end = min(n, start + chunk)
+        chunk_len = end - start
+        powers = np.zeros((num_scales, chunk_len), dtype=np.float32)
+
+        for scale_idx, kernel in enumerate(kernels):
+            width = widths[scale_idx]
+            radius = width // 2
+
+            input_start = start - radius if start > radius else 0
+            input_end = min(n, end + radius)
+            input_length = input_end - input_start
+
+            required = input_length + width - 1
+            fft_size = 1 << (required - 1).bit_length()
+
+            signal_buf = np.zeros(fft_size, dtype=np.complex128)
+            signal_buf[:input_length] = BASE[codes[input_start:input_end]]
+
+            kernel_rev = kernel[::-1]
+            kernel_buf = np.zeros(fft_size, dtype=np.complex128)
+            kernel_buf[:width] = kernel_rev
+
+            sig_fft = np.fft.fft(signal_buf)
+            ker_fft = np.fft.fft(kernel_buf)
+            conv = np.fft.ifft(sig_fft * ker_fft)
+
+            offset = radius - input_start
+            indices = np.arange(start, end) + offset
+            coeffs = conv[indices]
+
+            powers[scale_idx] = (coeffs.real**2 + coeffs.imag**2).astype(np.float32)
+
+        result[start:end] = powers.mean(axis=0)
+
+    for _ in parallel_map(compute_chunk, range(0, n, chunk), threads):
+        pass
+
+    result.flush()
+    return result
+
+def digest(metadata, *arrays):
+    result = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode())
+    for array in arrays:
+        result.update(np.ascontiguousarray(array).tobytes())
+    return result.hexdigest()
+
+def prepare_records(fasta, spec: CWTSpec, folder, chunk, threads, max_len=0):
+    records = []
+    for sid, codes in read_fasta(fasta, max_len=max_len).items():
+        key = digest(sid)[:16]
+        info(f"CWT: {sid} ({len(codes):,} bp)")
+        energy = compute_energy(
+            codes, Path(folder) / f"{key}.npy", spec, chunk, threads
+        )
+        mask = codes < 4
+        edge = spec.halo
+        mask[:edge] = False
+        mask[max(0, len(codes) - edge) :] = False
+        records.append(Record(sid, key, codes, energy, mask))
+    return records
 
 
 def open_text(path: Path) -> TextIO:
@@ -139,18 +458,15 @@ class Contig:
 class CwtMatrix:
     def __init__(self, matrix: np.memmap, contigs: dict[str, Contig], widths: list[int]) -> None:
         self.matrix, self.contigs, self.widths = matrix, contigs, widths
-        self.parameter = next(iter(contigs.values())).parameter
-        self.f32: Arr = np.ndarray(matrix.shape + (2,), dtype=np.float32, buffer=matrix)
+        self.parameter = "Energy"
 
     def close(self) -> None:
-        del self.f32
         if (mm := getattr(self.matrix, "_mmap", None)) is not None:
             mm.close()
         del self.matrix
 
     def power_at(self, start: int, end: int) -> Arr:
-        sl = self.f32[start:end]
-        return np.square(sl[..., 0]) + np.square(sl[..., 1])
+        return self.matrix[start:end, None]
 
     def validate(self, name: str, start: int, end: int, strand: str = "+", kind: str = "Contig") -> Interval:
         if name not in self.contigs:
@@ -159,39 +475,29 @@ class CwtMatrix:
         return (name, start, end, strand)
 
     @classmethod
-    def from_dir(cls, directory: Path) -> CwtMatrix:
-        with open(directory / "contigs.tsv") as stream:
-            if (version := stream.readline().strip()) not in ("# anno-cwt-v1", "# anno-cwt-v2"):
-                raise ValueError("Unsupported CWT index version")
-            fields = stream.readline().rstrip().split("\t")
-            parameter = "Scale" if version == "# anno-cwt-v2" else "Kernel width"
-            if fields[0] != ("# scales" if version == "# anno-cwt-v2" else "# kernel_widths"):
-                raise ValueError("Missing CWT parameters")
-            widths = [int(v) for v in ",".join(fields[1:]).split(",") if v]
-            contigs: dict[str, Contig] = {}
-            expected = 0
-            for row in csv.DictReader(stream, delimiter="\t"):
-                name = row["seqid"]
-                length, plus, minus = int(row["length"]), int(row["plus_offset"]), int(row["minus_offset"])
-                if name in contigs or length <= 0 or plus != expected or minus != plus + length:
-                    raise ValueError(f"Invalid contig offsets: {name}")
-                contigs[name] = Contig(name, length, plus, minus, parameter)
-                expected += 2 * length
-        if not widths or not contigs:
-            raise ValueError("Missing CWT metadata")
-        path = directory / "matrix.bin"
-        if not path.is_file() or path.stat().st_size != expected * len(widths) * np.dtype("<c8").itemsize:
-            raise ValueError("Expected a little-endian complex64 matrix matching contigs.tsv")
-        return cls(np.memmap(path, dtype="<c8", mode="r", shape=(expected, len(widths))), contigs, widths)
+    def load(cls, fasta: Path, target_dir: Path, threads: int, chunk: int) -> CwtMatrix:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        spec = CWTSpec()
+        records = prepare_records(fasta, spec, target_dir / "energy", chunk, threads)
+        contigs: dict[str, Contig] = {}
+        expected = 0
+        for record in records:
+            length = len(record.codes)
+            contigs[record.sid] = Contig(record.sid, length, expected, expected + length)
+            expected += 2 * length
 
-    @classmethod
-    def load_or_create(cls, binary: Path, fasta: Path, target_dir: Path, threads: int) -> CwtMatrix:
-        if (target_dir / "matrix.bin").is_file() and (target_dir / "contigs.tsv").is_file():
-            return cls.from_dir(target_dir)
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        exe = str(binary.resolve()) if binary.exists() else str(binary)
-        subprocess.run([exe, "-p", str(max(1, threads)), "cwt", str(fasta), str(target_dir)], check=True)
-        return cls.from_dir(target_dir)
+        matrix = np.lib.format.open_memmap(
+            target_dir / "surf-cwt.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(expected,),
+        )
+        for record in records:
+            contig = contigs[record.sid]
+            matrix[contig.plus : contig.minus] = record.energy
+            matrix[contig.minus : contig.minus + len(record.codes)] = record.energy[::-1]
+        matrix.flush()
+        return cls(matrix, contigs, [1])
 
     def aggregate_boundaries(self, intervals: Sequence[Interval], rows: int, radius: int = ABS_RADIUS) -> tuple[Arr, Arr]:
         ordered = sort_intervals(intervals)
@@ -282,7 +588,7 @@ class GenomeData:
         self.sequences: dict[str, str] = sequences or {}
         self._motif_cache: dict[bool, tuple[list[tuple[Arr, Arr]], list[Arr]]] = {}
 
-    def _parse_gff(self) -> tuple[dict[str, list[Interval]], dict[Interval, tuple[int, int]], bool, dict[bool, tuple[Arr, Arr]], dict[str, list[int]]]:
+    def _parse_gff(self) -> tuple[dict[str, list[Interval]], dict[Interval, tuple[int, int]], bool, dict[tuple[bool, bool], tuple[Arr, Arr]], dict[str, list[int]]]:
         intervals, gene_ids, rrna_ids = set(), set(), set()
         parents_by_id: dict[str, list[str]] = {}
         exon_rows: list[tuple[list[str], list[str]]] = []
@@ -497,16 +803,24 @@ class GenomeData:
 def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> None:
     boundary, img_vals, profile, widths, param, n_iv, out = task
     pos, ext = np.arange(-ABS_RADIUS, ABS_RADIUS + 1), (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, n_iv)
-    fig, axes = plt.subplots(2, len(widths), figsize=(4.1 * len(widths), 6), gridspec_kw={"height_ratios": [4, 1.3]}, layout="constrained", squeeze=False)
+    fig, axes = plt.subplots(
+        2, len(widths), figsize=(4.1 * len(widths), 6),
+        gridspec_kw={"height_ratios": (4, 1.2)},
+        layout="constrained", squeeze=False,
+    )
     for s, w in enumerate(widths):
-        ax, prof = axes[:, s]
+        ax, energy_ax = axes[:, s]
         panel = img_vals[:, s]
         vmax = max(float(np.quantile(panel[np.isfinite(panel)], 0.995)), 1e-6)
         fig.colorbar(ax.imshow(panel, aspect="auto", origin="lower", interpolation="nearest", extent=ext, cmap="viridis", vmin=0, vmax=vmax), ax=ax, pad=0.01)
-        ax.set(title=f"{param} {w} bp", ylabel="Interval rank" if s == 0 else "", ylim=ext[2:])
-        prof.plot(pos, profile[s], color="#256c87", linewidth=1.3)
-        prof.set(ylabel="Mean power" if s == 0 else "", ylim=(0.6, 1.2), xlabel=f"Position from {boundary} boundary (bp)")  # FIXHERE!!!
-        for p in (ax, prof):
+        title = f"{param} {w} bp" if param != "Energy" else "Surf CWT energy"
+        ax.set(title=title, ylabel="Interval rank" if s == 0 else "", ylim=ext[2:])
+        energy = profile[s]
+        energy_ax.plot(pos, energy, color="#256c87", linewidth=1.1)
+        energy_ax.set_ylabel("Mean energy" if s == 0 else "")
+        energy_ax.set_xlabel(f"Position from {boundary} boundary (bp)")
+        energy_ax.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
+        for p in (ax, energy_ax):
             p.set_xticks((-ABS_RADIUS, 0, ABS_RADIUS), (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"), fontsize=8)
             p.set_xlim(ext[:2])
     out.mkdir(parents=True, exist_ok=True)
@@ -515,12 +829,6 @@ def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> N
 
 
 class CwtPlotter:
-    CWT_ENCODINGS = (
-        ("general", Path("./anno_cwt_general")),
-        ("intron-low-energy", Path("./anno_cwt_intron_low_energy")),
-        ("branchpoint", Path("./anno_cwt_branchpoint")),
-    )
-
     @classmethod
     def run_meme(cls, fasta: Path, output: Path) -> list[dict[str, Any]]:
         output.mkdir(parents=True, exist_ok=True)
@@ -635,30 +943,33 @@ class CwtPlotter:
             if len(values := cwt.matrix[s_idx:e_idx]) > 100000:
                 raise ValueError("Use a region of at most 100,000 bp (including flanks)")
             bins, body_end = min(pixels, len(values)), before + last - first
-            panels = (
-                (cls.resample_mean(values.real, bins).T, "Real (bin mean)", "RdBu_r"),
-                (cls.resample_mean(values.imag, bins).T, "Imaginary (bin mean)", "RdBu_r"),
-                (np.log1p(cls.resample_mean(cwt.power_at(s_idx, e_idx), bins)).T, "log(1 + mean power)", "viridis"),
-            )
-            fig, axes = plt.subplots(3, 1, figsize=(13, 8), sharex=True, layout="constrained")
-            for ax, (panel, title, cmap) in zip(axes, panels):
-                vmax = max(float(np.nanmax(np.abs(panel))), 1e-6)
-                fig.colorbar(ax.imshow(panel, aspect="auto", origin="lower", interpolation="nearest",
-                                       extent=(0, len(values), -0.5, len(cwt.widths) - 0.5), cmap=cmap,
-                                       vmin=0 if cmap == "viridis" else -vmax, vmax=vmax), ax=ax, pad=0.01)
-                ax.set_yticks(range(len(cwt.widths)), cwt.widths)
-                ax.set_ylabel(f"{c.parameter} (bp)")
-                ax.set_title(title, loc="left", fontsize=11)
+            panel = np.log1p(cls.resample_mean(cwt.power_at(s_idx, e_idx), bins)).T
+            fig, ax = plt.subplots(figsize=(13, 4), layout="constrained")
+            vmax = max(float(np.nanmax(panel)), 1e-6)
+            fig.colorbar(ax.imshow(panel, aspect="auto", origin="lower", interpolation="nearest",
+                                   extent=(0, len(values), -0.5, len(cwt.widths) - 0.5),
+                                   cmap="viridis", vmin=0, vmax=vmax), ax=ax, pad=0.01)
+            ax.set_yticks(range(len(cwt.widths)), [str(width) for width in cwt.widths])
+            ax.set_ylabel("Surf CWT energy\n(mean over periods)")
+            ax.set_title("log(1 + mean Surf CWT energy)", loc="left", fontsize=11)
             l_b, r_b = (("start", start), ("end", end)) if strand == "+" else (("end", end), ("start", start))
-            ticks: list[tuple[int, str, str]] = ([(0, f"5' flank\n{before} bp", "left")] if before else []) + [
-                (before, f"{l_b[0]}\n{l_b[1]:,}", "right"), (body_end, f"{r_b[0]}\n{r_b[1]:,}", "left"),
-            ] + ([(len(values), f"3' flank\n{after} bp", "right")] if after else [])
-            axes[-1].set_xticks([p for p, _, _ in ticks], [lbl for _, lbl, _ in ticks])
-            for lbl, (_, _, align) in zip(axes[-1].get_xticklabels(), ticks):
+            ticks: list[tuple[int, str, Literal["left", "right"]]] = []
+            if before:
+                ticks.append((0, f"5' flank\n{before} bp", "left"))
+            ticks.extend(
+                (
+                    (before, f"{l_b[0]}\n{l_b[1]:,}", "right"),
+                    (body_end, f"{r_b[0]}\n{r_b[1]:,}", "left"),
+                )
+            )
+            if after:
+                ticks.append((len(values), f"3' flank\n{after} bp", "right"))
+            ax.set_xticks([p for p, _, _ in ticks], [lbl for _, lbl, _ in ticks])
+            for lbl, (_, _, align) in zip(ax.get_xticklabels(), ticks):
                 lbl.set_horizontalalignment(align)
-            axes[-1].tick_params(axis="x", labelsize=8, pad=6)
-            axes[-1].set_xlabel("5' to 3' position; start/end mark genomic exon boundaries")
-            fig.suptitle(f"{name}:{start:,}-{end:,} ({strand}) | CWT")
+            ax.tick_params(axis="x", labelsize=8, pad=6)
+            ax.set_xlabel("5' to 3' position; start/end mark genomic exon boundaries")
+            fig.suptitle(f"{name}:{start:,}-{end:,} ({strand}) | Surf CWT")
             fig.savefig(out / f"{name}_{start:06d}_{end:06d}_{'plus' if strand == '+' else 'minus'}.png", dpi=160)
             plt.close(fig)
 
@@ -719,24 +1030,14 @@ class CwtPlotter:
 
     @classmethod
     def run(cls, args: argparse.Namespace) -> None:
-        encodings = [(args.anno.stem, args.anno)] if args.anno else cls.CWT_ENCODINGS
-        for name, binary in encodings:
-            variant_args = argparse.Namespace(**vars(args))
-            variant_args.anno = binary
-            if len(encodings) > 1:
-                variant_args.out = args.out / name
-                variant_args.cwt = args.cwt / name if args.cwt else None
-            cls.run_encoding(variant_args)
-
-    @classmethod
-    def run_encoding(cls, args: argparse.Namespace) -> None:
         args.out.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".cwt-work-", dir=args.out, ignore_cleanup_errors=True) as tmp:
             work = Path(tmp)
+
             if args.regions:
                 if args.gff:
                     raise ValueError("-r/--region cannot be combined with -g/--gff")
-                cwt = CwtMatrix.load_or_create(args.anno, args.fasta, args.cwt or (work / "original"), args.threads)
+                cwt = CwtMatrix.load(args.fasta, args.cwt or (work / "original"), args.threads, args.chunk)
                 try:
                     ivs: list[Interval] = []
                     for spec in args.regions:
@@ -766,7 +1067,7 @@ class CwtPlotter:
             tasks: list[Any] = []
             genome: GenomeData | None = None
             if orig:
-                cwt = CwtMatrix.load_or_create(args.anno, args.fasta, args.cwt or (work / "original"), args.threads)
+                cwt = CwtMatrix.load(args.fasta, args.cwt or (work / "original"), args.threads, args.chunk)
                 try:
                     genome = GenomeData(args.gff, cwt.contigs)
                     print(f"Plotting {', '.join(orig)}", file=sys.stderr, flush=True)
@@ -782,7 +1083,7 @@ class CwtPlotter:
                     genome = GenomeData(args.gff, {n: Contig(n, len(s), 0, len(s)) for n, s in seqs.items()}, seqs)
                 mut_fa = genome.write_mutated_fasta(args.fasta, args.seed, work / "mutated.fa")
                 print(f"Plotting {', '.join(mut)}", file=sys.stderr, flush=True)
-                cwt_mut = CwtMatrix.load_or_create(args.anno, mut_fa, work / "mutated", args.threads)
+                cwt_mut = CwtMatrix.load(mut_fa, work / "mutated", args.threads, args.chunk)
                 try:
                     tasks.extend(cls.render_group(mut, cwt_mut, genome, mut_fa, args))
                 finally:
@@ -816,7 +1117,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-g", "--gff", type=Path)
     parser.add_argument("-o", "--out", type=Path, default=Path("plots"))
     parser.add_argument("-c", "--cwt", type=Path)
-    parser.add_argument("--anno", type=Path, help="Use one CWT binary instead of running all three encodings")
+    parser.add_argument("--chunk", type=pos_int, default=65536, help="Bases per CWT energy chunk")
     parser.add_argument("-p", "--threads", type=pos_int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("-n", "--rows", type=pos_int, default=1500)
     parser.add_argument("-s", "--seed", type=int, default=42)

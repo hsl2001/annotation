@@ -119,7 +119,7 @@ def metrics(reference_path, query_path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=f"{__doc__ or ''}".splitlines()[0])
     parser.add_argument("-r", "--reference", required=True, help="reference GFF3(.gz)")
     parser.add_argument("-q", "--query", required=True, help="query GFF3(.gz)")
     parser.add_argument("-g", "--genome", help="genome FASTA (accepted, unused)")
