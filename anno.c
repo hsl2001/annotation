@@ -91,13 +91,11 @@ static char *xstrdup(const char *text) {
 }
 
 /** @brief Monotonic wall-clock seconds. */
-#ifndef ANNO_NO_MAIN
 static double now_seconds(void) {
   struct timespec time;
   clock_gettime(CLOCK_MONOTONIC, &time);
   return (double)time.tv_sec + 1e-9 * (double)time.tv_nsec;
 }
-#endif
 
 /** @brief A/C/G/T -> 0..3, anything else -> -1. */
 static int base_index(char base) {
@@ -110,7 +108,7 @@ static int base_index(char base) {
   }
 }
 
-/** @brief Watson-Crick complement (N for unknown bases). */
+/** @brief Reverse complement (N for unknown bases). */
 static char complement(char base) {
   int index = base_index(base);
   return index < 0 ? 'N' : "TGCA"[index];
@@ -680,7 +678,7 @@ static uint8_t kann_swap_strand(uint8_t label) {
 
 /** @brief Return the KANN model configuration exposed by the public API. */
 UnetConfig unet_default_config(void) {
-  return (UnetConfig){.depth = 4, .kernel = 9, .pool = 2, .channels = {32, 64, 128, 256}};
+  return (UnetConfig){.kernel = 9, .channels = {32, 64, 128, 256}};
 }
 
 /** @brief Create a KANN model; configuration values are retained as metadata. */
@@ -825,6 +823,7 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
   float *y = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * KANN_LENGTH, sizeof(float));
   float *r = xcalloc((size_t)nvar, sizeof(float));
   uint64_t seed = ANNO_SEED;
+  double started = now_seconds();
   for (int iteration = 0; iteration < iterations; iteration++) {
     memset(x, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * KANN_LENGTH * sizeof(float));
     memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * KANN_LENGTH * sizeof(float));
@@ -844,7 +843,8 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
     kann_RMSprop(nvar, ANNO_LEARNING_RATE, NULL, 0.9f, unet->ann->g, unet->ann->x, r);
     if (!isfinite(loss)) fail("non-finite KANN loss");
     if (iteration == 0 || iteration + 1 == iterations || (iteration + 1) % 10 == 0)
-      say("iteration %d/%d loss %.4f", iteration + 1, iterations, loss);
+      say("iteration %d/%d loss %.4f %.1fs", iteration + 1, iterations, loss,
+          now_seconds() - started);
   }
   kann_mt(unet->ann, 0, 0);
   for (int i = 0; i < count; i++) free(power[i]);
@@ -855,9 +855,6 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
 #define GRAMMAR_MAX_STATES 256
 #define GRAMMAR_MAX_PREDECESSORS 5
 
-enum { MOTIF_NONE, MOTIF_PLUS_DONOR, MOTIF_PLUS_ACCEPTOR, MOTIF_MINUS_ENTRY,
-       MOTIF_MINUS_EXIT };
-
 /** @brief Pending class-wise bedGraph runs. */
 typedef struct {
   int count;
@@ -865,26 +862,24 @@ typedef struct {
   int predecessors[GRAMMAR_MAX_STATES];
   int from[GRAMMAR_MAX_STATES][GRAMMAR_MAX_PREDECESSORS];
   double score[GRAMMAR_MAX_STATES][GRAMMAR_MAX_PREDECESSORS];
-  uint8_t motif[GRAMMAR_MAX_STATES][GRAMMAR_MAX_PREDECESSORS];
   int shift[GRAMMAR_MAX_STATES], bits[GRAMMAR_MAX_STATES];
 } Grammar;
 
-static void grammar_edge(Grammar *g, int from, int to, double score, int motif) {
+static void grammar_edge(Grammar *g, int from, int to, double score) {
   int k = g->predecessors[to]++;
   if (k >= GRAMMAR_MAX_PREDECESSORS) fail("grammar has too many predecessors");
   g->from[to][k] = from;
   g->score[to][k] = score;
-  g->motif[to][k] = (uint8_t)motif;
 }
 
 static int grammar_chain(Grammar *g, uint8_t cls, int length) {
   int head = g->count;
   for (int i = 0; i < length; i++) {
     g->cls[g->count] = cls;
-    if (i) grammar_edge(g, g->count - 1, g->count, 0.0, MOTIF_NONE);
+    if (i) grammar_edge(g, g->count - 1, g->count, 0.0);
     g->count++;
   }
-  grammar_edge(g, g->count - 1, g->count - 1, 0.0, MOTIF_NONE);
+  grammar_edge(g, g->count - 1, g->count - 1, 0.0);
   return head;
 }
 
@@ -898,8 +893,7 @@ static void grammar_build(Grammar *g) {
   memset(g, 0, sizeof(*g));
   int inter = grammar_chain(g, ANNO_INTERGENIC, 1);
   for (int strand = 0; strand < 2; strand++) {
-    int o = strand ? 4 : 0, donor = strand ? MOTIF_MINUS_ENTRY : MOTIF_PLUS_DONOR;
-    int acceptor = strand ? MOTIF_MINUS_EXIT : MOTIF_PLUS_ACCEPTOR;
+    int o = strand ? 4 : 0;
     int u5 = grammar_chain(g, (uint8_t)(ANNO_PLUS_5UTR + o), 1);
     int ex = grammar_chain(g, (uint8_t)(ANNO_PLUS_EXON + o), ANNO_MIN_EXON_LENGTH);
     int ex_tail = ex + ANNO_MIN_EXON_LENGTH - 1;
@@ -911,16 +905,16 @@ static void grammar_build(Grammar *g) {
     int tail = ANNO_MIN_INTRON_LENGTH - 1;
     /* exonic pieces in genomic order: first, middle (coding), last */
     int first = strand ? u3 : u5, last = strand ? u5 : u3;
-    grammar_edge(g, inter, first, -ANNO_TRANSCRIPT_PENALTY, MOTIF_NONE);
-    grammar_edge(g, inter, ex, -ANNO_TRANSCRIPT_PENALTY, MOTIF_NONE);
-    grammar_edge(g, first, ex, 0.0, MOTIF_NONE);
-    grammar_edge(g, ex_tail, last, 0.0, MOTIF_NONE);
-    grammar_edge(g, ex_tail, inter, 0.0, MOTIF_NONE);
-    grammar_edge(g, last, inter, 0.0, MOTIF_NONE);
+    grammar_edge(g, inter, first, -ANNO_TRANSCRIPT_PENALTY);
+    grammar_edge(g, inter, ex, -ANNO_TRANSCRIPT_PENALTY);
+    grammar_edge(g, first, ex, 0.0);
+    grammar_edge(g, ex_tail, last, 0.0);
+    grammar_edge(g, ex_tail, inter, 0.0);
+    grammar_edge(g, last, inter, 0.0);
     int pieces[3] = {first, ex, last}, exits[3] = {first, ex_tail, last};
     for (int i = 0; i < 3; i++) {
-      grammar_edge(g, exits[i], introns[i], 0.0, donor);
-      grammar_edge(g, introns[i] + tail, pieces[i], 0.0, acceptor);
+      grammar_edge(g, exits[i], introns[i], 0.0);
+      grammar_edge(g, introns[i] + tail, pieces[i], 0.0);
     }
   }
   int shift = 0;
@@ -934,31 +928,18 @@ static void grammar_build(Grammar *g) {
   if (shift > 32 || g->count > GRAMMAR_MAX_STATES) fail("grammar too large");
 }
 
-/** @brief Whether the transition motif holds when entering position i. */
-static int motif_matches(int motif, const char *bases, int64_t length, int64_t i) {
-  switch (motif) {
-  case MOTIF_PLUS_DONOR: return i + 1 < length && bases[i] == 'G' && bases[i + 1] == 'T';
-  case MOTIF_PLUS_ACCEPTOR: return i >= 2 && bases[i - 2] == 'A' && bases[i - 1] == 'G';
-  case MOTIF_MINUS_ENTRY: return i + 1 < length && bases[i] == 'C' && bases[i + 1] == 'T';
-  case MOTIF_MINUS_EXIT: return i >= 2 && bases[i - 2] == 'A' && bases[i - 1] == 'C';
-  default: return 1;
-  }
-}
-
 /** Streaming Viterbi decoder. Owns its buffers. */
 typedef struct {
   Grammar grammar;
-  const char *bases;
   int64_t length, position;
   double *previous, *current;
   uint32_t *back;
 } Decoder;
 
-/** @brief Create a decoder for one sequence. */
-static Decoder *decoder_create(const char *bases, int64_t length) {
+/** @brief Create a decoder for a sequence of the given length. */
+static Decoder *decoder_create(int64_t length) {
   Decoder *d = xcalloc(1, sizeof(*d));
   grammar_build(&d->grammar);
-  d->bases = bases;
   d->length = length;
   d->previous = xcalloc((size_t)d->grammar.count, sizeof(double));
   d->current = xcalloc((size_t)d->grammar.count, sizeof(double));
@@ -996,8 +977,6 @@ static void decoder_step(Decoder *d, const float *row) {
     int choice = 0;
     for (int k = 0; k < g->predecessors[s]; k++) {
       double score = d->previous[g->from[s][k]] + g->score[s][k];
-      if (g->motif[s][k] && !motif_matches(g->motif[s][k], d->bases, d->length, i))
-        score -= ANNO_SPLICE_BONUS; /* canonical motifs keep the bonus */
       if (score > best) {
         best = score;
         choice = k;
@@ -1031,7 +1010,7 @@ static int decoder_finish(Decoder *d, uint8_t *path) {
 int anno_decode(const char *bases, int64_t length, const float *probability,
                 uint8_t *path) {
   if (!bases || !probability || !path || length < 1) return EINVAL;
-  Decoder *d = decoder_create(bases, length);
+  Decoder *d = decoder_create(length);
   for (int64_t i = 0; i < length; i++)
     decoder_step(d, probability + (size_t)i * ANNO_CLASSES);
   int status = decoder_finish(d, path);
@@ -1306,7 +1285,7 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
   unsigned long genes = 0;
   for (int i = 0; i < count; i++) {
     const AnnoSequence *s = &sequences[i];
-    Decoder *decoder = decoder_create(s->bases, s->length);
+    Decoder *decoder = decoder_create(s->length);
     for (int j = 0; j < ANNO_CLASSES; j++) bedgraph.value[j] = -1;
     for (int64_t start = 0; start < s->length; start += KANN_LENGTH) {
       int64_t valid = s->length - start < KANN_LENGTH ? s->length - start : KANN_LENGTH;
