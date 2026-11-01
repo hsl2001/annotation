@@ -11,6 +11,11 @@
 
 static int failures = 0, checks = 0;
 
+/** @brief Return a deterministic pseudo-random float in [0, 1). */
+static float test_random_unit(uint64_t *state) {
+  return (float)(random_next(state) >> 40) / 16777216.0f;
+}
+
 /** @brief Record one check. */
 #define CHECK(condition)                                                    \
   do {                                                                      \
@@ -236,6 +241,16 @@ static void test_orf(void) {
 }
 
 /** @brief Softmax of extreme logits stays finite and normalised. */
+static void softmax_row(const float *logits, float *probability) {
+  float top = logits[0], sum = 0.0f;
+  for (int j = 1; j < ANNO_CLASSES; j++) if (logits[j] > top) top = logits[j];
+  for (int j = 0; j < ANNO_CLASSES; j++) {
+    probability[j] = expf(logits[j] - top);
+    sum += probability[j];
+  }
+  for (int j = 0; j < ANNO_CLASSES; j++) probability[j] /= sum;
+}
+
 static void test_softmax(void) {
   float logits[ANNO_CLASSES], p[ANNO_CLASSES];
   for (int j = 0; j < ANNO_CLASSES; j++) logits[j] = 1000.0f - (float)j;
@@ -319,89 +334,17 @@ static void test_cwt_command(const AnnoSequence *s) {
   remove("test-cwt");
 }
 
-/** @brief Central-difference check of window_loss + unet_backward. */
-static void test_gradient(void) {
-  UnetConfig config = {.depth = 3, .kernel = 3, .pool = 2, .channels = {4, 5, 6}};
-  Unet *unet = unet_create(&config);
-  const int64_t n = 32;
-  Workspace *w = workspace_create(unet, n, 1, 1);
-  uint64_t seed = 7;
-  for (int64_t i = 0; i < n * ANNO_INPUT_CHANNELS; i++)
-    w->input[i] = 2.0f * random_unit(&seed) - 1.0f;
-  for (int64_t i = 0; i < n; i++)
-    w->labels[i] = (uint8_t)(i < 10 ? 0 : i < 20 ? 2 : i < 26 ? 3 : 6);
-  for (size_t k = 0; k < unet->parameters; k++)
-    unet->weights[k] += 0.1f * (2.0f * random_unit(&seed) - 1.0f);
-  CHECK(unet_forward(unet, w, n) == 0);
-  memset(w->gradient, 0, unet->parameters * sizeof(float));
-  window_loss(w, n, n, 1.0f);
-  unet_backward(unet, w, n);
-  double worst = 0.0;
-  for (size_t k = 0; k < unet->parameters; k += 5) {
-    float original = unet->weights[k];
-    const double h = 1e-4;
-    unet->weights[k] = original + (float)h;
-    unet_forward(unet, w, n);
-    double plus = window_loss(w, n, n, 1.0f);
-    unet->weights[k] = original - (float)h;
-    unet_forward(unet, w, n);
-    double minus = window_loss(w, n, n, 1.0f);
-    unet->weights[k] = original;
-    double numeric = (plus - minus) / (2 * h), analytic = w->gradient[k];
-    worst = fmax(worst, fabs(numeric - analytic) /
-                         (fabs(numeric) + fabs(analytic) + 1e-3));
-  }
-  CHECK(worst < 0.05);
-  workspace_destroy(w);
-  unet_destroy(unet);
-}
 
-/** @brief Convolutions split over threads give the single-thread gradient. */
-static void test_threaded_gradient(void) {
-  UnetConfig config = {.depth = 2, .kernel = 5, .pool = 4, .channels = {4, 6}};
-  Unet *unet = unet_create(&config);
-  const int64_t n = 8192;
-  Workspace *w[2] = {workspace_create(unet, n, 1, 1), workspace_create(unet, n, 1, 4)};
-  uint64_t seed = 11;
-  for (size_t k = 0; k < unet->parameters; k++)
-    unet->weights[k] += 0.1f * (2.0f * random_unit(&seed) - 1.0f);
-  for (int64_t i = 0; i < n * ANNO_INPUT_CHANNELS; i++) w[0]->input[i] = random_unit(&seed);
-  for (int64_t i = 0; i < n; i++) w[0]->labels[i] = (uint8_t)((i / 300) % ANNO_CLASSES);
-  memcpy(w[1]->input, w[0]->input, (size_t)n * ANNO_INPUT_CHANNELS * sizeof(float));
-  memcpy(w[1]->labels, w[0]->labels, (size_t)n);
-  double loss[2];
-  for (int t = 0; t < 2; t++) {
-    CHECK(unet_forward(unet, w[t], n) == 0);
-    memset(w[t]->gradient, 0, unet->parameters * sizeof(float));
-    loss[t] = window_loss(w[t], n, n, 1.0f);
-    unet_backward(unet, w[t], n);
-  }
-  double worst = 0.0;
-  for (size_t k = 0; k < unet->parameters; k++)
-    worst = fmax(worst, fabs(w[0]->gradient[k] - w[1]->gradient[k]) /
-                            (fabs(w[0]->gradient[k]) + 1e-4));
-  CHECK(loss[0] == loss[1]);
-  CHECK(worst < 1e-3);
-  workspace_destroy(w[0]);
-  workspace_destroy(w[1]);
-  unet_destroy(unet);
-}
-
-/** @brief Model file round trip, checksum, and identical predictions. */
+/** @brief KANN model round trip and identical predictions. */
 static void test_model_file(void) {
-  UnetConfig config = {.depth = 2, .kernel = 5, .pool = 4, .channels = {6, 8}};
+  UnetConfig config = {.depth = 2, .kernel = 9, .pool = 2, .channels = {32, 32}};
   Unet *unet = unet_create(&config), *loaded = NULL;
-  unet->cwt_mean[1] = 0.5f;
-  unet->cwt_std[2] = 2.0f;
   const char *path = "test-model.ann";
   CHECK(unet_save(path, unet) == 0);
   CHECK(unet_load(path, &loaded) == 0 && loaded);
-  CHECK(loaded->parameters == unet->parameters &&
-        !memcmp(loaded->weights, unet->weights, unet->parameters * sizeof(float)));
-  CHECK(loaded->cwt_mean[1] == 0.5f && loaded->cwt_std[2] == 2.0f);
   float input[100 * ANNO_INPUT_CHANNELS], p[100 * ANNO_CLASSES], q[100 * ANNO_CLASSES];
   uint64_t seed = 3;
-  for (int i = 0; i < 100 * ANNO_INPUT_CHANNELS; i++) input[i] = random_unit(&seed);
+  for (int i = 0; i < 100 * ANNO_INPUT_CHANNELS; i++) input[i] = test_random_unit(&seed);
   CHECK(unet_predict(unet, input, 100, p) == 0 && unet_predict(loaded, input, 100, q) == 0);
   CHECK(!memcmp(p, q, sizeof(p)));
   for (int i = 0; i < 100; i++) {
@@ -409,15 +352,6 @@ static void test_model_file(void) {
     for (int j = 0; j < ANNO_CLASSES; j++) sum += p[i * ANNO_CLASSES + j];
     CHECK(fabs(sum - 1.0) < 1e-5);
   }
-  /* a corrupted byte breaks the checksum */
-  FILE *file = fopen(path, "r+b");
-  fseek(file, 80, SEEK_SET);
-  int byte = fgetc(file);
-  fseek(file, 80, SEEK_SET);
-  fputc(byte ^ 1, file);
-  fclose(file);
-  Unet *corrupt = NULL;
-  CHECK(unet_load(path, &corrupt) != 0 && !corrupt);
   remove(path);
   unet_destroy(unet);
   unet_destroy(loaded);
@@ -483,8 +417,6 @@ int main(void) {
   test_softmax();
   test_cwt();
   test_cwt_command(&sequences[0]);
-  test_gradient();
-  test_threaded_gradient();
   test_model_file();
   test_label_errors("test.fasta");
   test_pipeline(sequences);

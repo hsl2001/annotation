@@ -1,6 +1,6 @@
 /**
  * @file anno.h
- * @brief Public API of anno: CWT + 1D UNet emissions, 9-state grammar
+ * @brief Public API of anno: CWT + KANN 1D convolution emissions, 9-state grammar
  *        Viterbi decoding, longest-ORF resolution and GFF3 output.
  *
  * Coordinates are 0-based half-open everywhere inside the program; GFF3
@@ -38,7 +38,7 @@
 #define ANNO_DEFAULT_ITERATIONS 1000
 #define ANNO_BATCH_WINDOWS 8
 #define ANNO_LEARNING_RATE 3e-3f
-#define ANNO_DICE_EPSILON 1e-5f
+#define ANNO_EPSILON 1e-5f
 #define ANNO_GRADIENT_CLIP 1.0f
 #define ANNO_SEED 2026u
 /**@}*/
@@ -75,27 +75,53 @@ typedef struct {
   uint8_t *labels;  /**< per-base AnnoClass (training only) or NULL   */
 } AnnoSequence;
 
-/** Default UNet shape used for training. */
+/**
+ * @brief Return the default KANN convolution configuration.
+ * @return Default model configuration.
+ */
 UnetConfig unet_default_config(void);
-/** @brief Create a randomly initialised UNet; NULL on invalid config. */
+/**
+ * @brief Create a KANN-backed model.
+ * @param config Model configuration; must not be NULL.
+ * @return New model, or NULL when config is invalid or allocation fails.
+ */
 Unet *unet_create(const UnetConfig *config);
-/** @brief Release a UNet created by unet_create() or unet_load(). */
+/**
+ * @brief Release a model created by unet_create() or unet_load().
+ * @param unet Model to release; NULL is accepted.
+ */
 void unet_destroy(Unet *unet);
 /**
  * @brief Predict class probabilities.
+ * @param unet       Model to evaluate.
  * @param input       length x ANNO_INPUT_CHANNELS normalised features.
+ * @param length      Number of input positions.
  * @param probability length x ANNO_CLASSES output (rows sum to one).
  * @return 0 on success, an errno value otherwise.
  */
 int unet_predict(const Unet *unet, const float *input, int64_t length,
                  float *probability);
-/** @brief Read a binary .ann model. @return 0 on success. */
+/**
+ * @brief Read a KANN model.
+ * @param path Model file path.
+ * @param out Receives the loaded model.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_load(const char *path, Unet **out);
-/** @brief Write a binary .ann model. @return 0 on success. */
+/**
+ * @brief Write a KANN model.
+ * @param path Model file path.
+ * @param unet Model to write.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_save(const char *path, const Unet *unet);
 
 /**
  * @brief Morlet CWT of the complex base signal for positions [start,end).
+ * @param bases Input sequence bases.
+ * @param length Total sequence length.
+ * @param start First position, inclusive.
+ * @param end Last position, exclusive.
  * @param out (end-start) x ANNO_CWT_CHANNELS x 2 floats (real, imaginary).
  *
  * The reverse-complement strand never needs recomputation: its transform
@@ -107,6 +133,7 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
 /**
  * @brief Grammar-constrained Viterbi decoding of a probability matrix.
  * @param bases       sequence (for splice motifs).
+ * @param length      Number of sequence positions.
  * @param probability length x ANNO_CLASSES.
  * @param path        length output classes (AnnoClass).
  * @return 0 on success.
@@ -116,6 +143,9 @@ int anno_decode(const char *bases, int64_t length, const float *probability,
 
 /**
  * @brief Convert a per-base class path into GFF3 transcript records.
+ * @param output       Destination GFF3 stream.
+ * @param sequence     Sequence and optional name metadata.
+ * @param path         Per-base decoded classes.
  * @param gene_counter running gene number, updated.
  * @return number of transcripts written, or -1 on error.
  */
@@ -124,12 +154,23 @@ long anno_write_gff(FILE *output, const AnnoSequence *sequence,
 
 /**
  * @brief Read a FASTA(.gz) file.
- * @return array owned by the caller (anno_sequences_free()).
+ * @param path FASTA path.
+ * @param count Receives the number of records.
+ * @return Array owned by the caller, or NULL only if the process does not fail.
  */
 AnnoSequence *anno_read_fasta(const char *path, int *count);
-/** @brief Fill sequences[].labels from a GFF3(.gz) annotation. */
+/**
+ * @brief Fill sequence labels from a GFF3(.gz) annotation.
+ * @param path GFF3 path.
+ * @param sequences FASTA records to label.
+ * @param count Number of FASTA records.
+ */
 void anno_read_labels(const char *path, AnnoSequence *sequences, int count);
-/** @brief Free an array returned by anno_read_fasta(). */
+/**
+ * @brief Free records returned by anno_read_fasta().
+ * @param sequences Records to free; NULL is accepted.
+ * @param count Number of records.
+ */
 void anno_sequences_free(AnnoSequence *sequences, int count);
 
 #endif
