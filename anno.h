@@ -35,7 +35,7 @@
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS 4
+#define ANNO_BATCH_WINDOWS 16
 #define ANNO_LEARNING_RATE 3e-3f
 #define ANNO_EPSILON 1e-5f
 #define ANNO_GRADIENT_CLIP 5.0f

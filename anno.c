@@ -32,31 +32,6 @@ KSEQ_INIT(gzFile, gzread)
 /* ------------------------------------------------------------------------ */
 /* Basic utilities                                                          */
 /* ------------------------------------------------------------------------ */
-
-#ifdef ANNO_NO_MAIN
-/**
- * @brief Advance a deterministic xorshift64* generator.
- * @param state Generator state, updated in place.
- * @return Next pseudo-random value.
- */
-static uint64_t random_next(uint64_t *state) {
-  *state ^= *state >> 12;
-  *state ^= *state << 25;
-  *state ^= *state >> 27;
-  return *state * 2685821657736338717ULL;
-}
-
-/**
- * @brief Generate a uniformly distributed integer below a bound.
- * @param state Generator state, updated in place.
- * @param bound Exclusive positive upper bound.
- * @return Value in the range [0, @p bound).
- */
-static int64_t random_below(uint64_t *state, int64_t bound) {
-  return (int64_t)(random_next(state) % (uint64_t)bound);
-}
-#endif
-
 /** Class names; also used for bedGraph file names. */
 static const char *const class_names[ANNO_CLASSES] = {
   "intergenic", "plus_five_prime_UTR", "plus_exon", "plus_intron",
