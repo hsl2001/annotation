@@ -1,139 +1,137 @@
+/**
+ * @file anno.h
+ * @brief Public API of anno: CWT + 1D UNet emissions, 9-state grammar
+ *        Viterbi decoding, longest-ORF resolution and GFF3 output.
+ *
+ * Coordinates are 0-based half-open everywhere inside the program; GFF3
+ * input and output use 1-based inclusive coordinates.
+ */
 #ifndef ANNO_H
 #define ANNO_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 
-#define ANNO_CLASSES 7
-#define ANNO_DECODED_STATES 9
-#define ANNO_CWT_CHANNELS 3
-#define ANNO_CWT_WINDOW 1024
-#define ANNO_UNET_WINDOW 65536
-#define ANNO_MIN_EXON_LENGTH 6
-#define ANNO_MIN_INTRON_LENGTH 30
-#define ANNO_DEFAULT_ITERATIONS 300
+/** @name Fixed sizes */
+/**@{*/
+#define ANNO_CLASSES 9            /**< UNet classes == decoded grammar states */
+#define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
+#define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
+#define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
+#define ANNO_UNET_WINDOW 65536    /**< UNet training / inference window      */
+#define ANNO_UNET_MARGIN 4096     /**< inference context discarded per side  */
+#define ANNO_MAX_DEPTH 6          /**< maximum number of UNet levels         */
+/**@}*/
 
+/** @name Grammar constants */
+/**@{*/
+#define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
+#define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp)            */
+#define ANNO_EMISSION_EPSILON 1e-6f
+#define ANNO_SPLICE_BONUS 8.0     /**< log advantage of GT..AG over other splice motifs */
+#define ANNO_TRANSCRIPT_PENALTY 8.0 /**< log penalty for opening a transcript */
+/**@}*/
+
+/** @name Training constants */
+/**@{*/
+#define ANNO_DEFAULT_ITERATIONS 400
+#define ANNO_BATCH_WINDOWS 1
+#define ANNO_LEARNING_RATE 3e-3f
+#define ANNO_FOCAL_GAMMA 2.0f
+#define ANNO_DICE_EPSILON 1e-5f
+#define ANNO_DICE_WEIGHT 0.25     /**< weight of the soft-F1 term vs focal */
+#define ANNO_GRADIENT_CLIP 1.0f
+#define ANNO_SEED 20261101u
+/**@}*/
+
+/** UNet output classes; each class is also one decoded grammar state. */
 typedef enum {
   ANNO_INTERGENIC = 0,
-  ANNO_PLUS_INTRON = 1,
-  ANNO_PLUS_5UTR = 2,
-  ANNO_PLUS_3UTR = 3,
-  ANNO_MINUS_INTRON = 4,
+  ANNO_PLUS_5UTR = 1,
+  ANNO_PLUS_EXON = 2,  /**< coding part of a plus-strand exon  */
+  ANNO_PLUS_INTRON = 3,
+  ANNO_PLUS_3UTR = 4,
   ANNO_MINUS_5UTR = 5,
-  ANNO_MINUS_3UTR = 6
+  ANNO_MINUS_EXON = 6, /**< coding part of a minus-strand exon */
+  ANNO_MINUS_INTRON = 7,
+  ANNO_MINUS_3UTR = 8
 } AnnoClass;
 
-typedef enum {
-  ANNO_STATE_INTERGENIC = 0,
-  ANNO_STATE_PLUS_5UTR = 1,
-  ANNO_STATE_PLUS_EXON = 2,
-  ANNO_STATE_PLUS_INTRON = 3,
-  ANNO_STATE_PLUS_3UTR = 4,
-  ANNO_STATE_MINUS_5UTR = 5,
-  ANNO_STATE_MINUS_EXON = 6,
-  ANNO_STATE_MINUS_INTRON = 7,
-  ANNO_STATE_MINUS_3UTR = 8
-} AnnoDecodedState;
-
+/** Shape of the 1D UNet. */
 typedef struct {
-  int input_channels;
-  int classes;
-  int base_channels;
-  int depth;
-  int kernel_size;
-} AnnoUnetConfig;
+  int depth;                       /**< number of resolution levels       */
+  int kernel;                      /**< odd convolution width             */
+  int pool;                        /**< average-pool / upsample factor    */
+  int channels[ANNO_MAX_DEPTH];    /**< feature channels per level        */
+} UnetConfig;
 
+/** 1D UNet with its input normalisation; opaque. */
+typedef struct Unet Unet;
+
+/** One sequence record. The struct owns every pointer it holds. */
 typedef struct {
-  float feature_mean[ANNO_CWT_CHANNELS + 4];
-  float feature_std[ANNO_CWT_CHANNELS + 4];
-  uint32_t window_size;
-  uint32_t cwt_scales[ANNO_CWT_CHANNELS];
-  char class_names[ANNO_CLASSES][24];
-} AnnoModelMetadata;
+  char *name;       /**< FASTA ID                                     */
+  char *bases;      /**< upper-case bases, NUL terminated             */
+  int64_t length;   /**< number of bases                              */
+  uint8_t *labels;  /**< per-base AnnoClass (training only) or NULL   */
+} AnnoSequence;
 
-typedef struct AnnoModel AnnoModel;
-
+/** Default UNet shape used for training. */
+UnetConfig unet_default_config(void);
+/** @brief Create a randomly initialised UNet; NULL on invalid config. */
+Unet *unet_create(const UnetConfig *config);
+/** @brief Release a UNet created by unet_create() or unet_load(). */
+void unet_destroy(Unet *unet);
 /**
- * @brief Executes anno_class_for_state.
- * @param state Input value.
- * @return Function result.
+ * @brief Predict class probabilities.
+ * @param input       length x ANNO_INPUT_CHANNELS normalised features.
+ * @param probability length x ANNO_CLASSES output (rows sum to one).
+ * @return 0 on success, an errno value otherwise.
  */
-int anno_class_for_state(uint8_t state);
-/**
- * @brief Executes anno_grammar_transition.
- * @param previous Input value.
- * @param current Input value.
- * @return Function result.
- */
-int anno_grammar_transition(uint8_t previous, uint8_t current);
-/**
- * @brief Executes anno_grammar_decode.
- * @param probability Input value.
- * @param length Input value.
- * @param min_exon Input value.
- * @param min_intron Input value.
- * @param path Input value.
- * @return Function result.
- */
-int anno_grammar_decode(const float *probability, int64_t length,
-                        int min_exon, int min_intron, uint8_t *path);
+int unet_predict(const Unet *unet, const float *input, int64_t length,
+                 float *probability);
+/** @brief Read a binary .ann model. @return 0 on success. */
+int unet_load(const char *path, Unet **out);
+/** @brief Write a binary .ann model. @return 0 on success. */
+int unet_save(const char *path, const Unet *unet);
 
 /**
- * @brief Executes anno_model_create.
- * @param config Input value.
- * @return Function result.
+ * @brief Morlet CWT of the complex base signal for positions [start,end).
+ * @param out (end-start) x ANNO_CWT_CHANNELS x 2 floats (real, imaginary).
+ *
+ * The reverse-complement strand never needs recomputation: its transform
+ * at position i equals the complex conjugate of this one at length-1-i.
  */
-AnnoModel *anno_model_create(const AnnoUnetConfig *config);
+void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
+              float *out);
+
 /**
- * @brief Executes anno_model_destroy.
- * @param model Input value.
- * @return No value.
+ * @brief Grammar-constrained Viterbi decoding of a probability matrix.
+ * @param bases       sequence (for splice motifs).
+ * @param probability length x ANNO_CLASSES.
+ * @param path        length output classes (AnnoClass).
+ * @return 0 on success.
  */
-void anno_model_destroy(AnnoModel *model);
+int anno_decode(const char *bases, int64_t length, const float *probability,
+                uint8_t *path);
+
 /**
- * @brief Executes anno_model_predict.
- * @param model Input value.
- * @param input Input value.
- * @param length Input value.
- * @param probability Input value.
- * @return Function result.
+ * @brief Convert a per-base class path into GFF3 transcript records.
+ * @param gene_counter running gene number, updated.
+ * @return number of transcripts written, or -1 on error.
  */
-int anno_model_predict(const AnnoModel *model, const float *input,
-                        int64_t length, float *probability);
+long anno_write_gff(FILE *output, const AnnoSequence *sequence,
+                    const uint8_t *path, unsigned long *gene_counter);
+
 /**
- * @brief Executes anno_model_train.
- * @param model Input value.
- * @param input Input value.
- * @param label Input value.
- * @param length Input value.
- * @param iterations Input value.
- * @param batch_size Input value.
- * @param learning_rate Input value.
- * @param seed Input value.
- * @return Function result.
+ * @brief Read a FASTA(.gz) file.
+ * @return array owned by the caller (anno_sequences_free()).
  */
-int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
-                     int64_t length, int iterations, int batch_size,
-                     float learning_rate, uint64_t seed);
-/**
- * @brief Executes anno_model_save.
- * @param model Input value.
- * @param path Input value.
- * @return Function result.
- */
-int anno_model_save(const AnnoModel *model, const char *path);
-/**
- * @brief Executes anno_model_load.
- * @param model Input value.
- * @param path Input value.
- * @return Function result.
- */
-int anno_model_load(AnnoModel **model, const char *path);
-/**
- * @brief Executes anno_model_metadata.
- * @param model Input value.
- * @return Function result.
- */
-const AnnoModelMetadata *anno_model_metadata(const AnnoModel *model);
+AnnoSequence *anno_read_fasta(const char *path, int *count);
+/** @brief Fill sequences[].labels from a GFF3(.gz) annotation. */
+void anno_read_labels(const char *path, AnnoSequence *sequences, int count);
+/** @brief Free an array returned by anno_read_fasta(). */
+void anno_sequences_free(AnnoSequence *sequences, int count);
 
 #endif
