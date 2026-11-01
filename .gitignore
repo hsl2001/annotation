@@ -1,5 +1,5 @@
 *.gff*
-*.model
+*.ann
 gffcmp*
 gffcompare
 *.fa*
