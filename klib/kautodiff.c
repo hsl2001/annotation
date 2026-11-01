@@ -229,6 +229,19 @@ kad_node_t *kad_avg1d(kad_node_t *x, int kernel_size, int stride, int left_pad)
 	return kad_finalize_node(s);
 }
 
+kad_node_t *kad_upsample1d(kad_node_t *x, int factor)
+{
+	kad_node_t *s;
+	int32_t *aux;
+	if (x->n_d != 3 || factor < 1) return 0;
+	aux = (int32_t*)malloc(sizeof(*aux));
+	*aux = factor;
+	s = kad_new_core(0, 37, 1);
+	s->child[0] = x;
+	s->ptr = aux, s->ptr_size = sizeof(*aux);
+	return kad_finalize_node(s);
+}
+
 /********** Multi-node pooling **********/
 
 static kad_node_t *kad_pooling_general(int op, int n, kad_node_t **x)
@@ -2312,6 +2325,30 @@ int kad_op_avg1d(kad_node_t *p, int action)
 	return 0;
 }
 
+int kad_op_upsample1d(kad_node_t *p, int action)
+{
+	kad_node_t *q = p->child[0];
+	int factor = *(int32_t*)p->ptr;
+	int outer, i, j, k;
+	if (q->n_d != 3 || factor < 1) return -1;
+	outer = q->d[0] * q->d[1];
+	if (action == KAD_SYNC_DIM) {
+		p->n_d = 3;
+		p->d[0] = q->d[0], p->d[1] = q->d[1], p->d[2] = q->d[2] * factor;
+	} else if (action == KAD_FORWARD) {
+		for (i = 0; i < outer; i++)
+			for (j = 0; j < q->d[2]; j++)
+				for (k = 0; k < factor; k++)
+					p->x[i * q->d[2] * factor + j * factor + k] = q->x[i * q->d[2] + j];
+	} else if (action == KAD_BACKWARD && kad_is_back(q)) {
+		for (i = 0; i < outer; i++)
+			for (j = 0; j < q->d[2]; j++)
+				for (k = 0; k < factor; k++)
+					q->g[i * q->d[2] + j] += p->g[i * q->d[2] * factor + j * factor + k];
+	}
+	return 0;
+}
+
 /********** List of operators **********/
 
 kad_op_f kad_op_list[KAD_MAX_OP] = {
@@ -2351,13 +2388,14 @@ kad_op_f kad_op_list[KAD_MAX_OP] = {
 	kad_op_exp,        /* 33: exp() */
 	kad_op_sin,        /* 34: sin() */
 	kad_op_stack,      /* 35: tf.stack, but on the first axis only */
-	kad_op_reverse     /* 36: tf.reverse, but on one axis only */
+	kad_op_reverse,     /* 36: tf.reverse, but on one axis only */
+	kad_op_upsample1d   /* 37: nearest-neighbor 1D upsampling */
 };
 
 char *kad_op_name[KAD_MAX_OP] = {
 	0, "add", "mul", "cmul", "ce_bin_neg", "square", "sigm", "tanh", "relu", "matmul", "avg", "1minus", "select", "ce_multi", "softmax",
 	"dropout", "conv2d", "max2d", "conv1d", "max1d", "slice", "max", "ce_bin", "sub", "sample_normal", "reduce_sum", "reduce_mean", "log",
-	"avg1d", "mse", "reshape", "concat", "stdnorm", "exp", "sin", "stack", "reverse"
+	"avg1d", "mse", "reshape", "concat", "stdnorm", "exp", "sin", "stack", "reverse", "upsample1d"
 };
 
 /**************************

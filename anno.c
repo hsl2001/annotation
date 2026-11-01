@@ -627,10 +627,25 @@ struct Unet {
 static kann_t *kann_unet(const UnetConfig *config) {
   kad_node_t *input = kad_feed(3, ANNO_BATCH_WINDOWS, ANNO_INPUT_CHANNELS, KANN_LENGTH);
   input->ext_flag |= KANN_F_IN;
-  kad_node_t *x = kad_relu(kann_layer_conv1d(input, config->channels[0],
-                                             config->kernel, 1, KAD_PAD_SAME));
-  x = kad_relu(kann_layer_conv1d(x, config->channels[1], config->kernel,
-                                 1, KAD_PAD_SAME));
+  kad_node_t *skip[ANNO_MAX_DEPTH] = {0};
+  kad_node_t *x = input;
+  for (int level = 0; level < config->depth; level++) {
+    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
+                                   1, KAD_PAD_SAME));
+    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
+                                   1, KAD_PAD_SAME));
+    skip[level] = x;
+    if (level + 1 < config->depth)
+      x = kad_avg1d(x, config->pool, config->pool, 0);
+  }
+  for (int level = config->depth - 2; level >= 0; level--) {
+    x = kad_upsample1d(x, config->pool);
+    x = kad_concat(1, 2, x, skip[level]);
+    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
+                                   1, KAD_PAD_SAME));
+    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
+                                   1, KAD_PAD_SAME));
+  }
   x = kann_layer_conv1d(x, ANNO_CLASSES, 1, 1, 0);
   x->ext_flag |= KANN_F_OUT;
   kad_node_t *truth = kad_feed(3, ANNO_BATCH_WINDOWS, ANNO_CLASSES, KANN_LENGTH);
@@ -678,7 +693,8 @@ static uint8_t kann_swap_strand(uint8_t label) {
 
 /** @brief Return the KANN model configuration exposed by the public API. */
 UnetConfig unet_default_config(void) {
-  return (UnetConfig){.kernel = 9, .channels = {32, 64, 128, 256}};
+  return (UnetConfig){.depth = 4, .kernel = 9, .pool = 2,
+                      .channels = {32, 64, 128, 256}};
 }
 
 /** @brief Create a KANN model; configuration values are retained as metadata. */
