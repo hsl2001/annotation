@@ -696,7 +696,7 @@ typedef struct {
 
 UnetConfig unet_default_config(void) {
   return (UnetConfig){.depth = 4, .kernel = 9, .pool = 4,
-                      .channels = {16, 32, 48, 64}};
+                      .channels = {32, 64, 96, 128}};
 }
 
 /** @brief Channels entering level l. */
