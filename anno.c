@@ -33,6 +33,30 @@ KSEQ_INIT(gzFile, gzread)
 /* Basic utilities                                                          */
 /* ------------------------------------------------------------------------ */
 
+#ifdef ANNO_NO_MAIN
+/**
+ * @brief Advance a deterministic xorshift64* generator.
+ * @param state Generator state, updated in place.
+ * @return Next pseudo-random value.
+ */
+static uint64_t random_next(uint64_t *state) {
+  *state ^= *state >> 12;
+  *state ^= *state << 25;
+  *state ^= *state >> 27;
+  return *state * 2685821657736338717ULL;
+}
+
+/**
+ * @brief Generate a uniformly distributed integer below a bound.
+ * @param state Generator state, updated in place.
+ * @param bound Exclusive positive upper bound.
+ * @return Value in the range [0, @p bound).
+ */
+static int64_t random_below(uint64_t *state, int64_t bound) {
+  return (int64_t)(random_next(state) % (uint64_t)bound);
+}
+#endif
+
 /** Class names; also used for bedGraph file names. */
 static const char *const class_names[ANNO_CLASSES] = {
   "intergenic", "plus_five_prime_UTR", "plus_exon", "plus_intron",
@@ -42,7 +66,12 @@ static const char *const class_names[ANNO_CLASSES] = {
 /** Morlet scales of the CWT channels. */
 static const int cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 
-/** @brief Print an error to stderr and exit. */
+/**
+ * @brief Print an error to stderr and terminate the process.
+ * @param format printf-style error format string.
+ * @param ... Values referenced by @p format.
+ * @return This function does not return.
+ */
 static _Noreturn void fail(const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);
@@ -53,7 +82,12 @@ static _Noreturn void fail(const char *format, ...) {
   exit(EXIT_FAILURE);
 }
 
-/** @brief Print a log line to stderr. */
+/**
+ * @brief Print a log line to stderr.
+ * @param format printf-style log format string.
+ * @param ... Values referenced by @p format.
+ * @return None.
+ */
 static void say(const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);
@@ -63,41 +97,68 @@ static void say(const char *format, ...) {
   va_end(arguments);
 }
 
-/** @brief Multiply two sizes, failing on overflow. */
+/**
+ * @brief Multiply two sizes, failing on overflow.
+ * @param a First factor.
+ * @param b Second factor.
+ * @return Product of @p a and @p b.
+ */
 static size_t mul_size(size_t a, size_t b) {
   if (a && b > SIZE_MAX / a) fail("size overflow");
   return a * b;
 }
 
-/** @brief calloc() that fails on overflow or exhaustion. Caller frees. */
+/**
+ * @brief Allocate zero-initialized memory or terminate on failure.
+ * @param count Number of elements.
+ * @param size Size of each element.
+ * @return Allocated zero-initialized memory.
+ */
 static void *xcalloc(size_t count, size_t size) {
   void *memory = calloc(count ? count : 1, size ? size : 1);
   if (!memory || (size && count > SIZE_MAX / size)) fail("out of memory");
   return memory;
 }
 
-/** @brief realloc() that fails on overflow or exhaustion. */
+/**
+ * @brief Resize an allocation or terminate on failure.
+ * @param old Existing allocation, or NULL.
+ * @param count Number of elements.
+ * @param size Size of each element.
+ * @return Resized allocation.
+ */
 static void *xrealloc(void *old, size_t count, size_t size) {
   void *memory = realloc(old, mul_size(count ? count : 1, size));
   if (!memory) fail("out of memory");
   return memory;
 }
 
-/** @brief strdup() that fails on exhaustion. Caller frees. */
+/**
+ * @brief Duplicate a string or terminate on allocation failure.
+ * @param text String to duplicate.
+ * @return Newly allocated string.
+ */
 static char *xstrdup(const char *text) {
   char *copy = strdup(text);
   if (!copy) fail("out of memory");
   return copy;
 }
 
-/** @brief Monotonic wall-clock seconds. */
+/**
+ * @brief Return monotonic elapsed time in seconds.
+ * @return Monotonic clock value in seconds.
+ */
 static double now_seconds(void) {
   struct timespec time;
   clock_gettime(CLOCK_MONOTONIC, &time);
   return (double)time.tv_sec + 1e-9 * (double)time.tv_nsec;
 }
 
-/** @brief A/C/G/T -> 0..3, anything else -> -1. */
+/**
+ * @brief Convert a nucleotide to its one-hot channel index.
+ * @param base Nucleotide character.
+ * @return A/C/G/T index in the range 0..3, or -1 for another character.
+ */
 static int base_index(char base) {
   switch (base) {
   case 'A': return 0;
@@ -108,23 +169,14 @@ static int base_index(char base) {
   }
 }
 
-/** @brief Reverse complement (N for unknown bases). */
+/**
+ * @brief Return the complement of a nucleotide.
+ * @param base Nucleotide character.
+ * @return Complementary nucleotide, or N for an unknown base.
+ */
 static char complement(char base) {
   int index = base_index(base);
   return index < 0 ? 'N' : "TGCA"[index];
-}
-
-/** @brief xorshift64* generator; deterministic for a given seed. */
-static uint64_t random_next(uint64_t *state) {
-  *state ^= *state >> 12;
-  *state ^= *state << 25;
-  *state ^= *state >> 27;
-  return *state * 2685821657736338717ULL;
-}
-
-/** @brief Uniform integer in [0, bound). bound must be positive. */
-static int64_t random_below(uint64_t *state, int64_t bound) {
-  return (int64_t)(random_next(state) % (uint64_t)bound);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -133,7 +185,14 @@ static int64_t random_below(uint64_t *state, int64_t bound) {
 
 typedef void (*JobFunction)(void *context, long job, int worker);
 
-/** @brief Run independent jobs through klib's static worker pool. */
+/**
+ * @brief Run independent jobs through klib's static worker pool.
+ * @param threads Number of worker threads.
+ * @param jobs Number of jobs.
+ * @param function Job callback.
+ * @param context User context passed to @p function.
+ * @return None.
+ */
 static void run_parallel(int threads, int64_t jobs, JobFunction function,
                          void *context) {
   kt_for(threads, function, context, (long)jobs);
@@ -143,6 +202,12 @@ static void run_parallel(int threads, int64_t jobs, JobFunction function,
 /* FASTA                                                                    */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * @brief Read FASTA records from a possibly compressed file.
+ * @param path FASTA file path.
+ * @param count_out Receives the number of records.
+ * @return Caller-owned sequence array.
+ */
 AnnoSequence *anno_read_fasta(const char *path, int *count_out) {
   gzFile input = gzopen(path, "rb");
   if (!input) fail("cannot open FASTA %s", path);
@@ -171,6 +236,12 @@ AnnoSequence *anno_read_fasta(const char *path, int *count_out) {
   return sequences;
 }
 
+/**
+ * @brief Release an array of sequence records and their owned data.
+ * @param sequences Sequence records, or NULL.
+ * @param count Number of records.
+ * @return None.
+ */
 void anno_sequences_free(AnnoSequence *sequences, int count) {
   for (int i = 0; sequences && i < count; i++) {
     free(sequences[i].name);
@@ -206,7 +277,13 @@ typedef struct {
   int count, capacity;
 } SegmentList;
 
-/** @brief Append a segment. */
+/**
+ * @brief Append a half-open segment to a growable list.
+ * @param list Segment list to extend.
+ * @param start Inclusive segment start.
+ * @param end Exclusive segment end.
+ * @return None.
+ */
 static void segments_push(SegmentList *list, int64_t start, int64_t end) {
   if (list->count == list->capacity) {
     list->capacity = list->capacity ? list->capacity * 2 : 8;
@@ -216,14 +293,24 @@ static void segments_push(SegmentList *list, int64_t start, int64_t end) {
   list->items[list->count++] = (Segment){start, end};
 }
 
-/** @brief Order segments by start. */
+/**
+ * @brief Compare segments by start and then end.
+ * @param a First segment.
+ * @param b Second segment.
+ * @return Negative, zero, or positive comparison result.
+ */
 static int segment_compare(const void *a, const void *b) {
   const Segment *x = a, *y = b;
   return x->start < y->start ? -1 : x->start > y->start ? 1
        : x->end < y->end ? -1 : x->end > y->end;
 }
 
-/** @brief Order features by parent, kind and start. */
+/**
+ * @brief Compare GFF features by parent, kind, and start.
+ * @param a First feature.
+ * @param b Second feature.
+ * @return Negative, zero, or positive comparison result.
+ */
 static int feature_compare(const void *a, const void *b) {
   const GffFeature *x = a, *y = b;
   int order = strcmp(x->parent, y->parent);
@@ -232,7 +319,11 @@ static int feature_compare(const void *a, const void *b) {
   return x->start < y->start ? -1 : x->start > y->start;
 }
 
-/** @brief GFF feature type -> KIND_*, or -1 when ignored. */
+/**
+ * @brief Convert a GFF feature type to an internal kind.
+ * @param type GFF feature type.
+ * @return KIND_* value, -2 for container features, or -1 when ignored.
+ */
 static int feature_kind(const char *type) {
   if (!strcmp(type, "exon")) return KIND_EXON;
   if (!strcmp(type, "CDS")) return KIND_CDS;
@@ -245,7 +336,12 @@ static int feature_kind(const char *type) {
   return -1;
 }
 
-/** @brief Parse a non-negative decimal integer. @return 1 on success. */
+/**
+ * @brief Parse a non-negative decimal integer.
+ * @param text Decimal text to parse.
+ * @param value Receives the parsed integer.
+ * @return 1 on success, otherwise 0.
+ */
 static int parse_int64(const char *text, int64_t *value) {
   char *end = NULL;
   errno = 0;
@@ -264,7 +360,12 @@ typedef struct {
   int64_t cds_start, cds_end;
 } LabelTranscript;
 
-/** @brief Order transcripts by decreasing span (longer transcripts win). */
+/**
+ * @brief Compare transcripts by decreasing genomic span.
+ * @param a First transcript.
+ * @param b Second transcript.
+ * @return Negative, zero, or positive comparison result.
+ */
 static int transcript_compare(const void *a, const void *b) {
   const LabelTranscript *x = a, *y = b;
   int64_t lx = x->end - x->start, ly = y->end - y->start;
@@ -273,7 +374,11 @@ static int transcript_compare(const void *a, const void *b) {
   return x->start < y->start ? -1 : x->start > y->start;
 }
 
-/** @brief Merge sorted touching/overlapping segments in place. */
+/**
+ * @brief Merge touching or overlapping segments in place.
+ * @param list Segment list to sort and merge.
+ * @return None.
+ */
 static void segments_merge(SegmentList *list) {
   if (!list->count) return;
   qsort(list->items, (size_t)list->count, sizeof(Segment), segment_compare);
@@ -289,7 +394,14 @@ static void segments_merge(SegmentList *list) {
   list->count = out + 1;
 }
 
-/** @brief Read GFF features that belong to transcripts. */
+/**
+ * @brief Read GFF features that belong to transcripts.
+ * @param path GFF3 file path.
+ * @param sequences FASTA sequences used to resolve sequence IDs.
+ * @param count Number of FASTA sequences.
+ * @param feature_count Receives the number of features.
+ * @return Caller-owned feature array.
+ */
 static GffFeature *read_gff_features(const char *path,
                                      const AnnoSequence *sequences, int count,
                                      size_t *feature_count) {
@@ -353,7 +465,12 @@ static GffFeature *read_gff_features(const char *path,
   return features;
 }
 
-/** @brief Paint one transcript into `labels` (caller checked overlap). */
+/**
+ * @brief Paint one transcript into a per-base label array.
+ * @param t Transcript to paint.
+ * @param labels Destination labels; overlapping transcripts are prechecked.
+ * @return None.
+ */
 static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
   int plus = t->strand == '+';
   uint8_t intron = plus ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
@@ -380,6 +497,13 @@ static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
       labels[i] = intron;
 }
 
+/**
+ * @brief Read GFF3 annotations and fill sequence label arrays.
+ * @param path GFF3 file path.
+ * @param sequences FASTA sequence records to label.
+ * @param count Number of sequence records.
+ * @return None.
+ */
 void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
   size_t feature_count = 0;
   GffFeature *features = read_gff_features(path, sequences, count, &feature_count);
@@ -460,6 +584,15 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
 /* CWT                                                                      */
 /* ------------------------------------------------------------------------ */
 
+/**
+ * @brief Compute the complex Morlet CWT for a sequence interval.
+ * @param bases Input sequence bases.
+ * @param length Total sequence length.
+ * @param start Inclusive interval start.
+ * @param end Exclusive interval end.
+ * @param out Destination complex CWT values.
+ * @return None.
+ */
 void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
               float *out) {
   static const double signal[4][2] = {{1, 1}, {-1, 1}, {-1, -1}, {1, -1}};
@@ -489,7 +622,15 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   }
 }
 
-/** @brief CWT power (|W|^2) for [start,end) into out[(p-start)*C + s]. */
+/**
+ * @brief Compute CWT power for a sequence interval.
+ * @param bases Input sequence bases.
+ * @param length Total sequence length.
+ * @param start Inclusive interval start.
+ * @param end Exclusive interval end.
+ * @param out Destination power matrix.
+ * @return None.
+ */
 static void cwt_power(const char *bases, int64_t length, int64_t start,
                       int64_t end, float *out) {
   for (int64_t block = start; block < end; block += ANNO_CWT_WINDOW) {
@@ -508,7 +649,13 @@ typedef struct {
   float *power;
 } PowerJob;
 
-/** @brief Job: CWT power of one ANNO_CWT_WINDOW block. */
+/**
+ * @brief Compute CWT power for one parallel window.
+ * @param pointer PowerJob context.
+ * @param job Window number.
+ * @param worker Worker number, unused.
+ * @return None.
+ */
 static void power_job(void *pointer, int64_t job, int worker) {
   (void)worker;
   PowerJob *context = pointer;
@@ -518,7 +665,12 @@ static void power_job(void *pointer, int64_t job, int worker) {
             context->power + (size_t)start * ANNO_CWT_CHANNELS);
 }
 
-/** @brief Whole-sequence CWT power computed in parallel blocks. Caller frees. */
+/**
+ * @brief Compute whole-sequence CWT power in parallel blocks.
+ * @param sequence Sequence to transform.
+ * @param threads Number of worker threads.
+ * @return Caller-owned power matrix.
+ */
 static float *sequence_power(const AnnoSequence *sequence, int threads) {
   PowerJob job = {sequence, xcalloc(mul_size((size_t)sequence->length,
                                              ANNO_CWT_CHANNELS), sizeof(float))};
@@ -534,7 +686,13 @@ typedef struct {
   float *out;
 } ComplexJob;
 
-/** @brief Job: complex CWT of one block for the cwt subcommand. */
+/**
+ * @brief Compute complex CWT for one cwt-subcommand block.
+ * @param pointer ComplexJob context.
+ * @param job Window number.
+ * @param worker Worker number, unused.
+ * @return None.
+ */
 static void complex_job(void *pointer, int64_t job, int worker) {
   (void)worker;
   ComplexJob *context = pointer;
@@ -547,9 +705,13 @@ static void complex_job(void *pointer, int64_t job, int worker) {
 }
 
 /**
- * @brief `anno cwt`: write {dir}/matrix.bin (complex64, plus rows then the
+ * @brief Write CWT matrices and contig offsets for the cwt subcommand.
  *        reverse-complement rows) and {dir}/contigs.tsv for plot.py.
  *        Minus rows are the conjugated, mirrored plus rows (no recompute).
+ * @param fasta Input FASTA file.
+ * @param directory Output directory.
+ * @param threads Number of worker threads.
+ * @return None.
  */
 static void run_cwt(const char *fasta, const char *directory, int threads) {
   int count = 0;
@@ -650,30 +812,41 @@ static kann_t *kann_unet(const UnetConfig *config) {
   x->ext_flag |= KANN_F_OUT;
   kad_node_t *truth = kad_feed(3, ANNO_BATCH_WINDOWS, ANNO_CLASSES, KANN_LENGTH);
   truth->ext_flag |= KANN_F_TRUTH;
-  kad_node_t *probability = kad_sigm(x);
-  kad_node_t *two = kann_new_scalar(KAD_CONST, 2.0f);
-  kad_node_t *epsilon = kann_new_scalar(KAD_CONST, ANNO_EPSILON);
+  truth->ext_label = 2;
+  kad_node_t *mask = kad_feed(3, ANNO_BATCH_WINDOWS, 1, KANN_LENGTH);
+  mask->ext_flag |= KANN_F_TRUTH;
+  mask->ext_label = 1;
   kad_node_t *minus_one = kann_new_scalar(KAD_CONST, -1.0f);
+  kad_node_t *epsilon = kann_new_scalar(KAD_CONST, ANNO_EPSILON);
+  kad_node_t *exp_logits = kad_exp(x);
+  kad_node_t *normalizer = kad_reduce_sum(exp_logits, 1);
+  kad_node_t *inverse = kad_exp(kad_mul(kad_log(normalizer), minus_one));
   kad_node_t *loss[ANNO_CLASSES];
+  if (!exp_logits || !normalizer || !inverse)
+    fail("invalid Soft F1 probability graph");
   for (int j = 0; j < ANNO_CLASSES; j++) {
-    kad_node_t *p = kad_slice(probability, 1, j, j + 1);
+    kad_node_t *p_exp = kad_slice(exp_logits, 1, j, j + 1);
+    kad_node_t *p = kad_mul(p_exp, inverse);
     kad_node_t *y = kad_slice(truth, 1, j, j + 1);
-    kad_node_t *product = kad_mul(p, y);
-    if (!p || !y || !product) fail("invalid KANN Soft F1 shape");
-    kad_node_t *intersection = kad_reduce_sum(product, 2);
+    p = kad_mul(p, mask);
+    y = kad_mul(y, mask);
+    kad_node_t *intersection = kad_reduce_sum(kad_mul(p, y), 2);
     kad_node_t *sum_p = kad_reduce_sum(p, 2);
     kad_node_t *sum_y = kad_reduce_sum(y, 2);
-    if (!intersection || !sum_p || !sum_y) fail("invalid KANN Soft F1 reduction");
-    kad_node_t *numerator = kad_add(kad_mul(intersection, two), epsilon);
+    kad_node_t *numerator = kad_add(kad_mul(intersection,
+                                             kann_new_scalar(KAD_CONST, 2.0f)),
+                                    epsilon);
     kad_node_t *denominator = kad_add(kad_add(sum_p, sum_y), epsilon);
-    kad_node_t *inverse = kad_exp(kad_mul(kad_log(denominator), minus_one));
-    kad_node_t *dice = kad_mul(numerator, inverse);
+    kad_node_t *dice = kad_mul(numerator,
+                               kad_exp(kad_mul(kad_log(denominator),
+                                               minus_one)));
     kad_node_t *class_loss = kad_1minus(dice);
-    if (!class_loss) fail("invalid KANN Soft F1 class loss");
+    if (!p_exp || !p || !y || !intersection || !sum_p || !sum_y || !numerator ||
+        !denominator || !dice || !class_loss)
+      fail("invalid Soft F1 loss graph");
     class_loss = kad_reduce_mean(class_loss, 0);
-    if (!class_loss) fail("invalid KANN Soft F1 batch reduction");
     loss[j] = kad_reduce_mean(class_loss, 0);
-    if (!loss[j]) fail("invalid KANN Soft F1 scalar reduction");
+    if (!loss[j]) fail("invalid Soft F1 reduction");
   }
   kad_node_t *cost = kad_avg(ANNO_CLASSES, loss);
   cost->ext_flag |= KANN_F_COST;
@@ -691,13 +864,20 @@ static uint8_t kann_swap_strand(uint8_t label) {
   return label == ANNO_INTERGENIC ? label : label <= 4 ? label + 4 : label - 4;
 }
 
-/** @brief Return the KANN model configuration exposed by the public API. */
+/**
+ * @brief Return the default KANN model configuration.
+ * @return Default model configuration.
+ */
 UnetConfig unet_default_config(void) {
   return (UnetConfig){.depth = 4, .kernel = 9, .pool = 2,
-                      .channels = {32, 64, 128, 256}};
+                      .channels = {16, 32, 64, 128}};
 }
 
-/** @brief Create a KANN model; configuration values are retained as metadata. */
+/**
+ * @brief Create a KANN model.
+ * @param config Model configuration.
+ * @return New model, or NULL when @p config is NULL or allocation fails.
+ */
 Unet *unet_create(const UnetConfig *config) {
   if (!config) return NULL;
   Unet *unet = xcalloc(1, sizeof(*unet));
@@ -711,7 +891,11 @@ Unet *unet_create(const UnetConfig *config) {
   return unet;
 }
 
-/** @brief Release a KANN model and its graph. */
+/**
+ * @brief Release a KANN model and its graph.
+ * @param unet Model to release, or NULL.
+ * @return None.
+ */
 void unet_destroy(Unet *unet) {
   if (!unet) return;
   kann_delete(unet->ann);
@@ -722,16 +906,34 @@ void unet_destroy(Unet *unet) {
  * @brief Fill channel-major KANN input and one-hot target tensors.
  * @param sequence Source sequence.
  * @param power Precomputed CWT power channels.
+ * @param power_start First genomic position represented by @p power.
  * @param start First source position.
  * @param valid Number of positions to fill.
  * @param flip Whether to reverse-complement the window.
  * @param input Channel-major input tensor.
  * @param labels Optional source labels.
  * @param truth Optional channel-major one-hot target tensor.
+ * @return None.
  */
 static void features(const AnnoSequence *sequence, const float *power,
-                     int64_t start, int64_t valid, int flip, float *input,
-                     const uint8_t *labels, float *truth) {
+                     int64_t power_start, int64_t start, int64_t valid,
+                     int flip, float *input, const uint8_t *labels,
+                     float *truth) {
+  float mean[ANNO_CWT_CHANNELS] = {0};
+  float variance[ANNO_CWT_CHANNELS] = {0};
+  for (int64_t q = 0; q < valid; q++)
+    for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
+      mean[s] += power[(size_t)(start + q - power_start) *
+                       ANNO_CWT_CHANNELS + s];
+  for (int s = 0; s < ANNO_CWT_CHANNELS; s++) mean[s] /= (float)valid;
+  for (int64_t q = 0; q < valid; q++)
+    for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
+      float delta = power[(size_t)(start + q - power_start) *
+                         ANNO_CWT_CHANNELS + s] - mean[s];
+      variance[s] += delta * delta;
+    }
+  for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
+    variance[s] = sqrtf(variance[s] / (float)valid + 1e-6f);
   for (int64_t q = 0; q < valid; q++) {
     int64_t p = flip ? start + valid - 1 - q : start + q;
     int base = base_index(sequence->bases[p]);
@@ -739,7 +941,8 @@ static void features(const AnnoSequence *sequence, const float *power,
     if (base >= 0) input[(size_t)base * KANN_LENGTH + q] = 1.0f;
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
       input[(size_t)(4 + s) * KANN_LENGTH + q] =
-        power[(size_t)p * ANNO_CWT_CHANNELS + s];
+        (power[(size_t)(p - power_start) * ANNO_CWT_CHANNELS + s] - mean[s]) /
+        variance[s];
     if (truth) {
       uint8_t label = labels[flip ? start + valid - 1 - q : start + q];
       if (flip) label = kann_swap_strand(label);
@@ -819,7 +1022,7 @@ int unet_load(const char *path, Unet **out) {
 }
 
 /**
- * @brief Train the KANN graph on random labelled sequence windows.
+ * @brief Train the KANN graph on every labelled sequence window.
  * @param sequences Labelled training sequences.
  * @param count Number of sequences.
  * @param iterations Number of optimizer iterations.
@@ -837,34 +1040,65 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
   int nvar = kann_size_var(unet->ann);
   float *x = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * KANN_LENGTH, sizeof(float));
   float *y = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * KANN_LENGTH, sizeof(float));
+  float *mask = xcalloc((size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH, sizeof(float));
   float *r = xcalloc((size_t)nvar, sizeof(float));
-  uint64_t seed = ANNO_SEED;
+  size_t total_windows = 0;
+  for (int i = 0; i < count; i++)
+    total_windows += (size_t)((sequences[i].length + KANN_LENGTH - 1) /
+                              KANN_LENGTH);
+  if (!total_windows) fail("no training windows");
   double started = now_seconds();
   for (int iteration = 0; iteration < iterations; iteration++) {
-    memset(x, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * KANN_LENGTH * sizeof(float));
-    memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * KANN_LENGTH * sizeof(float));
-    for (int b = 0; b < ANNO_BATCH_WINDOWS; b++) {
-      int sequence = (int)random_below(&seed, count);
-      int64_t valid = sequences[sequence].length < KANN_LENGTH ? sequences[sequence].length : KANN_LENGTH;
-      int64_t start = random_below(&seed, sequences[sequence].length - valid + 1);
-      features(&sequences[sequence], power[sequence], start, valid,
-               (int)(random_next(&seed) >> 63), x + (size_t)b * ANNO_INPUT_CHANNELS * KANN_LENGTH,
-               sequences[sequence].labels, y + (size_t)b * ANNO_CLASSES * KANN_LENGTH);
+    for (size_t batch_start = 0; batch_start < total_windows;
+         batch_start += ANNO_BATCH_WINDOWS) {
+      size_t batch_end = batch_start + ANNO_BATCH_WINDOWS;
+      if (batch_end > total_windows) batch_end = total_windows;
+      size_t window_index = 0;
+      memset(x, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS *
+             KANN_LENGTH * sizeof(float));
+      memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES *
+             KANN_LENGTH * sizeof(float));
+      memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH * sizeof(float));
+      for (int sequence = 0; sequence < count; sequence++) {
+        int64_t sequence_windows =
+          (sequences[sequence].length + KANN_LENGTH - 1) / KANN_LENGTH;
+        for (int64_t window = 0; window < sequence_windows;
+             window++, window_index++) {
+          if (window_index < batch_start) continue;
+          if (window_index >= batch_end) break;
+          int b = (int)(window_index - batch_start);
+          int64_t start = window * KANN_LENGTH;
+          int64_t valid = sequences[sequence].length - start;
+          if (valid > KANN_LENGTH) valid = KANN_LENGTH;
+          features(&sequences[sequence], power[sequence], 0, start, valid,
+                   (iteration + (int)(batch_start / ANNO_BATCH_WINDOWS)) & 1,
+                   x + (size_t)b * ANNO_INPUT_CHANNELS * KANN_LENGTH,
+                   sequences[sequence].labels,
+                   y + (size_t)b * ANNO_CLASSES * KANN_LENGTH);
+          for (int64_t q = 0; q < valid; q++)
+            mask[(size_t)b * KANN_LENGTH + q] = 1.0f;
+        }
+        if (window_index >= batch_end) break;
+      }
+      kann_feed_bind(unet->ann, KANN_F_IN, 0, &x);
+      kann_feed_bind(unet->ann, KANN_F_TRUTH, 2, &y);
+      kann_feed_bind(unet->ann, KANN_F_TRUTH, 1, &mask);
+      kann_set_batch_size(unet->ann, (int)(batch_end - batch_start));
+      float loss = kann_cost(unet->ann, 0, 1);
+      kann_grad_clip(ANNO_GRADIENT_CLIP, nvar, unet->ann->g);
+      kann_RMSprop(nvar, ANNO_LEARNING_RATE, NULL, 0.9f, unet->ann->g,
+                   unet->ann->x, r);
+      if (!isfinite(loss)) fail("non-finite KANN loss");
+      if (batch_end == total_windows &&
+          (iteration == 0 || iteration + 1 == iterations ||
+           (iteration + 1) % 10 == 0))
+        say("iteration %d/%d loss %.4f %.1fs", iteration + 1, iterations, loss,
+            now_seconds() - started);
     }
-    kann_feed_bind(unet->ann, KANN_F_IN, 0, &x);
-    kann_feed_bind(unet->ann, KANN_F_TRUTH, 0, &y);
-    kann_set_batch_size(unet->ann, ANNO_BATCH_WINDOWS);
-    float loss = kann_cost(unet->ann, 0, 1);
-    kann_grad_clip(ANNO_GRADIENT_CLIP, nvar, unet->ann->g);
-    kann_RMSprop(nvar, ANNO_LEARNING_RATE, NULL, 0.9f, unet->ann->g, unet->ann->x, r);
-    if (!isfinite(loss)) fail("non-finite KANN loss");
-    if (iteration == 0 || iteration + 1 == iterations || (iteration + 1) % 10 == 0)
-      say("iteration %d/%d loss %.4f %.1fs", iteration + 1, iterations, loss,
-          now_seconds() - started);
   }
   kann_mt(unet->ann, 0, 0);
   for (int i = 0; i < count; i++) free(power[i]);
-  free(power); free(x); free(y); free(r);
+  free(power); free(x); free(y); free(mask); free(r);
   return unet;
 }
 
@@ -881,6 +1115,14 @@ typedef struct {
   int shift[GRAMMAR_MAX_STATES], bits[GRAMMAR_MAX_STATES];
 } Grammar;
 
+/**
+ * @brief Add a scored predecessor edge to a grammar state.
+ * @param g Grammar to modify.
+ * @param from Predecessor state index.
+ * @param to Destination state index.
+ * @param score Transition score.
+ * @return None.
+ */
 static void grammar_edge(Grammar *g, int from, int to, double score) {
   int k = g->predecessors[to]++;
   if (k >= GRAMMAR_MAX_PREDECESSORS) fail("grammar has too many predecessors");
@@ -888,6 +1130,13 @@ static void grammar_edge(Grammar *g, int from, int to, double score) {
   g->score[to][k] = score;
 }
 
+/**
+ * @brief Add a self-looping chain of grammar states.
+ * @param g Grammar to modify.
+ * @param cls Class assigned to each new state.
+ * @param length Number of states in the chain.
+ * @return Index of the first new state.
+ */
 static int grammar_chain(Grammar *g, uint8_t cls, int length) {
   int head = g->count;
   for (int i = 0; i < length; i++) {
@@ -904,6 +1153,8 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
  *   intergenic -> [5'UTR (intron 5'UTR)*] -> exon (intron exon)* ->
  *   [3'UTR (intron 3'UTR)*] -> intergenic; minus strand is the mirror image.
  *   Introns are never entered from intergenic and UTRs never touch directly.
+ * @param g Grammar to initialize.
+ * @return None.
  */
 static void grammar_build(Grammar *g) {
   memset(g, 0, sizeof(*g));
@@ -952,7 +1203,11 @@ typedef struct {
   uint32_t *back;
 } Decoder;
 
-/** @brief Create a decoder for a sequence of the given length. */
+/**
+ * @brief Create a decoder for a sequence of the given length.
+ * @param length Number of sequence positions.
+ * @return Newly allocated decoder.
+ */
 static Decoder *decoder_create(int64_t length) {
   Decoder *d = xcalloc(1, sizeof(*d));
   grammar_build(&d->grammar);
@@ -963,7 +1218,11 @@ static Decoder *decoder_create(int64_t length) {
   return d;
 }
 
-/** @brief Free a decoder. */
+/**
+ * @brief Free a decoder and its buffers.
+ * @param d Decoder to free, or NULL.
+ * @return None.
+ */
 static void decoder_destroy(Decoder *d) {
   if (!d) return;
   free(d->previous);
@@ -972,7 +1231,12 @@ static void decoder_destroy(Decoder *d) {
   free(d);
 }
 
-/** @brief Consume the probability row of the next position. */
+/**
+ * @brief Consume the probability row of the next position.
+ * @param d Decoder to advance.
+ * @param row Class probabilities for one position.
+ * @return None.
+ */
 static void decoder_step(Decoder *d, const float *row) {
   const Grammar *g = &d->grammar;
   double emission[ANNO_CLASSES];
@@ -1009,7 +1273,12 @@ static void decoder_step(Decoder *d, const float *row) {
   d->current = swap;
 }
 
-/** @brief Trace back the best path ending in intergenic. @return 0 on success. */
+/**
+ * @brief Trace back the best path ending in intergenic.
+ * @param d Completed decoder.
+ * @param path Receives one class per sequence position.
+ * @return 0 on success, otherwise ERANGE.
+ */
 static int decoder_finish(Decoder *d, uint8_t *path) {
   const Grammar *g = &d->grammar;
   if (d->position != d->length || !isfinite(d->previous[0])) return ERANGE;
@@ -1038,7 +1307,11 @@ int anno_decode(const char *bases, int64_t length, const float *probability,
 /* ORF and GFF3 output                                                      */
 /* ------------------------------------------------------------------------ */
 
-/** @brief Whether the 3 bases form a stop codon. */
+/**
+ * @brief Test whether three bases form a stop codon.
+ * @param c Three-base codon.
+ * @return 1 for a stop codon, otherwise 0.
+ */
 static int is_stop(const char *c) {
   return c[0] == 'T' && ((c[1] == 'A' && (c[2] == 'A' || c[2] == 'G')) ||
                          (c[1] == 'G' && c[2] == 'A'));
@@ -1047,6 +1320,10 @@ static int is_stop(const char *c) {
 /**
  * @brief Longest ATG..stop ORF (stop included) in any frame of a spliced
  *        transcript; ties keep the 5'-most ORF.
+ * @param transcript Spliced transcript bases.
+ * @param length Transcript length.
+ * @param start Receives the ORF start in transcript coordinates.
+ * @param end Receives the exclusive ORF end in transcript coordinates.
  * @return 1 when found, filling [*start,*end) in transcript coordinates.
  */
 static int longest_orf(const char *transcript, int64_t length, int64_t *start,
@@ -1070,7 +1347,15 @@ static int longest_orf(const char *transcript, int64_t length, int64_t *start,
   return best > 0;
 }
 
-/** @brief Map transcript range [from,to) onto genomic exon pieces. */
+/**
+ * @brief Map a transcript range onto genomic exon pieces.
+ * @param exons Genomic exon segments in genomic order.
+ * @param strand Transcript strand.
+ * @param from Inclusive transcript start.
+ * @param to Exclusive transcript end.
+ * @param out Destination segment list.
+ * @return None.
+ */
 static void map_range(const SegmentList *exons, char strand, int64_t from,
                       int64_t to, SegmentList *out) {
   int64_t offset = 0;
@@ -1095,7 +1380,13 @@ typedef struct {
   char id[96], parent[96];
 } Record;
 
-/** @brief Whether [start,end) lies within one of the segments. */
+/**
+ * @brief Test whether an interval lies within one segment.
+ * @param list Segment list to inspect.
+ * @param start Inclusive interval start.
+ * @param end Exclusive interval end.
+ * @return 1 when contained, otherwise 0.
+ */
 static int inside(const SegmentList *list, int64_t start, int64_t end) {
   for (int i = 0; i < list->count; i++)
     if (start >= list->items[i].start && end <= list->items[i].end) return 1;
@@ -1104,6 +1395,9 @@ static int inside(const SegmentList *list, int64_t start, int64_t end) {
 
 /**
  * @brief Check ID/Parent links and containment of the records of one gene.
+ * @param records Records to validate.
+ * @param count Number of records.
+ * @param exons Exon segments used for containment checks.
  * @return 1 when consistent.
  */
 static int records_valid(const Record *records, int count, const SegmentList *exons) {
@@ -1128,7 +1422,18 @@ static int records_valid(const Record *records, int count, const SegmentList *ex
   return 1;
 }
 
-/** @brief Append a record. */
+/**
+ * @brief Append a GFF3 record to a growable record array.
+ * @param records Record array to extend.
+ * @param count Number of records, updated in place.
+ * @param type GFF3 feature type.
+ * @param start Inclusive genomic start.
+ * @param end Exclusive genomic end.
+ * @param phase CDS phase, or -1.
+ * @param id Record ID.
+ * @param parent Parent record ID, or an empty string.
+ * @return None.
+ */
 static void record_add(Record **records, int *count, const char *type,
                        int64_t start, int64_t end, int phase, const char *id,
                        const char *parent) {
@@ -1144,6 +1449,11 @@ static void record_add(Record **records, int *count, const char *type,
 
 /**
  * @brief Emit one transcript (exons on one strand) with its longest ORF.
+ * @param output Destination GFF3 stream.
+ * @param sequence Source sequence record.
+ * @param exons Transcript exon segments.
+ * @param strand Transcript strand.
+ * @param gene_number Gene number used in generated IDs.
  * @return 1 written, 0 skipped (no ORF), -1 on error.
  */
 static int write_transcript(FILE *output, const AnnoSequence *sequence,
@@ -1216,11 +1526,23 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
   return ok ? 1 : -1;
 }
 
-/** @brief Strand of a class: '+', '-' or 0 for intergenic. */
+/**
+ * @brief Map a decoded class to its strand.
+ * @param cls Decoded annotation class.
+ * @return '+' or '-', or 0 for intergenic.
+ */
 static char class_strand(uint8_t cls) {
   return cls == ANNO_INTERGENIC ? 0 : cls <= 4 ? '+' : '-';
 }
 
+/**
+ * @brief Convert a decoded class path into GFF3 transcript records.
+ * @param output Destination GFF3 stream.
+ * @param sequence Sequence metadata and bases.
+ * @param path Per-base decoded classes.
+ * @param gene_counter Gene number counter, updated in place.
+ * @return Number of transcripts written, or -1 on output error.
+ */
 long anno_write_gff(FILE *output, const AnnoSequence *sequence,
                     const uint8_t *path, unsigned long *gene_counter) {
   long written = 0;
@@ -1263,7 +1585,14 @@ typedef struct {
   int64_t start[ANNO_CLASSES];
 } Bedgraph;
 
-/** @brief Flush one pending bedGraph run. */
+/**
+ * @brief Flush one pending bedGraph run.
+ * @param b BedGraph state containing output files and current runs.
+ * @param name Sequence name.
+ * @param j Class index.
+ * @param position Exclusive genomic end position.
+ * @return None.
+ */
 static void bedgraph_emit(Bedgraph *b, const char *name, int j, int64_t position) {
   if (b->value[j] >= 0 && position > b->start[j] &&
       fprintf(b->files[j], "%s\t%lld\t%lld\t%d.%02d\n", name,
@@ -1272,7 +1601,14 @@ static void bedgraph_emit(Bedgraph *b, const char *name, int j, int64_t position
     fail("cannot write bedGraph");
 }
 
-/** @brief Append a probability row to the class bedGraph runs. */
+/**
+ * @brief Append a probability row to the class bedGraph runs.
+ * @param b BedGraph state to update.
+ * @param name Sequence name.
+ * @param position Genomic position.
+ * @param row Class probability row.
+ * @return None.
+ */
 static void bedgraph_add(Bedgraph *b, const char *name, int64_t position,
                           const float *row) {
   if (!b->files[0]) return;
@@ -1285,7 +1621,16 @@ static void bedgraph_add(Bedgraph *b, const char *name, int64_t position,
   }
 }
 
-/** @brief Predict, decode, and write GFF3 and optional bedGraph files. */
+/**
+ * @brief Predict, decode, and write GFF3 and optional bedGraph files.
+ * @param unet Trained model.
+ * @param sequences Genome sequences to predict.
+ * @param count Number of sequences.
+ * @param threads Number of worker threads.
+ * @param gff Destination GFF3 stream.
+ * @param prefix Optional bedGraph output prefix.
+ * @return Number of genes written.
+ */
 static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequences,
                                     int count, int threads, FILE *gff,
                                     const char *prefix) {
@@ -1310,7 +1655,7 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
       float *input = xcalloc(mul_size((size_t)valid, ANNO_INPUT_CHANNELS), sizeof(float));
       float *probability = xcalloc(mul_size((size_t)valid, ANNO_CLASSES), sizeof(float));
       cwt_power(s->bases, s->length, start, start + valid, power);
-      features(s, power, start, valid, 0, channel, NULL, NULL);
+      features(s, power, start, start, valid, 0, channel, NULL, NULL);
       for (int64_t p = 0; p < valid; p++)
         for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
           input[(size_t)p * ANNO_INPUT_CHANNELS + c] = channel[(size_t)c * KANN_LENGTH + p];
@@ -1342,7 +1687,10 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
 /* ------------------------------------------------------------------------ */
 
 #ifndef ANNO_NO_MAIN
-/** @brief Print usage to stderr. */
+/**
+ * @brief Print command-line usage to standard error.
+ * @return None.
+ */
 static void usage(void) {
   fprintf(stderr,
     "Usage: anno [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
@@ -1357,7 +1705,12 @@ static void usage(void) {
     "  -h         this help\n", ANNO_DEFAULT_ITERATIONS);
 }
 
-/** @brief Parse a positive int option value. */
+/**
+ * @brief Parse a positive integer option value.
+ * @param text Numeric option text.
+ * @param name Option name used in diagnostics.
+ * @return Parsed positive integer.
+ */
 static int positive(const char *text, const char *name) {
   char *end = NULL;
   errno = 0;
@@ -1367,7 +1720,12 @@ static int positive(const char *text, const char *name) {
   return (int)value;
 }
 
-/** @brief Entry point. */
+/**
+ * @brief Run the anno command-line application.
+ * @param argc Number of command-line arguments.
+ * @param argv Command-line argument vector.
+ * @return EXIT_SUCCESS on success, otherwise EXIT_FAILURE.
+ */
 int main(int argc, char **argv) {
   int threads = 1, iterations = ANNO_DEFAULT_ITERATIONS;
   const char *model_path = "anno.ann", *prefix = NULL;

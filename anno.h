@@ -19,7 +19,7 @@
 #define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
 #define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
 #define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
-#define ANNO_UNET_WINDOW 65536    /**< UNet training / inference window      */
+#define ANNO_UNET_WINDOW 16384    /**< UNet training / inference window      */
 #define ANNO_UNET_MARGIN 4096     /**< inference context discarded per side  */
 #define ANNO_MAX_DEPTH 6          /**< maximum number of UNet levels         */
 /**@}*/
@@ -29,18 +29,16 @@
 #define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
 #define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp)            */
 #define ANNO_EMISSION_EPSILON 1e-6f
-#define ANNO_SPLICE_BONUS 8.0     /**< log advantage of GT..AG over other splice motifs */
-#define ANNO_TRANSCRIPT_PENALTY 8.0 /**< log penalty for opening a transcript */
+#define ANNO_TRANSCRIPT_PENALTY 5.0 /**< log penalty for opening a transcript */
 /**@}*/
 
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS 8
+#define ANNO_BATCH_WINDOWS 4
 #define ANNO_LEARNING_RATE 3e-3f
 #define ANNO_EPSILON 1e-5f
-#define ANNO_GRADIENT_CLIP 1.0f
-#define ANNO_SEED 2026u
+#define ANNO_GRADIENT_CLIP 5.0f
 /**@}*/
 
 /** UNet output classes; each class is also one decoded grammar state. */
@@ -89,6 +87,7 @@ Unet *unet_create(const UnetConfig *config);
 /**
  * @brief Release a model created by unet_create() or unet_load().
  * @param unet Model to release; NULL is accepted.
+ * @return None.
  */
 void unet_destroy(Unet *unet);
 /**
@@ -123,6 +122,7 @@ int unet_save(const char *path, const Unet *unet);
  * @param start First position, inclusive.
  * @param end Last position, exclusive.
  * @param out (end-start) x ANNO_CWT_CHANNELS x 2 floats (real, imaginary).
+ * @return None.
  *
  * The reverse-complement strand never needs recomputation: its transform
  * at position i equals the complex conjugate of this one at length-1-i.
@@ -164,12 +164,14 @@ AnnoSequence *anno_read_fasta(const char *path, int *count);
  * @param path GFF3 path.
  * @param sequences FASTA records to label.
  * @param count Number of FASTA records.
+ * @return None.
  */
 void anno_read_labels(const char *path, AnnoSequence *sequences, int count);
 /**
  * @brief Free records returned by anno_read_fasta().
  * @param sequences Records to free; NULL is accepted.
  * @param count Number of records.
+ * @return None.
  */
 void anno_sequences_free(AnnoSequence *sequences, int count);
 
