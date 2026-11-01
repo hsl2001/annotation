@@ -50,30 +50,87 @@ typedef struct {
 
 typedef struct AnnoModel AnnoModel;
 
-/** Input: decoded state. Output: matching class, or -1 for an invalid state. */
+/**
+ * @brief Executes anno_class_for_state.
+ * @param state Input value.
+ * @return Function result.
+ */
 int anno_class_for_state(uint8_t state);
-/** Input: adjacent decoded states. Output: nonzero when the transition is valid. */
+/**
+ * @brief Executes anno_grammar_transition.
+ * @param previous Input value.
+ * @param current Input value.
+ * @return Function result.
+ */
 int anno_grammar_transition(uint8_t previous, uint8_t current);
-/** Input: class probabilities and minimum run lengths. Output: decoded path, or 0. */
+/**
+ * @brief Executes anno_grammar_decode.
+ * @param probability Input value.
+ * @param length Input value.
+ * @param min_exon Input value.
+ * @param min_intron Input value.
+ * @param path Input value.
+ * @return Function result.
+ */
 int anno_grammar_decode(const float *probability, int64_t length,
                         int min_exon, int min_intron, uint8_t *path);
 
-/** Input: valid network configuration. Output: initialized model, or NULL. */
+/**
+ * @brief Executes anno_model_create.
+ * @param config Input value.
+ * @return Function result.
+ */
 AnnoModel *anno_model_create(const AnnoUnetConfig *config);
-/** Input: model. Output: none; releases all model storage. */
+/**
+ * @brief Executes anno_model_destroy.
+ * @param model Input value.
+ * @return No value.
+ */
 void anno_model_destroy(AnnoModel *model);
-/** Input: model and feature matrix. Output: class probabilities, or an error code. */
+/**
+ * @brief Executes anno_model_predict.
+ * @param model Input value.
+ * @param input Input value.
+ * @param length Input value.
+ * @param probability Input value.
+ * @return Function result.
+ */
 int anno_model_predict(const AnnoModel *model, const float *input,
                         int64_t length, float *probability);
-/** Input: model, labeled feature matrix, and training parameters. Output: 0 or an error code. */
+/**
+ * @brief Executes anno_model_train.
+ * @param model Input value.
+ * @param input Input value.
+ * @param label Input value.
+ * @param length Input value.
+ * @param iterations Input value.
+ * @param batch_size Input value.
+ * @param learning_rate Input value.
+ * @param seed Input value.
+ * @return Function result.
+ */
 int anno_model_train(AnnoModel *model, const float *input, const uint8_t *label,
                      int64_t length, int iterations, int batch_size,
                      float learning_rate, uint64_t seed);
-/** Input: model and destination path. Output: 0 on success, otherwise an error code. */
+/**
+ * @brief Executes anno_model_save.
+ * @param model Input value.
+ * @param path Input value.
+ * @return Function result.
+ */
 int anno_model_save(const AnnoModel *model, const char *path);
-/** Input: model path. Output: allocated model through model, or an error code. */
+/**
+ * @brief Executes anno_model_load.
+ * @param model Input value.
+ * @param path Input value.
+ * @return Function result.
+ */
 int anno_model_load(AnnoModel **model, const char *path);
-/** Input: model. Output: read-only metadata, or NULL for a null model. */
+/**
+ * @brief Executes anno_model_metadata.
+ * @param model Input value.
+ * @return Function result.
+ */
 const AnnoModelMetadata *anno_model_metadata(const AnnoModel *model);
 
 #endif
