@@ -13,6 +13,7 @@
 #include "unet.h"
 
 #include <ctype.h>
+#include <complex.h>
 #include <errno.h>
 #include <float.h>
 #include <limits.h>
@@ -24,6 +25,8 @@
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
+
+#include "rfft.h"
 
 uint64_t anno_random_next(uint64_t *state) {
   uint64_t value = *state;
@@ -703,36 +706,107 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
  */
 void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
               float *out) {
-  static const double signal[ANNO_NUCLEOTIDES][ANNO_COMPLEX_COMPONENTS] = {
-      {1, 1}, {-1, 1}, {-1, -1}, {1, -1}};
+  static const double complex signal[ANNO_NUCLEOTIDES] = {
+      1.0 + I, -1.0 + I, -1.0 - I, 1.0 - I};
+  static const double nodes[8] = {
+      0.09501250983763744, 0.2816035507792589, 0.4580167776572274,
+      0.6178762444026438, 0.7554044083550030, 0.8656312023878318,
+      0.9445750230732324, 0.9894009349916499};
+  static const double weights[8] = {
+      0.1894506104550685, 0.1826034150449236, 0.1691565193950025,
+      0.1495959888165767, 0.1246289712555339, 0.0951585116824928,
+      0.0622535239386479, 0.0271524594117541};
+  if (start >= end || start < 0 || end > length)
+    return;
+  const int width[ANNO_CWT_CHANNELS] = {67, 83, 99};
+  double complex kernel[ANNO_CWT_CHANNELS][99];
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
-    int radius = ANNO_CWT_RADIUS_FACTOR * cwt_scales[s];
-    double g[64], c[64], sn[64];
-    for (int o = -radius; o <= radius; o++) {
-      double x = (double)o / cwt_scales[s];
-      g[o + radius] = exp(-0.5 * x * x);
-      c[o + radius] = g[o + radius] * cos(ANNO_MORLET_FREQUENCY * x);
-      sn[o + radius] = g[o + radius] * sin(ANNO_MORLET_FREQUENCY * x);
-    }
-    for (int64_t p = start; p < end; p++) {
-      double real = 0, imaginary = 0, norm = 0;
-      for (int o = -radius; o <= radius; o++) {
-        int64_t q = p + o;
-        int b = q >= 0 && q < length ? base_index(bases[q]) : -1;
-        if (b < 0)
-          continue;
-        real += signal[b][0] * c[o + radius] - signal[b][1] * sn[o + radius];
-        imaginary +=
-            signal[b][0] * sn[o + radius] + signal[b][1] * c[o + radius];
-        norm += g[o + radius];
+    double scale = cwt_scales[s];
+    int radius = width[s] / 2;
+    for (int tap = 0; tap < width[s]; tap++) {
+      double lower = fmax(((double)(tap - radius) - 0.5) / scale, -8.0);
+      double upper = fmin(((double)(tap - radius) + 0.5) / scale, 8.0);
+      int segments = (int)ceil((upper - lower) * 2.0);
+      double complex integral = 0.0;
+      if (lower < upper) {
+        double step = (upper - lower) / segments;
+        for (int segment = 0; segment < segments; segment++) {
+          double middle = lower + (segment + 0.5) * step;
+          for (int node = 0; node < 8; node++) {
+            double left = middle - nodes[node] * step / 2.0;
+            double right = middle + nodes[node] * step / 2.0;
+            integral += weights[node] * step / 2.0 *
+                        (cexp(-0.5 * left * left) *
+                             (cexp(-I * 6.0 * left) - exp(-18.0)) +
+                         cexp(-0.5 * right * right) *
+                             (cexp(-I * 6.0 * right) - exp(-18.0)));
+          }
+        }
       }
-      float *value =
-          out + ((size_t)(p - start) * ANNO_CWT_CHANNELS + (size_t)s) *
-                    ANNO_COMPLEX_COMPONENTS;
-      value[0] = norm > 0 ? (float)(real / norm) : 0.0f;
-      value[1] = norm > 0 ? (float)(imaginary / norm) : 0.0f;
+      double normalization =
+          1.0 / sqrt(sqrt(acos(-1.0)) *
+                     (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
+      kernel[s][tap] = sqrt(scale) * normalization * integral;
     }
   }
+  const int max_width = 99;
+  size_t input_length = (size_t)(end - start);
+  if (input_length > ANNO_CWT_WINDOW)
+    input_length = ANNO_CWT_WINDOW;
+  input_length += max_width;
+  size_t fft_size = 1;
+  while (fft_size < input_length + max_width - 1)
+    fft_size <<= 1;
+  double complex *kernel_fft =
+      calloc((size_t)ANNO_CWT_CHANNELS * fft_size, sizeof(*kernel_fft));
+  if (!kernel_fft)
+    fail("out of memory");
+  for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
+    for (int tap = 0; tap < width[s]; tap++)
+      kernel_fft[(size_t)s * fft_size + width[s] - 1 - tap] = kernel[s][tap];
+    anno_fft_radix2(kernel_fft + (size_t)s * fft_size, fft_size, false);
+  }
+  const int64_t window_count =
+      (end - start + ANNO_CWT_WINDOW - 1) / ANNO_CWT_WINDOW;
+#pragma omp parallel for schedule(static)
+  for (int64_t window = 0; window < window_count; window++) {
+    int64_t window_start = start + window * ANNO_CWT_WINDOW;
+    int64_t window_end = window_start + ANNO_CWT_WINDOW;
+    if (window_end > end)
+      window_end = end;
+    int radius = max_width / 2;
+    int64_t input_start = window_start > radius ? window_start - radius : 0;
+    int64_t input_end = window_end + radius < length ? window_end + radius
+                                                      : length;
+    size_t input_count = (size_t)(input_end - input_start);
+    double complex *transformed = calloc(fft_size, sizeof(*transformed));
+    if (!transformed)
+      fail("out of memory");
+    for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
+      for (size_t i = 0; i < input_count; i++) {
+        int base = base_index(bases[input_start + (int64_t)i]);
+        transformed[i] = base < 0 ? 0.0 : signal[base] / sqrt(2.0);
+      }
+      memset(transformed + input_count, 0,
+             (fft_size - input_count) * sizeof(*transformed));
+      anno_fft_radix2(transformed, fft_size, false);
+      for (size_t i = 0; i < fft_size; i++)
+        transformed[i] *= kernel_fft[(size_t)s * fft_size + i];
+      anno_fft_radix2(transformed, fft_size, true);
+      for (int64_t position = window_start; position < window_end; position++) {
+        size_t index = (size_t)(position - input_start) +
+                       (size_t)(width[s] - 1 - width[s] / 2);
+        double complex coefficient = transformed[index] / (double)fft_size;
+        float *value =
+            out + (size_t)(position - start) * ANNO_CWT_CHANNELS * 2 +
+                  (size_t)s * 2;
+        value[0] = (float)creal(coefficient);
+        value[1] = (float)cimag(coefficient);
+      }
+    }
+    free(transformed);
+  }
+  free(kernel_fft);
 }
 
 /**
@@ -760,31 +834,6 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
   }
 }
 
-/** Context of the cwt-subcommand block job. */
-typedef struct {
-  const AnnoSequence *sequence;
-  int64_t start;
-  float *out;
-} ComplexJob;
-
-/**
- * @brief Compute complex CWT for one cwt-subcommand block.
- * @param pointer ComplexJob context.
- * @param job Window number.
- * @return None.
- */
-static void complex_job(void *pointer, int64_t job) {
-  ComplexJob *context = pointer;
-  int64_t start = context->start + job * ANNO_CWT_WINDOW;
-  int64_t end = start + ANNO_CWT_WINDOW;
-  if (end > context->sequence->length)
-    end = context->sequence->length;
-  if (start < end)
-    anno_cwt(context->sequence->bases, context->sequence->length, start, end,
-             context->out + (size_t)(start - context->start) *
-                                ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS);
-}
-
 /**
  * @brief Write CWT matrices and contig offsets for the cwt subcommand.
  *        reverse-complement rows) and {dir}/contigs.tsv for plot.py.
@@ -795,6 +844,7 @@ static void complex_job(void *pointer, int64_t job) {
  * @return None.
  */
 static void run_cwt(const char *fasta, const char *directory, int threads) {
+  (void)threads;
   int count = 0;
   AnnoSequence *sequences = anno_read_fasta(fasta, &count);
   char command_path[ANNO_PATH_BUFFER];
@@ -823,9 +873,7 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
     long base = (long)(rows * (int64_t)row * (int64_t)sizeof(float));
     for (int64_t start = 0; start < s->length; start += chunk) {
       int64_t n = s->length - start < chunk ? s->length - start : chunk;
-      ComplexJob job = {s, start, buffer};
-      run_parallel(threads, (n + ANNO_CWT_WINDOW - 1) / ANNO_CWT_WINDOW,
-                   complex_job, &job);
+      anno_cwt(s->bases, s->length, start, start + n, buffer);
       if (fwrite(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n)
         fail("cannot write CWT matrix");
     }
@@ -934,7 +982,8 @@ static void training_batch_job(void *pointer, int64_t job) {
 
 static Unet *train_unet(const AnnoSequence *sequences, int count,
                         int iterations, int threads) {
-  Unet *unet = unet_create(&(UnetConfig){4, 9, 2, {16, 32, 64, 128}});
+  UnetConfig config = unet_default_config();
+  Unet *unet = unet_create(&config);
   if (!unet)
     fail("cannot create neural-network model");
 #ifdef _OPENMP
@@ -1718,6 +1767,9 @@ int main(int argc, char **argv) {
     usage();
     return EXIT_FAILURE;
   }
+#ifdef _OPENMP
+  omp_set_num_threads(threads);
+#endif
   int a = optind;
   if (a < argc && !strcmp(argv[a], "cwt")) {
     if (argc - a != 3) {
