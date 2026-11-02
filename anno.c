@@ -618,42 +618,6 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
   }
 }
 
-/** Context of the parallel whole-sequence CWT power job. */
-typedef struct {
-  const AnnoSequence *sequence;
-  float *power;
-} PowerJob;
-
-/**
- * @brief Compute CWT power for one parallel window.
- * @param pointer PowerJob context.
- * @param job Window number.
- * @param worker Worker number, unused.
- * @return None.
- */
-static void power_job(void *pointer, int64_t job, int worker) {
-  (void)worker;
-  PowerJob *context = pointer;
-  int64_t start = job * ANNO_CWT_WINDOW, end = start + ANNO_CWT_WINDOW;
-  if (end > context->sequence->length) end = context->sequence->length;
-  cwt_power(context->sequence->bases, context->sequence->length, start, end,
-            context->power + (size_t)start * ANNO_CWT_CHANNELS);
-}
-
-/**
- * @brief Compute whole-sequence CWT power in parallel blocks.
- * @param sequence Sequence to transform.
- * @param threads Number of worker threads.
- * @return Caller-owned power matrix.
- */
-static float *sequence_power(const AnnoSequence *sequence, int threads) {
-  PowerJob job = {sequence, xcalloc(mul_size((size_t)sequence->length,
-                                             ANNO_CWT_CHANNELS), sizeof(float))};
-  run_parallel(threads, (sequence->length + ANNO_CWT_WINDOW - 1) / ANNO_CWT_WINDOW,
-               power_job, &job);
-  return job.power;
-}
-
 /** Context of the cwt-subcommand block job. */
 typedef struct {
   const AnnoSequence *sequence;
@@ -934,14 +898,11 @@ static void features(const AnnoSequence *sequence, const float *power,
  * @param probability Position-major output probabilities.
  * @return 0 on success, or an errno value otherwise.
  */
-int unet_predict(const Unet *unet, const float *input, int64_t length,
-                 float *probability) {
+static int unet_predict_channels(const Unet *unet, const float *input,
+                                  int64_t length, float *probability) {
   if (!unet || !input || !probability || length < 1 || length > KANN_LENGTH)
     return EINVAL;
-  float *bound = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH, sizeof(float));
-  for (int64_t p = 0; p < length; p++)
-    for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
-      bound[(size_t)c * KANN_LENGTH + p] = input[(size_t)p * ANNO_INPUT_CHANNELS + c];
+  float *bound = (float *)input;
   kann_feed_bind(unet->ann, KANN_F_IN, 0, &bound);
   kann_set_batch_size(unet->ann, 1);
   kann_eval_out(unet->ann);
@@ -957,8 +918,22 @@ int unet_predict(const Unet *unet, const float *input, int64_t length,
     }
     for (int j = 0; j < ANNO_CLASSES; j++) probability[(size_t)p * ANNO_CLASSES + j] /= sum;
   }
-  free(bound);
   return 0;
+}
+
+int unet_predict(const Unet *unet, const float *input, int64_t length,
+                 float *probability) {
+  if (!unet || !input || !probability || length < 1 || length > KANN_LENGTH)
+    return EINVAL;
+  float *channel_input = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH,
+                                 sizeof(float));
+  for (int64_t p = 0; p < length; p++)
+    for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
+      channel_input[(size_t)c * KANN_LENGTH + p] =
+        input[(size_t)p * ANNO_INPUT_CHANNELS + c];
+  int status = unet_predict_channels(unet, channel_input, length, probability);
+  free(channel_input);
+  return status;
 }
 
 /**
@@ -996,6 +971,41 @@ int unet_load(const char *path, Unet **out) {
   return 0;
 }
 
+typedef struct {
+  const AnnoSequence *sequence;
+  int64_t start;
+  int64_t valid;
+} TrainingWindow;
+
+typedef struct {
+  const TrainingWindow *windows;
+  size_t batch_start;
+  float *input;
+  float *truth;
+  float *mask;
+  int flip;
+} TrainingBatchJob;
+
+static void training_batch_job(void *pointer, int64_t job, int worker) {
+  (void)worker;
+  TrainingBatchJob *context = pointer;
+  const TrainingWindow *window =
+    &context->windows[context->batch_start + (size_t)job];
+  size_t slot = (size_t)job;
+  float *power = xcalloc(mul_size((size_t)window->valid,
+                                  ANNO_CWT_CHANNELS), sizeof(float));
+  cwt_power(window->sequence->bases, window->sequence->length,
+            window->start, window->start + window->valid, power);
+  features(window->sequence, power, window->start, window->start,
+           window->valid, context->flip,
+           context->input + slot * ANNO_INPUT_CHANNELS * KANN_LENGTH,
+           window->sequence->labels,
+           context->truth + slot * ANNO_CLASSES * KANN_LENGTH);
+  for (int64_t q = 0; q < window->valid; q++)
+    context->mask[slot * KANN_LENGTH + q] = 1.0f;
+  free(power);
+}
+
 /**
  * @brief Train the KANN graph on every labelled sequence window.
  * @param sequences Labelled training sequences.
@@ -1009,8 +1019,6 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
   UnetConfig config = unet_default_config();
   Unet *unet = unet_create(&config);
   if (!unet) fail("cannot create KANN network");
-  float **power = xcalloc((size_t)count, sizeof(*power));
-  for (int i = 0; i < count; i++) power[i] = sequence_power(&sequences[i], threads);
   kann_mt(unet->ann, threads, ANNO_BATCH_WINDOWS);
   int nvar = kann_size_var(unet->ann);
   float *x = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * KANN_LENGTH, sizeof(float));
@@ -1022,39 +1030,41 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
     total_windows += (size_t)((sequences[i].length + KANN_LENGTH - 1) /
                               KANN_LENGTH);
   if (!total_windows) fail("no training windows");
+  TrainingWindow *batch_windows =
+    xcalloc(ANNO_BATCH_WINDOWS, sizeof(*batch_windows));
   double started = now_seconds();
   for (int iteration = 0; iteration < iterations; iteration++) {
     for (size_t batch_start = 0; batch_start < total_windows;
          batch_start += ANNO_BATCH_WINDOWS) {
       size_t batch_end = batch_start + ANNO_BATCH_WINDOWS;
       if (batch_end > total_windows) batch_end = total_windows;
-      size_t window_index = 0;
       memset(x, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS *
              KANN_LENGTH * sizeof(float));
       memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES *
              KANN_LENGTH * sizeof(float));
       memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH * sizeof(float));
+      size_t cursor = 0;
+      size_t skipped = 0;
       for (int sequence = 0; sequence < count; sequence++) {
         int64_t sequence_windows =
           (sequences[sequence].length + KANN_LENGTH - 1) / KANN_LENGTH;
-        for (int64_t window = 0; window < sequence_windows;
-             window++, window_index++) {
-          if (window_index < batch_start) continue;
-          if (window_index >= batch_end) break;
-          int b = (int)(window_index - batch_start);
+        for (int64_t window = 0; window < sequence_windows; window++) {
+          if (skipped++ < batch_start) continue;
+          if (cursor == batch_end - batch_start) break;
           int64_t start = window * KANN_LENGTH;
           int64_t valid = sequences[sequence].length - start;
           if (valid > KANN_LENGTH) valid = KANN_LENGTH;
-          features(&sequences[sequence], power[sequence], 0, start, valid,
-                   (iteration + (int)(batch_start / ANNO_BATCH_WINDOWS)) & 1,
-                   x + (size_t)b * ANNO_INPUT_CHANNELS * KANN_LENGTH,
-                   sequences[sequence].labels,
-                   y + (size_t)b * ANNO_CLASSES * KANN_LENGTH);
-          for (int64_t q = 0; q < valid; q++)
-            mask[(size_t)b * KANN_LENGTH + q] = 1.0f;
+          batch_windows[cursor++] =
+            (TrainingWindow){&sequences[sequence], start, valid};
         }
-        if (window_index >= batch_end) break;
+        if (cursor == batch_end - batch_start) break;
       }
+      TrainingBatchJob batch = {
+        batch_windows, 0, x, y, mask,
+        (iteration + (int)(batch_start / ANNO_BATCH_WINDOWS)) & 1
+      };
+      run_parallel(threads, (int64_t)(batch_end - batch_start),
+                   training_batch_job, &batch);
       kann_feed_bind(unet->ann, KANN_F_IN, 0, &x);
       kann_feed_bind(unet->ann, KANN_F_TRUTH, 2, &y);
       kann_feed_bind(unet->ann, KANN_F_TRUTH, 1, &mask);
@@ -1072,8 +1082,8 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
     }
   }
   kann_mt(unet->ann, 0, 0);
-  for (int i = 0; i < count; i++) free(power[i]);
-  free(power); free(x); free(y); free(mask); free(r);
+  free(batch_windows);
+  free(x); free(y); free(mask); free(r);
   return unet;
 }
 
@@ -1623,25 +1633,32 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
     const AnnoSequence *s = &sequences[i];
     Decoder *decoder = decoder_create(s->length);
     for (int j = 0; j < ANNO_CLASSES; j++) bedgraph.value[j] = -1;
-    for (int64_t start = 0; start < s->length; start += KANN_LENGTH) {
+    int64_t window_count = (s->length + KANN_LENGTH - 1) / KANN_LENGTH;
+    float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH,
+                           sizeof(float));
+    float *power = xcalloc((size_t)KANN_LENGTH * ANNO_CWT_CHANNELS,
+                           sizeof(float));
+    float *probability = xcalloc((size_t)KANN_LENGTH * ANNO_CLASSES,
+                                 sizeof(float));
+    for (int64_t window = 0; window < window_count; window++) {
+      int64_t start = window * KANN_LENGTH;
       int64_t valid = s->length - start < KANN_LENGTH ? s->length - start : KANN_LENGTH;
-      float *power = xcalloc(mul_size((size_t)valid, ANNO_CWT_CHANNELS), sizeof(float));
-      float *channel = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH, sizeof(float));
-      float *input = xcalloc(mul_size((size_t)valid, ANNO_INPUT_CHANNELS), sizeof(float));
-      float *probability = xcalloc(mul_size((size_t)valid, ANNO_CLASSES), sizeof(float));
+      memset(input, 0, (size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH * sizeof(float));
+      memset(power, 0, (size_t)KANN_LENGTH * ANNO_CWT_CHANNELS * sizeof(float));
       cwt_power(s->bases, s->length, start, start + valid, power);
-      features(s, power, start, start, valid, 0, channel, NULL, NULL);
-      for (int64_t p = 0; p < valid; p++)
-        for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
-          input[(size_t)p * ANNO_INPUT_CHANNELS + c] = channel[(size_t)c * KANN_LENGTH + p];
-      if (unet_predict(unet, input, valid, probability)) fail("KANN prediction failed");
+      features(s, power, start, start, valid, 0, input, NULL, NULL);
+      memset(probability, 0, (size_t)valid * ANNO_CLASSES * sizeof(float));
+      if (unet_predict_channels(unet, input, valid, probability))
+        fail("KANN prediction failed");
       for (int64_t p = 0; p < valid; p++) {
         const float *row = probability + (size_t)p * ANNO_CLASSES;
         bedgraph_add(&bedgraph, s->name, start + p, row);
         decoder_step(decoder, row);
       }
-      free(power); free(channel); free(input); free(probability);
     }
+    free(input);
+    free(power);
+    free(probability);
     for (int j = 0; j < ANNO_CLASSES && bedgraph.files[0]; j++)
       bedgraph_emit(&bedgraph, s->name, j, s->length);
     uint8_t *path = xcalloc((size_t)s->length, 1);

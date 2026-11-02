@@ -11,9 +11,40 @@
 
 static int failures = 0, checks = 0;
 
+/** @brief Advance the deterministic test random-number generator. */
+static uint64_t random_next(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  *state = value;
+  return value * UINT64_C(2685821657736338717);
+}
+
+/** @brief Return a deterministic random integer below the given bound. */
+static unsigned random_below(uint64_t *state, unsigned bound) {
+  return (unsigned)(random_next(state) % bound);
+}
+
 /** @brief Return a deterministic pseudo-random float in [0, 1). */
 static float test_random_unit(uint64_t *state) {
   return (float)(random_next(state) >> 40) / 16777216.0f;
+}
+
+static float *test_sequence_power(const AnnoSequence *sequence) {
+  float *power = xcalloc((size_t)sequence->length * ANNO_CWT_CHANNELS,
+                         sizeof(float));
+  for (int64_t start = 0; start < sequence->length;
+       start += ANNO_CWT_WINDOW) {
+    int64_t end = start + ANNO_CWT_WINDOW;
+    if (end > sequence->length) end = sequence->length;
+    float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * 2];
+    anno_cwt(sequence->bases, sequence->length, start, end, values);
+    for (int64_t i = 0; i < (end - start) * ANNO_CWT_CHANNELS; i++)
+      power[(size_t)start * ANNO_CWT_CHANNELS + (size_t)i] =
+        values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
+  }
+  return power;
 }
 
 /** @brief Record one check. */
@@ -289,7 +320,7 @@ static void test_cwt(void) {
   CHECK(worst < 1e-4);
   /* power via parallel 1024-bp blocks equals the one-shot transform */
   AnnoSequence sequence = {"r", bases, N, NULL};
-  float *power = sequence_power(&sequence, 3);
+  float *power = test_sequence_power(&sequence);
   worst = 0.0;
   for (int i = 0; i < N * ANNO_CWT_CHANNELS; i++)
     worst = fmax(worst, fabs(power[i] - (a[2 * i] * a[2 * i] + a[2 * i + 1] * a[2 * i + 1])));
