@@ -1258,7 +1258,13 @@ int kad_op_exp(kad_node_t *p, int action)
 	if (action == KAD_SYNC_DIM) {
 		kad_copy_dim1(p, q);
 	} else if (action == KAD_FORWARD) {
-		for (i = 0; i < n; ++i) p->x[i] = expf(q->x[i]);
+		// Clamping for too large values to avoid overflow in expf
+		for (i = 0; i < n; ++i) {
+			float value = q->x[i];
+			if (value > 20.0f) value = 20.0f;
+			else if (value < -20.0f) value = -20.0f;
+			p->x[i] = expf(value);
+		}
 	} else if (action == KAD_BACKWARD && kad_is_back(q)) {
 		for (i = 0; i < n; ++i)
 			q->g[i] += p->g[i] * p->x[i];

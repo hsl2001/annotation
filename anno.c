@@ -761,7 +761,7 @@ static kann_t *kann_unet(const UnetConfig *config) {
   kad_node_t *normalizer = kad_reduce_sum(exp_logits, 1);
   kad_node_t *inverse = kad_exp(kad_mul(kad_log(normalizer), minus_one));
   kad_node_t *loss[ANNO_CLASSES];
-  if (!exp_logits || !normalizer || !inverse)
+  if (!exp_logits || !normalizer || !inverse || !epsilon)
     fail("invalid Soft F1 probability graph");
   for (int j = 0; j < ANNO_CLASSES; j++) {
     kad_node_t *p_exp = kad_slice(exp_logits, 1, j, j + 1);
