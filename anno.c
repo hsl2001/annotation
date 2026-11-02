@@ -1,6 +1,6 @@
 /**
  * @file anno.c
- * @brief anno: FASTA/GFF3 input, CWT, KANN 1D convolution model,
+ * @brief anno: FASTA/GFF3 input, CWT, local 1D convolution model,
  *        9-state grammar Viterbi, longest ORF and GFF3 output.
  *
  * Pipeline: bases -> one-hot + CWT power -> UNet -> per-base probability of
@@ -10,9 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "anno.h"
-#include "klib/kann.h"
-#include "klib/kthread.h"
-#include "klib/ketopt.h"
+#include "ann.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -22,22 +20,22 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 #include <zlib.h>
-
-#include "klib/kseq.h"
-KSEQ_INIT(gzFile, gzread)
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* ------------------------------------------------------------------------ */
 /* Basic utilities                                                          */
 /* ------------------------------------------------------------------------ */
 /** Class names; also used for bedGraph file names. */
 static const char *const class_names[ANNO_CLASSES] = {
-  "intergenic", "plus_five_prime_UTR", "plus_exon", "plus_intron",
-  "plus_three_prime_UTR", "minus_five_prime_UTR", "minus_exon",
-  "minus_intron", "minus_three_prime_UTR"
-};
+    "intergenic",  "plus_five_prime_UTR",  "plus_exon",
+    "plus_intron", "plus_three_prime_UTR", "minus_five_prime_UTR",
+    "minus_exon",  "minus_intron",         "minus_three_prime_UTR"};
 /** Morlet scales of the CWT channels. */
 static const int cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 
@@ -79,7 +77,8 @@ static void say(const char *format, ...) {
  * @return Product of @p a and @p b.
  */
 static size_t mul_size(size_t a, size_t b) {
-  if (a && b > SIZE_MAX / a) fail("size overflow");
+  if (a && b > SIZE_MAX / a)
+    fail("size overflow");
   return a * b;
 }
 
@@ -91,7 +90,8 @@ static size_t mul_size(size_t a, size_t b) {
  */
 static void *xcalloc(size_t count, size_t size) {
   void *memory = calloc(count ? count : 1, size ? size : 1);
-  if (!memory || (size && count > SIZE_MAX / size)) fail("out of memory");
+  if (!memory || (size && count > SIZE_MAX / size))
+    fail("out of memory");
   return memory;
 }
 
@@ -104,7 +104,8 @@ static void *xcalloc(size_t count, size_t size) {
  */
 static void *xrealloc(void *old, size_t count, size_t size) {
   void *memory = realloc(old, mul_size(count ? count : 1, size));
-  if (!memory) fail("out of memory");
+  if (!memory)
+    fail("out of memory");
   return memory;
 }
 
@@ -115,7 +116,8 @@ static void *xrealloc(void *old, size_t count, size_t size) {
  */
 static char *xstrdup(const char *text) {
   char *copy = strdup(text);
-  if (!copy) fail("out of memory");
+  if (!copy)
+    fail("out of memory");
   return copy;
 }
 
@@ -136,12 +138,22 @@ static double now_seconds(void) {
  */
 static int base_index(char base) {
   switch (base) {
-  case 'A': return 0;
-  case 'C': return 1;
-  case 'G': return 2;
-  case 'T': return 3;
-  default: return -1;
+  case 'A':
+    return 0;
+  case 'C':
+    return 1;
+  case 'G':
+    return 2;
+  case 'T':
+    return 3;
+  default:
+    return -1;
   }
+}
+
+static char complement(char base) {
+  int index = base_index(base);
+  return index < 0 ? 'N' : "TGCA"[index];
 }
 
 /**
@@ -149,19 +161,14 @@ static int base_index(char base) {
  * @param base Nucleotide character.
  * @return Complementary nucleotide, or N for an unknown base.
  */
-static char complement(char base) {
-  int index = base_index(base);
-  return index < 0 ? 'N' : "TGCA"[index];
-}
-
 /* ------------------------------------------------------------------------ */
 /* Threads                                                                  */
 /* ------------------------------------------------------------------------ */
 
-typedef void (*JobFunction)(void *context, long job, int worker);
+typedef void (*JobFunction)(void *context, long job);
 
 /**
- * @brief Run independent jobs through klib's static worker pool.
+ * @brief Run independent jobs through OpenMP.
  * @param threads Number of worker threads.
  * @param jobs Number of jobs.
  * @param function Job callback.
@@ -170,7 +177,20 @@ typedef void (*JobFunction)(void *context, long job, int worker);
  */
 static void run_parallel(int threads, int64_t jobs, JobFunction function,
                          void *context) {
-  kt_for(threads, function, context, (long)jobs);
+  if (jobs <= 0)
+    return;
+  if ((int64_t)threads > jobs)
+    threads = (int)jobs;
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(threads) schedule(static)
+#endif
+  for (int64_t job = 0; job < jobs; job++) {
+#ifdef _OPENMP
+    function(context, job);
+#else
+    function(context, job);
+#endif
+  }
 }
 
 /* ------------------------------------------------------------------------ */
@@ -183,30 +203,84 @@ static void run_parallel(int threads, int64_t jobs, JobFunction function,
  * @param count_out Receives the number of records.
  * @return Caller-owned sequence array.
  */
+static char *gz_line(gzFile input) {
+  size_t length = 0, capacity = 256;
+  char *line = xcalloc(capacity, 1);
+  int ch;
+  while ((ch = gzgetc(input)) != -1) {
+    if (length + 1 >= capacity) {
+      capacity = mul_size(capacity, 2);
+      line = xrealloc(line, capacity, 1);
+    }
+    line[length++] = (char)ch;
+    if (ch == '\n')
+      break;
+  }
+  if (!length) {
+    free(line);
+    return NULL;
+  }
+  line[length] = '\0';
+  return line;
+}
+
 AnnoSequence *anno_read_fasta(const char *path, int *count_out) {
   gzFile input = gzopen(path, "rb");
-  if (!input) fail("cannot open FASTA %s", path);
+  if (!input)
+    fail("cannot open FASTA %s", path);
   AnnoSequence *sequences = NULL;
   int count = 0;
-  kseq_t *reader = kseq_init(input);
-  int length;
-  while ((length = kseq_read(reader)) >= 0) {
-    if (!reader->name.l) fail("empty FASTA sequence ID in %s", path);
-    if (!length) fail("empty FASTA sequence %s", reader->name.s);
-    for (int i = 0; i < count; i++)
-      if (!strcmp(sequences[i].name, reader->name.s))
-        fail("duplicate FASTA sequence ID %s", reader->name.s);
-    sequences = xrealloc(sequences, (size_t)count + 1, sizeof(*sequences));
-    AnnoSequence *sequence = &sequences[count++];
-    *sequence = (AnnoSequence){.name = xstrdup(reader->name.s), .length = length,
-                               .bases = xcalloc((size_t)length + 1, 1)};
-    for (int i = 0; i < length; i++)
-      sequence->bases[i] = (char)toupper((unsigned char)reader->seq.s[i]);
+  char *line = NULL, *name = NULL, *bases = NULL;
+  size_t length = 0, capacity = 0;
+  while ((line = gz_line(input)) != NULL) {
+    size_t line_length = strcspn(line, "\r\n");
+    if (line[0] == '>') {
+      if (name) {
+        if (!length)
+          fail("empty FASTA sequence %s", name);
+        sequences = xrealloc(sequences, (size_t)count + 1, sizeof(*sequences));
+        sequences[count++] = (AnnoSequence){name, bases, (int64_t)length, NULL};
+        name = NULL;
+        bases = NULL;
+        length = capacity = 0;
+      }
+      char *first = line + 1;
+      while (*first && isspace((unsigned char)*first))
+        first++;
+      char *end = first;
+      while (*end && !isspace((unsigned char)*end))
+        end++;
+      if (end == first)
+        fail("empty FASTA sequence ID in %s", path);
+      *end = '\0';
+      name = xstrdup(first);
+      for (int i = 0; i < count; i++)
+        if (!strcmp(sequences[i].name, name))
+          fail("duplicate FASTA sequence ID %s", name);
+    } else if (name) {
+      for (size_t i = 0; i < line_length; i++)
+        if (!isspace((unsigned char)line[i])) {
+          if (length + 1 >= capacity) {
+            capacity = capacity ? capacity * 2 : 256;
+            bases = xrealloc(bases, capacity, 1);
+          }
+          bases[length++] = (char)toupper((unsigned char)line[i]);
+        }
+    } else if (line_length) {
+      fail("FASTA sequence before first header in %s", path);
+    }
+    free(line);
   }
-  int error = length < -1;
-  kseq_destroy(reader);
-  if (gzclose(input) != Z_OK || error) fail("cannot read FASTA %s", path);
-  if (!count) fail("no FASTA records in %s", path);
+  if (name) {
+    if (!length)
+      fail("empty FASTA sequence %s", name);
+    sequences = xrealloc(sequences, (size_t)count + 1, sizeof(*sequences));
+    sequences[count++] = (AnnoSequence){name, bases, (int64_t)length, NULL};
+  }
+  if (gzclose(input) != Z_OK)
+    fail("cannot read FASTA %s", path);
+  if (!count)
+    fail("no FASTA records in %s", path);
   *count_out = count;
   return sequences;
 }
@@ -262,8 +336,8 @@ typedef struct {
 static void segments_push(SegmentList *list, int64_t start, int64_t end) {
   if (list->count == list->capacity) {
     list->capacity = list->capacity ? list->capacity * 2 : 8;
-    list->items = xrealloc(list->items, (size_t)list->capacity,
-                           sizeof(*list->items));
+    list->items =
+        xrealloc(list->items, (size_t)list->capacity, sizeof(*list->items));
   }
   list->items[list->count++] = (Segment){start, end};
 }
@@ -276,8 +350,10 @@ static void segments_push(SegmentList *list, int64_t start, int64_t end) {
  */
 static int segment_compare(const void *a, const void *b) {
   const Segment *x = a, *y = b;
-  return x->start < y->start ? -1 : x->start > y->start ? 1
-       : x->end < y->end ? -1 : x->end > y->end;
+  return x->start < y->start   ? -1
+         : x->start > y->start ? 1
+         : x->end < y->end     ? -1
+                               : x->end > y->end;
 }
 
 /**
@@ -289,8 +365,10 @@ static int segment_compare(const void *a, const void *b) {
 static int feature_compare(const void *a, const void *b) {
   const GffFeature *x = a, *y = b;
   int order = strcmp(x->parent, y->parent);
-  if (order) return order;
-  if (x->kind != y->kind) return x->kind - y->kind;
+  if (order)
+    return order;
+  if (x->kind != y->kind)
+    return x->kind - y->kind;
   return x->start < y->start ? -1 : x->start > y->start;
 }
 
@@ -300,11 +378,16 @@ static int feature_compare(const void *a, const void *b) {
  * @return KIND_* value, -2 for container features, or -1 when ignored.
  */
 static int feature_kind(const char *type) {
-  if (!strcmp(type, "exon")) return KIND_EXON;
-  if (!strcmp(type, "CDS")) return KIND_CDS;
-  if (!strcmp(type, "five_prime_UTR")) return KIND_5UTR;
-  if (!strcmp(type, "three_prime_UTR")) return KIND_3UTR;
-  if (!strcmp(type, "intron")) return KIND_INTRON;
+  if (!strcmp(type, "exon"))
+    return KIND_EXON;
+  if (!strcmp(type, "CDS"))
+    return KIND_CDS;
+  if (!strcmp(type, "five_prime_UTR"))
+    return KIND_5UTR;
+  if (!strcmp(type, "three_prime_UTR"))
+    return KIND_3UTR;
+  if (!strcmp(type, "intron"))
+    return KIND_INTRON;
   if (!strcmp(type, "gene") || !strcmp(type, "mRNA") ||
       !strcmp(type, "transcript"))
     return -2;
@@ -321,7 +404,8 @@ static int parse_int64(const char *text, int64_t *value) {
   char *end = NULL;
   errno = 0;
   long long parsed = strtoll(text, &end, 10);
-  if (errno || end == text || *end || parsed < 0) return 0;
+  if (errno || end == text || *end || parsed < 0)
+    return 0;
   *value = parsed;
   return 1;
 }
@@ -344,8 +428,10 @@ typedef struct {
 static int transcript_compare(const void *a, const void *b) {
   const LabelTranscript *x = a, *y = b;
   int64_t lx = x->end - x->start, ly = y->end - y->start;
-  if (lx != ly) return lx > ly ? -1 : 1;
-  if (x->sequence != y->sequence) return x->sequence - y->sequence;
+  if (lx != ly)
+    return lx > ly ? -1 : 1;
+  if (x->sequence != y->sequence)
+    return x->sequence - y->sequence;
   return x->start < y->start ? -1 : x->start > y->start;
 }
 
@@ -355,7 +441,8 @@ static int transcript_compare(const void *a, const void *b) {
  * @return None.
  */
 static void segments_merge(SegmentList *list) {
-  if (!list->count) return;
+  if (!list->count)
+    return;
   qsort(list->items, (size_t)list->count, sizeof(Segment), segment_compare);
   int out = 0;
   for (int i = 1; i < list->count; i++) {
@@ -381,15 +468,18 @@ static GffFeature *read_gff_features(const char *path,
                                      const AnnoSequence *sequences, int count,
                                      size_t *feature_count) {
   gzFile input = gzopen(path, "rb");
-  if (!input) fail("cannot open annotation %s", path);
+  if (!input)
+    fail("cannot open annotation %s", path);
   GffFeature *features = NULL;
   size_t used = 0, capacity = 0;
   char line[65536];
   long line_number = 0;
   while (gzgets(input, line, sizeof(line))) {
     line_number++;
-    if (!strncmp(line, "##FASTA", 7)) break;
-    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+    if (!strncmp(line, "##FASTA", 7))
+      break;
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r')
+      continue;
     line[strcspn(line, "\r\n")] = '\0';
     char *fields[9];
     char *cursor = line;
@@ -397,16 +487,21 @@ static GffFeature *read_gff_features(const char *path,
     while (columns < 9 && cursor) {
       fields[columns++] = cursor;
       cursor = strchr(cursor, '\t');
-      if (cursor) *cursor++ = '\0';
+      if (cursor)
+        *cursor++ = '\0';
     }
-    if (columns != 9 || cursor) fail("%s:%ld: expected 9 columns", path, line_number);
+    if (columns != 9 || cursor)
+      fail("%s:%ld: expected 9 columns", path, line_number);
     int kind = feature_kind(fields[2]);
-    if (kind == -1) continue;
+    if (kind == -1)
+      continue;
     int sequence = -1;
     for (int i = 0; i < count; i++)
-      if (!strcmp(sequences[i].name, fields[0])) sequence = i;
-    if (sequence < 0) fail("%s:%ld: sequence %s absent from FASTA", path,
-                           line_number, fields[0]);
+      if (!strcmp(sequences[i].name, fields[0]))
+        sequence = i;
+    if (sequence < 0)
+      fail("%s:%ld: sequence %s absent from FASTA", path, line_number,
+           fields[0]);
     int64_t start = 0, end = 0;
     if (!parse_int64(fields[3], &start) || !parse_int64(fields[4], &end) ||
         start < 1 || end < start)
@@ -417,11 +512,15 @@ static GffFeature *read_gff_features(const char *path,
     char strand = fields[6][0];
     if ((strand != '+' && strand != '-') || fields[6][1])
       fail("%s:%ld: unsupported strand %s", path, line_number, fields[6]);
-    if (kind < 0) continue;
+    if (kind < 0)
+      continue;
     char *parents = NULL;
-    for (char *field = strtok(fields[8], ";"); field; field = strtok(NULL, ";")) {
-      while (*field == ' ') field++;
-      if (!strncmp(field, "Parent=", 7)) parents = field + 7;
+    for (char *field = strtok(fields[8], ";"); field;
+         field = strtok(NULL, ";")) {
+      while (*field == ' ')
+        field++;
+      if (!strncmp(field, "Parent=", 7))
+        parents = field + 7;
     }
     if (!parents || !*parents)
       fail("%s:%ld: %s without Parent", path, line_number, fields[2]);
@@ -431,11 +530,12 @@ static GffFeature *read_gff_features(const char *path,
         capacity = capacity ? capacity * 2 : 1024;
         features = xrealloc(features, capacity, sizeof(*features));
       }
-      features[used++] = (GffFeature){xstrdup(parent), sequence, kind, strand,
-                                      start - 1, end};
+      features[used++] =
+          (GffFeature){xstrdup(parent), sequence, kind, strand, start - 1, end};
     }
   }
-  if (gzclose(input) != Z_OK) fail("cannot read annotation %s", path);
+  if (gzclose(input) != Z_OK)
+    fail("cannot read annotation %s", path);
   *feature_count = used;
   return features;
 }
@@ -452,11 +552,13 @@ static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
   uint8_t coding = plus ? ANNO_PLUS_EXON : ANNO_MINUS_EXON;
   uint8_t utr5 = plus ? ANNO_PLUS_5UTR : ANNO_MINUS_5UTR;
   uint8_t utr3 = plus ? ANNO_PLUS_3UTR : ANNO_MINUS_3UTR;
-  for (int64_t i = t->start; i < t->end; i++) labels[i] = intron;
+  for (int64_t i = t->start; i < t->end; i++)
+    labels[i] = intron;
   for (int e = 0; e < t->exons.count; e++)
     for (int64_t i = t->exons.items[e].start; i < t->exons.items[e].end; i++)
-      labels[i] = i < t->cds_start ? (plus ? utr5 : utr3)
-                : i >= t->cds_end ? (plus ? utr3 : utr5) : coding;
+      labels[i] = i < t->cds_start  ? (plus ? utr5 : utr3)
+                  : i >= t->cds_end ? (plus ? utr3 : utr5)
+                                    : coding;
   /* explicit UTR/intron features outrank the inferred labels */
   for (int e = 0; e < t->explicit_utr5.count; e++)
     for (int64_t i = t->explicit_utr5.items[e].start;
@@ -481,7 +583,8 @@ static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
  */
 void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
   size_t feature_count = 0;
-  GffFeature *features = read_gff_features(path, sequences, count, &feature_count);
+  GffFeature *features =
+      read_gff_features(path, sequences, count, &feature_count);
   qsort(features, feature_count, sizeof(*features), feature_compare);
   LabelTranscript *transcripts = NULL;
   size_t transcript_count = 0, skipped = 0;
@@ -492,20 +595,26 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
       last++;
     LabelTranscript t = {.sequence = features[first].sequence,
                          .strand = features[first].strand,
-                         .cds_start = INT64_MAX, .cds_end = -1};
+                         .cds_start = INT64_MAX,
+                         .cds_end = -1};
     SegmentList pieces = {0};
     for (size_t i = first; i < last; i++) {
       const GffFeature *f = &features[i];
       if (f->sequence != t.sequence || f->strand != t.strand)
         fail("transcript %s mixes sequences or strands", f->parent);
-      if (f->kind == KIND_EXON) segments_push(&t.exons, f->start, f->end);
-      if (f->kind == KIND_5UTR) segments_push(&t.explicit_utr5, f->start, f->end);
-      if (f->kind == KIND_3UTR) segments_push(&t.explicit_utr3, f->start, f->end);
+      if (f->kind == KIND_EXON)
+        segments_push(&t.exons, f->start, f->end);
+      if (f->kind == KIND_5UTR)
+        segments_push(&t.explicit_utr5, f->start, f->end);
+      if (f->kind == KIND_3UTR)
+        segments_push(&t.explicit_utr3, f->start, f->end);
       if (f->kind == KIND_INTRON)
         segments_push(&t.explicit_introns, f->start, f->end);
       if (f->kind == KIND_CDS) {
-        if (f->start < t.cds_start) t.cds_start = f->start;
-        if (f->end > t.cds_end) t.cds_end = f->end;
+        if (f->start < t.cds_start)
+          t.cds_start = f->start;
+        if (f->end > t.cds_end)
+          t.cds_end = f->end;
       }
       if (f->kind == KIND_CDS || f->kind == KIND_5UTR || f->kind == KIND_3UTR)
         segments_push(&pieces, f->start, f->end);
@@ -526,13 +635,16 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
     }
     t.start = t.exons.items[0].start;
     t.end = t.exons.items[t.exons.count - 1].end;
-    transcripts = xrealloc(transcripts, transcript_count + 1, sizeof(*transcripts));
+    transcripts =
+        xrealloc(transcripts, transcript_count + 1, sizeof(*transcripts));
     transcripts[transcript_count++] = t;
     first = last;
   }
-  for (size_t i = 0; i < feature_count; i++) free(features[i].parent);
+  for (size_t i = 0; i < feature_count; i++)
+    free(features[i].parent);
   free(features);
-  qsort(transcripts, transcript_count, sizeof(*transcripts), transcript_compare);
+  qsort(transcripts, transcript_count, sizeof(*transcripts),
+        transcript_compare);
   for (int i = 0; i < count; i++) {
     free(sequences[i].labels);
     sequences[i].labels = xcalloc((size_t)sequences[i].length, 1);
@@ -543,8 +655,10 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
     int free_span = 1;
     for (int64_t i = t->start; i < t->end && free_span; i++)
       free_span = !labels[i];
-    if (free_span) paint_transcript(t, labels);
-    else skipped++;
+    if (free_span)
+      paint_transcript(t, labels);
+    else
+      skipped++;
     free(t->exons.items);
     free(t->explicit_utr5.items);
     free(t->explicit_utr3.items);
@@ -585,12 +699,15 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
       for (int o = -radius; o <= radius; o++) {
         int64_t q = p + o;
         int b = q >= 0 && q < length ? base_index(bases[q]) : -1;
-        if (b < 0) continue;
+        if (b < 0)
+          continue;
         real += signal[b][0] * c[o + radius] - signal[b][1] * sn[o + radius];
-        imaginary += signal[b][0] * sn[o + radius] + signal[b][1] * c[o + radius];
+        imaginary +=
+            signal[b][0] * sn[o + radius] + signal[b][1] * c[o + radius];
         norm += g[o + radius];
       }
-      float *value = out + ((size_t)(p - start) * ANNO_CWT_CHANNELS + (size_t)s) * 2;
+      float *value =
+          out + ((size_t)(p - start) * ANNO_CWT_CHANNELS + (size_t)s) * 2;
       value[0] = norm > 0 ? (float)(real / norm) : 0.0f;
       value[1] = norm > 0 ? (float)(imaginary / norm) : 0.0f;
     }
@@ -610,11 +727,12 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
                       int64_t end, float *out) {
   for (int64_t block = start; block < end; block += ANNO_CWT_WINDOW) {
     float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * 2];
-    int64_t stop = block + ANNO_CWT_WINDOW < end ? block + ANNO_CWT_WINDOW : end;
+    int64_t stop =
+        block + ANNO_CWT_WINDOW < end ? block + ANNO_CWT_WINDOW : end;
     anno_cwt(bases, length, block, stop, values);
     for (int64_t i = 0; i < (stop - block) * ANNO_CWT_CHANNELS; i++)
       out[(size_t)(block - start) * ANNO_CWT_CHANNELS + (size_t)i] =
-        values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
+          values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
   }
 }
 
@@ -629,18 +747,18 @@ typedef struct {
  * @brief Compute complex CWT for one cwt-subcommand block.
  * @param pointer ComplexJob context.
  * @param job Window number.
- * @param worker Worker number, unused.
  * @return None.
  */
-static void complex_job(void *pointer, int64_t job, int worker) {
-  (void)worker;
+static void complex_job(void *pointer, int64_t job) {
   ComplexJob *context = pointer;
   int64_t start = context->start + job * ANNO_CWT_WINDOW;
   int64_t end = start + ANNO_CWT_WINDOW;
-  if (end > context->sequence->length) end = context->sequence->length;
+  if (end > context->sequence->length)
+    end = context->sequence->length;
   if (start < end)
     anno_cwt(context->sequence->bases, context->sequence->length, start, end,
-             context->out + (size_t)(start - context->start) * ANNO_CWT_CHANNELS * 2);
+             context->out +
+                 (size_t)(start - context->start) * ANNO_CWT_CHANNELS * 2);
 }
 
 /**
@@ -656,16 +774,20 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
   int count = 0;
   AnnoSequence *sequences = anno_read_fasta(fasta, &count);
   char command_path[4096];
-  if (snprintf(command_path, sizeof(command_path), "%s/matrix.bin", directory) >=
-      (int)sizeof(command_path))
+  if (snprintf(command_path, sizeof(command_path), "%s/matrix.bin",
+               directory) >= (int)sizeof(command_path))
     fail("CWT directory path too long");
-  if (mkdir(directory, 0777) && errno != EEXIST) fail("cannot create %s", directory);
+  if (mkdir(directory, 0777) && errno != EEXIST)
+    fail("cannot create %s", directory);
   FILE *matrix = fopen(command_path, "w+b");
   snprintf(command_path, sizeof(command_path), "%s/contigs.tsv", directory);
   FILE *index = fopen(command_path, "w");
-  if (!matrix || !index) fail("cannot create CWT output in %s", directory);
-  fprintf(index, "# anno-cwt-v2\n# scales\t%d,%d,%d\nseqid\tlength\tplus_offset\t"
-          "minus_offset\n", cwt_scales[0], cwt_scales[1], cwt_scales[2]);
+  if (!matrix || !index)
+    fail("cannot create CWT output in %s", directory);
+  fprintf(index,
+          "# anno-cwt-v2\n# scales\t%d,%d,%d\nseqid\tlength\tplus_offset\t"
+          "minus_offset\n",
+          cwt_scales[0], cwt_scales[1], cwt_scales[2]);
   const int64_t chunk = (int64_t)ANNO_CWT_WINDOW * 256;
   const size_t row = ANNO_CWT_CHANNELS * 2;
   float *buffer = xcalloc(mul_size((size_t)chunk, row), sizeof(float));
@@ -685,14 +807,16 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
     }
     for (int64_t end = s->length; end > 0; end -= chunk) {
       int64_t n = end < chunk ? end : chunk, start = end - n;
-      if (fseek(matrix, base + (long)(start * (int64_t)row * (int64_t)sizeof(float)),
+      if (fseek(matrix,
+                base + (long)(start * (int64_t)row * (int64_t)sizeof(float)),
                 SEEK_SET) ||
           fread(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n ||
           fseek(matrix, 0, SEEK_END))
         fail("cannot reread CWT matrix");
       for (int64_t a = 0, b = n - 1; a <= b; a++, b--)
         for (size_t k = 0; k < row; k++) {
-          float x = buffer[(size_t)a * row + k], y = buffer[(size_t)b * row + k];
+          float x = buffer[(size_t)a * row + k],
+                y = buffer[(size_t)b * row + k];
           buffer[(size_t)a * row + k] = (k & 1) ? -y : y;
           buffer[(size_t)b * row + k] = (k & 1) ? -x : x;
         }
@@ -702,7 +826,8 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
     rows += 2 * s->length;
   }
   free(buffer);
-  if (fclose(matrix) || fclose(index)) fail("cannot close CWT output");
+  if (fclose(matrix) || fclose(index))
+    fail("cannot close CWT output");
   anno_sequences_free(sequences, count);
 }
 
@@ -710,276 +835,56 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
 /* 1D UNet                                                                  */
 /* ------------------------------------------------------------------------ */
 
+#define ANN_LENGTH ANNO_UNET_WINDOW
 
-#define KANN_LENGTH ANNO_UNET_WINDOW
-
-/** @brief Opaque public model backed by a KANN graph. */
-struct Unet {
-  UnetConfig config;
-  kann_t *ann;
-  int output;
-};
-
-/**
- * @brief Build the fixed-length KANN convolution graph and Soft F1 cost.
- * @param config Convolution configuration.
- * @return Newly allocated KANN graph, or NULL on graph construction failure.
- */
-static kann_t *kann_unet(const UnetConfig *config) {
-  kad_node_t *input = kad_feed(3, ANNO_BATCH_WINDOWS, ANNO_INPUT_CHANNELS, KANN_LENGTH);
-  input->ext_flag |= KANN_F_IN;
-  kad_node_t *skip[ANNO_MAX_DEPTH] = {0};
-  kad_node_t *x = input;
-  for (int level = 0; level < config->depth; level++) {
-    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
-                                   1, KAD_PAD_SAME));
-    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
-                                   1, KAD_PAD_SAME));
-    skip[level] = x;
-    if (level + 1 < config->depth)
-      x = kad_avg1d(x, config->pool, config->pool, 0);
-  }
-  for (int level = config->depth - 2; level >= 0; level--) {
-    x = kad_upsample1d(x, config->pool);
-    x = kad_concat(1, 2, x, skip[level]);
-    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
-                                   1, KAD_PAD_SAME));
-    x = kad_relu(kann_layer_conv1d(x, config->channels[level], config->kernel,
-                                   1, KAD_PAD_SAME));
-  }
-  x = kann_layer_conv1d(x, ANNO_CLASSES, 1, 1, 0);
-  x->ext_flag |= KANN_F_OUT;
-  kad_node_t *truth = kad_feed(3, ANNO_BATCH_WINDOWS, ANNO_CLASSES, KANN_LENGTH);
-  truth->ext_flag |= KANN_F_TRUTH;
-  truth->ext_label = 2;
-  kad_node_t *mask = kad_feed(3, ANNO_BATCH_WINDOWS, 1, KANN_LENGTH);
-  mask->ext_flag |= KANN_F_TRUTH;
-  mask->ext_label = 1;
-  kad_node_t *minus_one = kann_new_scalar(KAD_CONST, -1.0f);
-  kad_node_t *epsilon = kann_new_scalar(KAD_CONST, ANNO_EPSILON);
-  kad_node_t *probabilities = kad_softmax_axis(x, 1);
-  kad_node_t *loss[ANNO_CLASSES];
-  kad_node_t *cross_entropy[ANNO_CLASSES];
-  if (!probabilities || !epsilon)
-    fail("invalid Soft F1 probability graph");
-  for (int j = 0; j < ANNO_CLASSES; j++) {
-    kad_node_t *p = kad_slice(probabilities, 1, j, j + 1);
-    kad_node_t *y = kad_slice(truth, 1, j, j + 1);
-    kad_node_t *masked_p = kad_mul(p, mask);
-    kad_node_t *masked_y = kad_mul(y, mask);
-    kad_node_t *intersection = kad_reduce_sum(kad_mul(masked_p, masked_y), 2);
-    kad_node_t *sum_p = kad_reduce_sum(masked_p, 2);
-    kad_node_t *sum_y = kad_reduce_sum(masked_y, 2);
-    kad_node_t *numerator = kad_add(kad_mul(intersection,
-                                             kann_new_scalar(KAD_CONST, 2.0f)),
-                                    epsilon);
-    kad_node_t *denominator = kad_add(kad_add(sum_p, sum_y), epsilon);
-    kad_node_t *dice = kad_mul(numerator,
-                               kad_exp(kad_mul(kad_log(denominator),
-                                               minus_one)));
-    kad_node_t *class_loss = kad_1minus(dice);
-    cross_entropy[j] = kad_ce_bin(masked_p, masked_y);
-    if (!p || !y || !masked_p || !masked_y || !intersection || !sum_p || !sum_y ||
-        !cross_entropy[j] || !numerator ||
-        !denominator || !dice || !class_loss)
-      fail("invalid Soft F1 loss graph");
-    class_loss = kad_reduce_mean(class_loss, 0);
-    loss[j] = kad_reduce_mean(class_loss, 0);
-    if (!loss[j]) fail("invalid Soft F1 reduction");
-  }
-  kad_node_t *dice_cost = kad_avg(ANNO_CLASSES, loss);
-  kad_node_t *ce_cost = kad_avg(ANNO_CLASSES, cross_entropy);
-  kad_node_t *cost = kad_add(dice_cost,
-                             kad_mul(kann_new_scalar(KAD_CONST, 0.2f), ce_cost));
-  cost->ext_flag |= KANN_F_COST;
-  kann_t *ann = kann_new(cost, 0);
-  kann_set_batch_size(ann, 1);
-  return ann;
-}
-
-/**
- * @brief Map a class label to its reverse-complement strand.
- * @param label Class label on either strand.
- * @return Equivalent class on the opposite strand.
- */
-static uint8_t kann_swap_strand(uint8_t label) {
+static uint8_t ann_swap_strand(uint8_t label) {
   return label == ANNO_INTERGENIC ? label : label <= 4 ? label + 4 : label - 4;
 }
 
-/**
- * @brief Return the default KANN model configuration.
- * @return Default model configuration.
- */
-UnetConfig unet_default_config(void) {
-  return (UnetConfig){.depth = 4, .kernel = 9, .pool = 2,
-                      .channels = {16, 32, 64, 128}};
-}
-
-/**
- * @brief Create a KANN model.
- * @param config Model configuration.
- * @return New model, or NULL when @p config is NULL or allocation fails.
- */
-Unet *unet_create(const UnetConfig *config) {
-  if (!config) return NULL;
-  Unet *unet = xcalloc(1, sizeof(*unet));
-  unet->config = *config;
-  unet->ann = kann_unet(&unet->config);
-  unet->output = kann_find(unet->ann, KANN_F_OUT, 0);
-  if (!unet->output) {
-    unet_destroy(unet);
-    return NULL;
-  }
-  return unet;
-}
-
-/**
- * @brief Release a KANN model and its graph.
- * @param unet Model to release, or NULL.
- * @return None.
- */
-void unet_destroy(Unet *unet) {
-  if (!unet) return;
-  kann_delete(unet->ann);
-  free(unet);
-}
-
-/**
- * @brief Fill channel-major KANN input and one-hot target tensors.
- * @param sequence Source sequence.
- * @param power Precomputed CWT power channels.
- * @param power_start First genomic position represented by @p power.
- * @param start First source position.
- * @param valid Number of positions to fill.
- * @param flip Whether to reverse-complement the window.
- * @param input Channel-major input tensor.
- * @param labels Optional source labels.
- * @param truth Optional channel-major one-hot target tensor.
- * @return None.
- */
 static void features(const AnnoSequence *sequence, const float *power,
                      int64_t power_start, int64_t start, int64_t valid,
                      int flip, float *input, const uint8_t *labels,
                      float *truth) {
-  float mean[ANNO_CWT_CHANNELS] = {0};
-  float variance[ANNO_CWT_CHANNELS] = {0};
+  float mean[ANNO_CWT_CHANNELS] = {0}, variance[ANNO_CWT_CHANNELS] = {0};
   for (int64_t q = 0; q < valid; q++)
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
-      mean[s] += power[(size_t)(start + q - power_start) *
-                       ANNO_CWT_CHANNELS + s];
-  for (int s = 0; s < ANNO_CWT_CHANNELS; s++) mean[s] /= (float)valid;
+      mean[s] +=
+          power[(size_t)(start + q - power_start) * ANNO_CWT_CHANNELS + s];
+  for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
+    mean[s] /= (float)valid;
   for (int64_t q = 0; q < valid; q++)
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
-      float delta = power[(size_t)(start + q - power_start) *
-                         ANNO_CWT_CHANNELS + s] - mean[s];
-      variance[s] += delta * delta;
+      float d =
+          power[(size_t)(start + q - power_start) * ANNO_CWT_CHANNELS + s] -
+          mean[s];
+      variance[s] += d * d;
     }
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
     variance[s] = sqrtf(variance[s] / (float)valid + 1e-6f);
   for (int64_t q = 0; q < valid; q++) {
     int64_t p = flip ? start + valid - 1 - q : start + q;
     int base = base_index(sequence->bases[p]);
-    if (flip && base >= 0) base = 3 - base;
-    if (base >= 0) input[(size_t)base * KANN_LENGTH + q] = 1.0f;
+    if (flip && base >= 0)
+      base = 3 - base;
+    if (base >= 0)
+      input[(size_t)base * ANN_LENGTH + q] = 1.0f;
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
-      input[(size_t)(4 + s) * KANN_LENGTH + q] =
-        (power[(size_t)(p - power_start) * ANNO_CWT_CHANNELS + s] - mean[s]) /
-        variance[s];
+      input[(size_t)(4 + s) * ANN_LENGTH + q] =
+          (power[(size_t)(p - power_start) * ANNO_CWT_CHANNELS + s] - mean[s]) /
+          variance[s];
     if (truth) {
       uint8_t label = labels[flip ? start + valid - 1 - q : start + q];
-      if (flip) label = kann_swap_strand(label);
-      truth[(size_t)label * KANN_LENGTH + q] = 1.0f;
+      if (flip)
+        label = ann_swap_strand(label);
+      truth[(size_t)label * ANN_LENGTH + q] = 1.0f;
     }
   }
-}
-
-/**
- * @brief Evaluate a sequence and return per-base class probabilities.
- * @param unet Model to evaluate.
- * @param input Position-major input features.
- * @param length Number of positions.
- * @param probability Position-major output probabilities.
- * @return 0 on success, or an errno value otherwise.
- */
-static int unet_predict_channels(const Unet *unet, const float *input,
-                                  int64_t length, float *probability) {
-  if (!unet || !input || !probability || length < 1 || length > KANN_LENGTH)
-    return EINVAL;
-  float *bound = (float *)input;
-  kann_feed_bind(unet->ann, KANN_F_IN, 0, &bound);
-  kann_set_batch_size(unet->ann, 1);
-  kann_eval_out(unet->ann);
-  const float *raw = unet->ann->v[unet->output]->x;
-  for (int64_t p = 0; p < length; p++) {
-    float top = raw[p], sum = 0.0f;
-    for (int j = 1; j < ANNO_CLASSES; j++) if (raw[(size_t)j * KANN_LENGTH + p] > top)
-      top = raw[(size_t)j * KANN_LENGTH + p];
-    for (int j = 0; j < ANNO_CLASSES; j++) {
-      float value = expf(raw[(size_t)j * KANN_LENGTH + p] - top);
-      probability[(size_t)p * ANNO_CLASSES + j] = value;
-      sum += value;
-    }
-    for (int j = 0; j < ANNO_CLASSES; j++) probability[(size_t)p * ANNO_CLASSES + j] /= sum;
-  }
-  return 0;
-}
-
-int unet_predict(const Unet *unet, const float *input, int64_t length,
-                 float *probability) {
-  if (!unet || !input || !probability || length < 1 || length > KANN_LENGTH)
-    return EINVAL;
-  float *channel_input = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH,
-                                 sizeof(float));
-  for (int64_t p = 0; p < length; p++)
-    for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
-      channel_input[(size_t)c * KANN_LENGTH + p] =
-        input[(size_t)p * ANNO_INPUT_CHANNELS + c];
-  int status = unet_predict_channels(unet, channel_input, length, probability);
-  free(channel_input);
-  return status;
-}
-
-/**
- * @brief Save a KANN graph and its parameters.
- * @param path Destination model path.
- * @param unet Model to save.
- * @return 0 on success, or EINVAL for invalid arguments.
- */
-int unet_save(const char *path, const Unet *unet) {
-  if (!path || !unet) return EINVAL;
-  kann_save(path, unet->ann);
-  return 0;
-}
-
-/**
- * @brief Load a KANN graph and wrap it as an Unet handle.
- * @param path Source model path.
- * @param out Receives the loaded model.
- * @return 0 on success, or EINVAL when loading fails.
- */
-int unet_load(const char *path, Unet **out) {
-  if (!path || !out) return EINVAL;
-  *out = NULL;
-  kann_t *ann = kann_load(path);
-  if (!ann) return EINVAL;
-  Unet *unet = xcalloc(1, sizeof(*unet));
-  unet->config = unet_default_config();
-  unet->ann = ann;
-  unet->output = kann_find(ann, KANN_F_OUT, 0);
-  if (unet->output < 0) {
-    unet_destroy(unet);
-    return EINVAL;
-  }
-  *out = unet;
-  return 0;
 }
 
 typedef struct {
   const AnnoSequence *sequence;
-  int64_t start;
-  int64_t valid;
+  int64_t start, valid;
 } TrainingWindow;
-
 static uint64_t training_random_next(uint64_t *state) {
   uint64_t value = *state;
   value ^= value >> 12;
@@ -988,125 +893,108 @@ static uint64_t training_random_next(uint64_t *state) {
   *state = value;
   return value * UINT64_C(2685821657736338717);
 }
-
 typedef struct {
   const TrainingWindow *windows;
   size_t batch_start;
-  float *input;
-  float *truth;
-  float *mask;
+  float *input, *truth, *mask;
   int flip;
 } TrainingBatchJob;
-
-static void training_batch_job(void *pointer, int64_t job, int worker) {
-  (void)worker;
+static void training_batch_job(void *pointer, int64_t job) {
   TrainingBatchJob *context = pointer;
   const TrainingWindow *window =
-    &context->windows[context->batch_start + (size_t)job];
+      &context->windows[context->batch_start + (size_t)job];
   size_t slot = (size_t)job;
-  float *power = xcalloc(mul_size((size_t)window->valid,
-                                  ANNO_CWT_CHANNELS), sizeof(float));
-  cwt_power(window->sequence->bases, window->sequence->length,
-            window->start, window->start + window->valid, power);
-  features(window->sequence, power, window->start, window->start,
-           window->valid, context->flip,
-           context->input + slot * ANNO_INPUT_CHANNELS * KANN_LENGTH,
+  float *power =
+      xcalloc((size_t)window->valid * ANNO_CWT_CHANNELS, sizeof(float));
+  cwt_power(window->sequence->bases, window->sequence->length, window->start,
+            window->start + window->valid, power);
+  features(window->sequence, power, window->start, window->start, window->valid,
+           context->flip,
+           context->input + slot * ANNO_INPUT_CHANNELS * ANN_LENGTH,
            window->sequence->labels,
-           context->truth + slot * ANNO_CLASSES * KANN_LENGTH);
+           context->truth + slot * ANNO_CLASSES * ANN_LENGTH);
   for (int64_t q = 0; q < window->valid; q++)
-    context->mask[slot * KANN_LENGTH + q] = 1.0f;
+    context->mask[slot * ANN_LENGTH + q] = 1.0f;
   free(power);
 }
 
-/**
- * @brief Train the KANN graph on every labelled sequence window.
- * @param sequences Labelled training sequences.
- * @param count Number of sequences.
- * @param iterations Number of optimizer iterations.
- * @param threads Number of KANN worker threads.
- * @return Newly trained model.
- */
-static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations,
-                        int threads) {
-  UnetConfig config = unet_default_config();
-  Unet *unet = unet_create(&config);
-  if (!unet) fail("cannot create KANN network");
-  kann_mt(unet->ann, threads, ANNO_BATCH_WINDOWS);
-  int nvar = kann_size_var(unet->ann);
-  float *x = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * KANN_LENGTH, sizeof(float));
-  float *y = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * KANN_LENGTH, sizeof(float));
-  float *mask = xcalloc((size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH, sizeof(float));
-  float *r = xcalloc((size_t)nvar, sizeof(float));
+static Unet *train_unet(const AnnoSequence *sequences, int count,
+                        int iterations, int threads) {
+  Unet *unet = unet_create(&(UnetConfig){4, 9, 2, {16, 32, 64, 128}});
+  if (!unet)
+    fail("cannot create neural-network model");
+#ifdef _OPENMP
+  omp_set_num_threads(threads);
+#endif
   size_t total_windows = 0;
   for (int i = 0; i < count; i++)
-    total_windows += (size_t)((sequences[i].length + KANN_LENGTH - 1) /
-                              KANN_LENGTH);
-  if (!total_windows) fail("no training windows");
-  TrainingWindow *all_windows = xcalloc(total_windows, sizeof(*all_windows));
+    total_windows +=
+        (size_t)((sequences[i].length + ANN_LENGTH - 1) / ANN_LENGTH);
+  if (!total_windows)
+    fail("no training windows");
+  TrainingWindow *all = xcalloc(total_windows, sizeof(*all));
+  size_t n = 0;
+  for (int i = 0; i < count; ++i)
+    for (int64_t w = 0; w * ANN_LENGTH < sequences[i].length; ++w) {
+      int64_t start = w * ANN_LENGTH, valid = sequences[i].length - start;
+      if (valid > ANN_LENGTH)
+        valid = ANN_LENGTH;
+      all[n++] = (TrainingWindow){&sequences[i], start, valid};
+    }
+  float *x =
+      xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * ANN_LENGTH,
+              sizeof(float));
+  float *y = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANN_LENGTH,
+                     sizeof(float));
+  float *mask = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANN_LENGTH, sizeof(float));
   TrainingWindow *batch_windows =
-    xcalloc(ANNO_BATCH_WINDOWS, sizeof(*batch_windows));
-  size_t all_index = 0;
-  for (int sequence = 0; sequence < count; sequence++) {
-    int64_t sequence_windows =
-      (sequences[sequence].length + KANN_LENGTH - 1) / KANN_LENGTH;
-    for (int64_t window = 0; window < sequence_windows; window++) {
-      int64_t start = window * KANN_LENGTH;
-      int64_t valid = sequences[sequence].length - start;
-      if (valid > KANN_LENGTH) valid = KANN_LENGTH;
-      all_windows[all_index++] =
-        (TrainingWindow){&sequences[sequence], start, valid};
-    }
-  }
-  uint64_t shuffle_state = UINT64_C(0x9e3779b97f4a7c15);
+      xcalloc(ANNO_BATCH_WINDOWS, sizeof(*batch_windows));
+  uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
   double started = now_seconds();
-  for (int iteration = 0; iteration < iterations; iteration++) {
-    for (size_t i = total_windows; i > 1; i--) {
-      size_t j = (size_t)(training_random_next(&shuffle_state) % i);
-      TrainingWindow swap = all_windows[i - 1];
-      all_windows[i - 1] = all_windows[j];
-      all_windows[j] = swap;
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    for (size_t i = total_windows; i > 1; --i) {
+      size_t j = training_random_next(&state) % i;
+      TrainingWindow t = all[i - 1];
+      all[i - 1] = all[j];
+      all[j] = t;
     }
-    double epoch_loss = 0.0;
-    size_t epoch_batches = 0;
-    for (size_t batch_start = 0; batch_start < total_windows;
-         batch_start += ANNO_BATCH_WINDOWS) {
-      size_t batch_end = batch_start + ANNO_BATCH_WINDOWS;
-      if (batch_end > total_windows) batch_end = total_windows;
-      memset(x, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS *
-             KANN_LENGTH * sizeof(float));
-      memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES *
-             KANN_LENGTH * sizeof(float));
-      memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH * sizeof(float));
-      size_t batch_size = batch_end - batch_start;
-      memcpy(batch_windows, all_windows + batch_start,
-             batch_size * sizeof(*batch_windows));
-      TrainingBatchJob batch = {
-        batch_windows, 0, x, y, mask,
-        (iteration + (int)(batch_start / ANNO_BATCH_WINDOWS)) & 1
-      };
-      run_parallel(threads, (int64_t)(batch_end - batch_start),
-                   training_batch_job, &batch);
-      kann_feed_bind(unet->ann, KANN_F_IN, 0, &x);
-      kann_feed_bind(unet->ann, KANN_F_TRUTH, 2, &y);
-      kann_feed_bind(unet->ann, KANN_F_TRUTH, 1, &mask);
-      kann_set_batch_size(unet->ann, (int)(batch_end - batch_start));
-      float loss = kann_cost(unet->ann, 0, 1);
-      kann_RMSprop(nvar, ANNO_LEARNING_RATE, NULL, 0.9f, unet->ann->g,
-                   unet->ann->x, r);
-      if (!isfinite(loss)) fail("non-finite KANN loss");
+    double epoch_loss = 0;
+    size_t batches = 0;
+    for (size_t first = 0; first < total_windows; first += ANNO_BATCH_WINDOWS) {
+      size_t size = total_windows - first;
+      if (size > ANNO_BATCH_WINDOWS)
+        size = ANNO_BATCH_WINDOWS;
+      memset(x, 0,
+             (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * ANN_LENGTH *
+                 sizeof(float));
+      memset(y, 0,
+             (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANN_LENGTH *
+                 sizeof(float));
+      memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * ANN_LENGTH * sizeof(float));
+      memcpy(batch_windows, all + first, size * sizeof(*batch_windows));
+      TrainingBatchJob job = {batch_windows,
+                              0,
+                              x,
+                              y,
+                              mask,
+                              (iteration + first / ANNO_BATCH_WINDOWS) & 1};
+      run_parallel(threads, (int64_t)size, training_batch_job, &job);
+      float loss = 0;
+      if (unet_train_batch(unet, x, y, mask, size, ANNO_LEARNING_RATE, &loss))
+        fail("neural-network training failed");
       epoch_loss += loss;
-      epoch_batches++;
+      ++batches;
     }
     if (iteration == 0 || iteration + 1 == iterations ||
         (iteration + 1) % 10 == 0)
-      say("iteration %d/%d loss %.4f batches %zu %.1fs",
-          iteration + 1, iterations, epoch_loss / (double)epoch_batches,
-          epoch_batches, now_seconds() - started);
+      say("iteration %d/%d loss %.4f batches %zu %.1fs", iteration + 1,
+          iterations, epoch_loss / batches, batches, now_seconds() - started);
   }
-  kann_mt(unet->ann, 0, 0);
-  free(all_windows);
+  free(all);
   free(batch_windows);
-  free(x); free(y); free(mask); free(r);
+  free(x);
+  free(y);
+  free(mask);
   return unet;
 }
 
@@ -1133,7 +1021,8 @@ typedef struct {
  */
 static void grammar_edge(Grammar *g, int from, int to, double score) {
   int k = g->predecessors[to]++;
-  if (k >= GRAMMAR_MAX_PREDECESSORS) fail("grammar has too many predecessors");
+  if (k >= GRAMMAR_MAX_PREDECESSORS)
+    fail("grammar has too many predecessors");
   g->from[to][k] = from;
   g->score[to][k] = score;
 }
@@ -1149,7 +1038,8 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
   int head = g->count;
   for (int i = 0; i < length; i++) {
     g->cls[g->count] = cls;
-    if (i) grammar_edge(g, g->count - 1, g->count, 0.0);
+    if (i)
+      grammar_edge(g, g->count - 1, g->count, 0.0);
     g->count++;
   }
   grammar_edge(g, g->count - 1, g->count - 1, 0.0);
@@ -1170,7 +1060,8 @@ static void grammar_build(Grammar *g) {
   for (int strand = 0; strand < 2; strand++) {
     int o = strand ? 4 : 0;
     int u5 = grammar_chain(g, (uint8_t)(ANNO_PLUS_5UTR + o), 1);
-    int ex = grammar_chain(g, (uint8_t)(ANNO_PLUS_EXON + o), ANNO_MIN_EXON_LENGTH);
+    int ex =
+        grammar_chain(g, (uint8_t)(ANNO_PLUS_EXON + o), ANNO_MIN_EXON_LENGTH);
     int ex_tail = ex + ANNO_MIN_EXON_LENGTH - 1;
     int u3 = grammar_chain(g, (uint8_t)(ANNO_PLUS_3UTR + o), 1);
     int introns[3];
@@ -1195,12 +1086,14 @@ static void grammar_build(Grammar *g) {
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
     int bits = 0;
-    while ((1 << bits) < g->predecessors[s]) bits++;
+    while ((1 << bits) < g->predecessors[s])
+      bits++;
     g->shift[s] = shift;
     g->bits[s] = bits;
     shift += bits;
   }
-  if (shift > 32 || g->count > GRAMMAR_MAX_STATES) fail("grammar too large");
+  if (shift > 32 || g->count > GRAMMAR_MAX_STATES)
+    fail("grammar too large");
 }
 
 /** Streaming Viterbi decoder. Owns its buffers. */
@@ -1232,7 +1125,8 @@ static Decoder *decoder_create(int64_t length) {
  * @return None.
  */
 static void decoder_destroy(Decoder *d) {
-  if (!d) return;
+  if (!d)
+    return;
   free(d->previous);
   free(d->current);
   free(d->back);
@@ -1254,7 +1148,8 @@ static void decoder_step(Decoder *d, const float *row) {
   }
   int64_t i = d->position++;
   if (!i) {
-    for (int s = 0; s < g->count; s++) d->previous[s] = -INFINITY;
+    for (int s = 0; s < g->count; s++)
+      d->previous[s] = -INFINITY;
     d->previous[0] = emission[ANNO_INTERGENIC];
     return;
   }
@@ -1271,10 +1166,12 @@ static void decoder_step(Decoder *d, const float *row) {
       }
     }
     d->current[s] = best + emission[g->cls[s]];
-    if (d->current[s] > top) top = d->current[s];
+    if (d->current[s] > top)
+      top = d->current[s];
     back |= (uint32_t)choice << g->shift[s];
   }
-  for (int s = 0; s < g->count; s++) d->current[s] -= top; /* keep scores small */
+  for (int s = 0; s < g->count; s++)
+    d->current[s] -= top; /* keep scores small */
   d->back[i] = back;
   double *swap = d->previous;
   d->previous = d->current;
@@ -1289,11 +1186,13 @@ static void decoder_step(Decoder *d, const float *row) {
  */
 static int decoder_finish(Decoder *d, uint8_t *path) {
   const Grammar *g = &d->grammar;
-  if (d->position != d->length || !isfinite(d->previous[0])) return ERANGE;
+  if (d->position != d->length || !isfinite(d->previous[0]))
+    return ERANGE;
   int state = 0;
   for (int64_t i = d->length - 1; i > 0; i--) {
     path[i] = g->cls[state];
-    int choice = (int)((d->back[i] >> g->shift[state]) & ((1u << g->bits[state]) - 1u));
+    int choice =
+        (int)((d->back[i] >> g->shift[state]) & ((1u << g->bits[state]) - 1u));
     state = g->from[state][choice];
   }
   path[0] = g->cls[state];
@@ -1302,7 +1201,8 @@ static int decoder_finish(Decoder *d, uint8_t *path) {
 
 int anno_decode(const char *bases, int64_t length, const float *probability,
                 uint8_t *path) {
-  if (!bases || !probability || !path || length < 1) return EINVAL;
+  if (!bases || !probability || !path || length < 1)
+    return EINVAL;
   Decoder *d = decoder_create(length);
   for (int64_t i = 0; i < length; i++)
     decoder_step(d, probability + (size_t)i * ANNO_CLASSES);
@@ -1341,10 +1241,12 @@ static int longest_orf(const char *transcript, int64_t length, int64_t *start,
     int64_t open = -1;
     for (int64_t p = frame; p + 3 <= length; p += 3) {
       const char *c = transcript + p;
-      if (open < 0 && c[0] == 'A' && c[1] == 'T' && c[2] == 'G') open = p;
-      if (!is_stop(c)) continue;
-      if (open >= 0 && (p + 3 - open > best ||
-                        (p + 3 - open == best && open < *start))) {
+      if (open < 0 && c[0] == 'A' && c[1] == 'T' && c[2] == 'G')
+        open = p;
+      if (!is_stop(c))
+        continue;
+      if (open >= 0 &&
+          (p + 3 - open > best || (p + 3 - open == best && open < *start))) {
         best = p + 3 - open;
         *start = open;
         *end = p + 3;
@@ -1368,7 +1270,8 @@ static void map_range(const SegmentList *exons, char strand, int64_t from,
                       int64_t to, SegmentList *out) {
   int64_t offset = 0;
   for (int order = 0; order < exons->count; order++) {
-    const Segment *e = &exons->items[strand == '+' ? order : exons->count - 1 - order];
+    const Segment *e =
+        &exons->items[strand == '+' ? order : exons->count - 1 - order];
     int64_t length = e->end - e->start;
     int64_t a = from > offset ? from - offset : 0;
     int64_t b = to < offset + length ? to - offset : length;
@@ -1397,7 +1300,8 @@ typedef struct {
  */
 static int inside(const SegmentList *list, int64_t start, int64_t end) {
   for (int i = 0; i < list->count; i++)
-    if (start >= list->items[i].start && end <= list->items[i].end) return 1;
+    if (start >= list->items[i].start && end <= list->items[i].end)
+      return 1;
   return 0;
 }
 
@@ -1408,24 +1312,30 @@ static int inside(const SegmentList *list, int64_t start, int64_t end) {
  * @param exons Exon segments used for containment checks.
  * @return 1 when consistent.
  */
-static int records_valid(const Record *records, int count, const SegmentList *exons) {
+static int records_valid(const Record *records, int count,
+                         const SegmentList *exons) {
   for (int i = 0; i < count; i++) {
     const Record *r = &records[i];
-    if (r->start < 0 || r->end <= r->start) return 0;
+    if (r->start < 0 || r->end <= r->start)
+      return 0;
     if (i == 0) {
-      if (strcmp(r->type, "gene") || r->parent[0]) return 0;
+      if (strcmp(r->type, "gene") || r->parent[0])
+        return 0;
       continue;
     }
     int parent = -1;
     for (int j = 0; j < count; j++)
-      if (r->parent[0] && !strcmp(records[j].id, r->parent)) parent = j;
-    if (parent < 0 || r->start < records[parent].start || r->end > records[parent].end)
+      if (r->parent[0] && !strcmp(records[j].id, r->parent))
+        parent = j;
+    if (parent < 0 || r->start < records[parent].start ||
+        r->end > records[parent].end)
       return 0;
     if (strcmp(r->type, "mRNA") && strcmp(r->type, "exon") &&
         !inside(exons, r->start, r->end))
       return 0;
     for (int j = 0; j < i; j++)
-      if (r->id[0] && !strcmp(records[j].id, r->id)) return 0;
+      if (r->id[0] && !strcmp(records[j].id, r->id))
+        return 0;
   }
   return 1;
 }
@@ -1468,19 +1378,23 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
                             const SegmentList *exons, char strand,
                             unsigned long gene_number) {
   int64_t length = 0;
-  for (int i = 0; i < exons->count; i++) length += exons->items[i].end - exons->items[i].start;
+  for (int i = 0; i < exons->count; i++)
+    length += exons->items[i].end - exons->items[i].start;
   char *transcript = xcalloc((size_t)length + 1, 1);
   int64_t at = 0;
   for (int order = 0; order < exons->count; order++) {
-    const Segment *e = &exons->items[strand == '+' ? order : exons->count - 1 - order];
+    const Segment *e =
+        &exons->items[strand == '+' ? order : exons->count - 1 - order];
     for (int64_t p = 0; p < e->end - e->start; p++)
-      transcript[at++] = strand == '+' ? sequence->bases[e->start + p]
-                                       : complement(sequence->bases[e->end - 1 - p]);
+      transcript[at++] = strand == '+'
+                             ? sequence->bases[e->start + p]
+                             : complement(sequence->bases[e->end - 1 - p]);
   }
   int64_t orf_start = INT64_MAX, orf_end = 0;
   int found = longest_orf(transcript, length, &orf_start, &orf_end);
   free(transcript);
-  if (!found) return 0;
+  if (!found)
+    return 0;
   SegmentList utr5 = {0}, cds = {0}, utr3 = {0};
   map_range(exons, strand, 0, orf_start, &utr5);
   map_range(exons, strand, orf_start, orf_end, &cds);
@@ -1490,13 +1404,14 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
   snprintf(mrna, sizeof(mrna), "%s.t1", gene);
   Record *records = NULL;
   int count = 0;
-  int64_t start = exons->items[0].start, end = exons->items[exons->count - 1].end;
+  int64_t start = exons->items[0].start,
+          end = exons->items[exons->count - 1].end;
   record_add(&records, &count, "gene", start, end, -1, gene, "");
   record_add(&records, &count, "mRNA", start, end, -1, mrna, gene);
   for (int i = 0; i < exons->count; i++) {
     snprintf(id, sizeof(id), "%s.exon%d", mrna, i + 1);
-    record_add(&records, &count, "exon", exons->items[i].start, exons->items[i].end,
-               -1, id, mrna);
+    record_add(&records, &count, "exon", exons->items[i].start,
+               exons->items[i].end, -1, id, mrna);
   }
   for (int i = 0; i < utr5.count; i++) {
     snprintf(id, sizeof(id), "%s.utr5p%d", mrna, i + 1);
@@ -1506,7 +1421,8 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
   for (int i = 0; i < cds.count; i++) {
     int64_t before = 0; /* coding bases upstream in transcript orientation */
     for (int j = 0; j < cds.count; j++)
-      if (strand == '+' ? j < i : j > i) before += cds.items[j].end - cds.items[j].start;
+      if (strand == '+' ? j < i : j > i)
+        before += cds.items[j].end - cds.items[j].start;
     snprintf(id, sizeof(id), "%s.cds%d", mrna, i + 1);
     record_add(&records, &count, "CDS", cds.items[i].start, cds.items[i].end,
                (int)((3 - before % 3) % 3), id, mrna);
@@ -1517,11 +1433,13 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
                utr3.items[i].end, -1, id, mrna);
   }
   int ok = records_valid(records, count, exons);
-  if (!ok) fail("internal error: inconsistent GFF3 records for %s", gene);
+  if (!ok)
+    fail("internal error: inconsistent GFF3 records for %s", gene);
   for (int i = 0; ok && i < count; i++) {
     const Record *r = &records[i];
     char phase[12] = ".";
-    if (r->phase >= 0) snprintf(phase, sizeof(phase), "%d", r->phase);
+    if (r->phase >= 0)
+      snprintf(phase, sizeof(phase), "%d", r->phase);
     ok = fprintf(output, "%s\tanno\t%s\t%lld\t%lld\t.\t%c\t%s\tID=%s%s%s\n",
                  sequence->name, r->type, (long long)r->start + 1,
                  (long long)r->end, strand, phase, r->id,
@@ -1565,14 +1483,18 @@ long anno_write_gff(FILE *output, const AnnoSequence *sequence,
       int intron = path[p] == ANNO_PLUS_INTRON || path[p] == ANNO_MINUS_INTRON;
       int64_t start = p;
       while (p < sequence->length && class_strand(path[p]) == strand &&
-             (path[p] == ANNO_PLUS_INTRON || path[p] == ANNO_MINUS_INTRON) == intron)
+             (path[p] == ANNO_PLUS_INTRON || path[p] == ANNO_MINUS_INTRON) ==
+                 intron)
         p++;
-      if (!intron) segments_push(&exons, start, p);
+      if (!intron)
+        segments_push(&exons, start, p);
     }
-    int result = exons.count
-      ? write_transcript(output, sequence, &exons, strand, *gene_counter + 1) : 0;
+    int result = exons.count ? write_transcript(output, sequence, &exons,
+                                                strand, *gene_counter + 1)
+                             : 0;
     free(exons.items);
-    if (result < 0) return -1;
+    if (result < 0)
+      return -1;
     if (result) {
       ++*gene_counter;
       written++;
@@ -1601,7 +1523,8 @@ typedef struct {
  * @param position Exclusive genomic end position.
  * @return None.
  */
-static void bedgraph_emit(Bedgraph *b, const char *name, int j, int64_t position) {
+static void bedgraph_emit(Bedgraph *b, const char *name, int j,
+                          int64_t position) {
   if (b->value[j] >= 0 && position > b->start[j] &&
       fprintf(b->files[j], "%s\t%lld\t%lld\t%d.%02d\n", name,
               (long long)b->start[j], (long long)position, b->value[j] / 100,
@@ -1618,11 +1541,13 @@ static void bedgraph_emit(Bedgraph *b, const char *name, int j, int64_t position
  * @return None.
  */
 static void bedgraph_add(Bedgraph *b, const char *name, int64_t position,
-                          const float *row) {
-  if (!b->files[0]) return;
+                         const float *row) {
+  if (!b->files[0])
+    return;
   for (int j = 0; j < ANNO_CLASSES; j++) {
     int value = (int)lrintf(row[j] * 100.0f);
-    if (value == b->value[j]) continue;
+    if (value == b->value[j])
+      continue;
     bedgraph_emit(b, name, j, position);
     b->value[j] = value;
     b->start[j] = position;
@@ -1639,40 +1564,47 @@ static void bedgraph_add(Bedgraph *b, const char *name, int64_t position,
  * @param prefix Optional bedGraph output prefix.
  * @return Number of genes written.
  */
-static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequences,
-                                    int count, int threads, FILE *gff,
+static unsigned long predict_genome(const Unet *unet,
+                                    const AnnoSequence *sequences, int count,
+                                    int threads, FILE *gff,
                                     const char *prefix) {
   (void)threads;
   Bedgraph bedgraph = {0};
   for (int j = 0; prefix && j < ANNO_CLASSES; j++) {
     char path[4096];
-    if (snprintf(path, sizeof(path), "%s.%s.bedgraph", prefix, class_names[j]) >=
-        (int)sizeof(path)) fail("output prefix too long");
-    if (!(bedgraph.files[j] = fopen(path, "w"))) fail("cannot create %s", path);
-    fprintf(bedgraph.files[j], "track type=bedGraph name=\"%s\"\n", class_names[j]);
+    if (snprintf(path, sizeof(path), "%s.%s.bedgraph", prefix,
+                 class_names[j]) >= (int)sizeof(path))
+      fail("output prefix too long");
+    if (!(bedgraph.files[j] = fopen(path, "w")))
+      fail("cannot create %s", path);
+    fprintf(bedgraph.files[j], "track type=bedGraph name=\"%s\"\n",
+            class_names[j]);
   }
   unsigned long genes = 0;
   for (int i = 0; i < count; i++) {
     const AnnoSequence *s = &sequences[i];
     Decoder *decoder = decoder_create(s->length);
-    for (int j = 0; j < ANNO_CLASSES; j++) bedgraph.value[j] = -1;
-    int64_t window_count = (s->length + KANN_LENGTH - 1) / KANN_LENGTH;
-    float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH,
-                           sizeof(float));
-    float *power = xcalloc((size_t)KANN_LENGTH * ANNO_CWT_CHANNELS,
-                           sizeof(float));
-    float *probability = xcalloc((size_t)KANN_LENGTH * ANNO_CLASSES,
-                                 sizeof(float));
+    for (int j = 0; j < ANNO_CLASSES; j++)
+      bedgraph.value[j] = -1;
+    int64_t window_count = (s->length + ANN_LENGTH - 1) / ANN_LENGTH;
+    float *input =
+        xcalloc((size_t)ANNO_INPUT_CHANNELS * ANN_LENGTH, sizeof(float));
+    float *power =
+        xcalloc((size_t)ANN_LENGTH * ANNO_CWT_CHANNELS, sizeof(float));
+    float *probability =
+        xcalloc((size_t)ANN_LENGTH * ANNO_CLASSES, sizeof(float));
     for (int64_t window = 0; window < window_count; window++) {
-      int64_t start = window * KANN_LENGTH;
-      int64_t valid = s->length - start < KANN_LENGTH ? s->length - start : KANN_LENGTH;
-      memset(input, 0, (size_t)ANNO_INPUT_CHANNELS * KANN_LENGTH * sizeof(float));
-      memset(power, 0, (size_t)KANN_LENGTH * ANNO_CWT_CHANNELS * sizeof(float));
+      int64_t start = window * ANN_LENGTH;
+      int64_t valid =
+          s->length - start < ANN_LENGTH ? s->length - start : ANN_LENGTH;
+      memset(input, 0,
+             (size_t)ANNO_INPUT_CHANNELS * ANN_LENGTH * sizeof(float));
+      memset(power, 0, (size_t)ANN_LENGTH * ANNO_CWT_CHANNELS * sizeof(float));
       cwt_power(s->bases, s->length, start, start + valid, power);
       features(s, power, start, start, valid, 0, input, NULL, NULL);
       memset(probability, 0, (size_t)valid * ANNO_CLASSES * sizeof(float));
       if (unet_predict_channels(unet, input, valid, probability))
-        fail("KANN prediction failed");
+        fail("neural-network prediction failed");
       for (int64_t p = 0; p < valid; p++) {
         const float *row = probability + (size_t)p * ANNO_CLASSES;
         bedgraph_add(&bedgraph, s->name, start + p, row);
@@ -1685,15 +1617,18 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
     for (int j = 0; j < ANNO_CLASSES && bedgraph.files[0]; j++)
       bedgraph_emit(&bedgraph, s->name, j, s->length);
     uint8_t *path = xcalloc((size_t)s->length, 1);
-    if (decoder_finish(decoder, path)) fail("grammar decoding failed for %s", s->name);
+    if (decoder_finish(decoder, path))
+      fail("grammar decoding failed for %s", s->name);
     decoder_destroy(decoder);
     long written = anno_write_gff(gff, s, path, &genes);
     free(path);
-    if (written < 0) fail("cannot write GFF3");
+    if (written < 0)
+      fail("cannot write GFF3");
     say("%s: %ld genes", s->name, written);
   }
   for (int j = 0; j < ANNO_CLASSES; j++)
-    if (bedgraph.files[j] && fclose(bedgraph.files[j])) fail("cannot close bedGraph");
+    if (bedgraph.files[j] && fclose(bedgraph.files[j]))
+      fail("cannot close bedGraph");
   return genes;
 }
 
@@ -1708,16 +1643,17 @@ static unsigned long predict_genome(const Unet *unet, const AnnoSequence *sequen
  */
 static void usage(void) {
   fprintf(stderr,
-    "Usage: anno [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
-    "       anno [-p N] cwt genome.fasta[.gz] directory\n"
-    "  with an annotation: train a UNet and write it to -m\n"
-    "  without:            predict genes (GFF3 on stdout unless -o)\n"
-    "Options:\n"
-    "  -p N       threads [1]\n"
-    "  -i N       training iterations [%d]\n"
-    "  -m FILE    model file [anno.ann]\n"
-    "  -o PREFIX  write PREFIX.gff3 and PREFIX.{class}.bedgraph\n"
-    "  -h         this help\n", ANNO_DEFAULT_ITERATIONS);
+          "Usage: anno [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
+          "       anno [-p N] cwt genome.fasta[.gz] directory\n"
+          "  with an annotation: train a UNet and write it to -m\n"
+          "  without:            predict genes (GFF3 on stdout unless -o)\n"
+          "Options:\n"
+          "  -p N       threads [1]\n"
+          "  -i N       training iterations [%d]\n"
+          "  -m FILE    model file [anno.ann]\n"
+          "  -o PREFIX  write PREFIX.gff3 and PREFIX.{class}.bedgraph\n"
+          "  -h         this help\n",
+          ANNO_DEFAULT_ITERATIONS);
 }
 
 /**
@@ -1744,23 +1680,27 @@ static int positive(const char *text, const char *name) {
 int main(int argc, char **argv) {
   int threads = 1, iterations = ANNO_DEFAULT_ITERATIONS;
   const char *model_path = "anno.ann", *prefix = NULL;
-  ketopt_t options = KETOPT_INIT;
   int opt;
-  while ((opt = ketopt(&options, argc, argv, 1, "hp:i:m:o:", NULL)) >= 0) {
+  opterr = 0;
+  while ((opt = getopt(argc, argv, "hp:i:m:o:")) != -1) {
     if (opt == 'h') {
       usage();
       return EXIT_SUCCESS;
     }
-    if (opt == 'p') threads = positive(options.arg, "thread count");
-    if (opt == 'i') iterations = positive(options.arg, "iteration count");
-    if (opt == 'm') model_path = options.arg;
-    if (opt == 'o') prefix = options.arg;
+    if (opt == 'p')
+      threads = positive(optarg, "thread count");
+    if (opt == 'i')
+      iterations = positive(optarg, "iteration count");
+    if (opt == 'm')
+      model_path = optarg;
+    if (opt == 'o')
+      prefix = optarg;
   }
-  if (opt == ':' || opt == '?') {
+  if (opt == '?') {
     usage();
     return EXIT_FAILURE;
   }
-  int a = options.ind;
+  int a = optind;
   if (a < argc && !strcmp(argv[a], "cwt")) {
     if (argc - a != 3) {
       usage();
@@ -1780,22 +1720,27 @@ int main(int argc, char **argv) {
     anno_read_labels(argv[a + 1], sequences, count);
     Unet *unet = train_unet(sequences, count, iterations, threads);
     int status = unet_save(model_path, unet);
-    if (status) fail("cannot write model %s: %s", model_path, strerror(status));
-    say("trained in %.1fs; model written to %s", now_seconds() - started, model_path);
+    if (status)
+      fail("cannot write model %s: %s", model_path, strerror(status));
+    say("trained in %.1fs; model written to %s", now_seconds() - started,
+        model_path);
     unet_destroy(unet);
   } else {
     Unet *unet = NULL;
     int status = unet_load(model_path, &unet);
-    if (status) fail("cannot read model %s: %s", model_path, strerror(status));
+    if (status)
+      fail("cannot read model %s: %s", model_path, strerror(status));
     FILE *gff = stdout;
     if (prefix) {
       char path[4096];
       if (snprintf(path, sizeof(path), "%s.gff3", prefix) >= (int)sizeof(path))
         fail("output prefix too long");
-      if (!(gff = fopen(path, "w"))) fail("cannot create %s", path);
+      if (!(gff = fopen(path, "w")))
+        fail("cannot create %s", path);
     }
     fputs("##gff-version 3\n", gff);
-    unsigned long genes = predict_genome(unet, sequences, count, threads, gff, prefix);
+    unsigned long genes =
+        predict_genome(unet, sequences, count, threads, gff, prefix);
     if (fflush(gff) || ferror(gff) || (gff != stdout && fclose(gff)))
       fail("cannot write GFF3");
     say("predicted %lu genes", genes);

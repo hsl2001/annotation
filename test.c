@@ -32,30 +32,30 @@ static float test_random_unit(uint64_t *state) {
 }
 
 static float *test_sequence_power(const AnnoSequence *sequence) {
-  float *power = xcalloc((size_t)sequence->length * ANNO_CWT_CHANNELS,
-                         sizeof(float));
-  for (int64_t start = 0; start < sequence->length;
-       start += ANNO_CWT_WINDOW) {
+  float *power =
+      xcalloc((size_t)sequence->length * ANNO_CWT_CHANNELS, sizeof(float));
+  for (int64_t start = 0; start < sequence->length; start += ANNO_CWT_WINDOW) {
     int64_t end = start + ANNO_CWT_WINDOW;
-    if (end > sequence->length) end = sequence->length;
+    if (end > sequence->length)
+      end = sequence->length;
     float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * 2];
     anno_cwt(sequence->bases, sequence->length, start, end, values);
     for (int64_t i = 0; i < (end - start) * ANNO_CWT_CHANNELS; i++)
       power[(size_t)start * ANNO_CWT_CHANNELS + (size_t)i] =
-        values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
+          values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
   }
   return power;
 }
 
 /** @brief Record one check. */
-#define CHECK(condition)                                                    \
-  do {                                                                      \
-    checks++;                                                               \
-    if (!(condition)) {                                                     \
-      failures++;                                                           \
-      fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__,      \
-              #condition);                                                  \
-    }                                                                       \
+#define CHECK(condition)                                                       \
+  do {                                                                         \
+    checks++;                                                                  \
+    if (!(condition)) {                                                        \
+      failures++;                                                              \
+      fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__,         \
+              #condition);                                                     \
+    }                                                                          \
   } while (0)
 
 /** @brief Write text to a file. */
@@ -72,7 +72,8 @@ static char *read_text(FILE *file) {
   long size = ftell(file);
   char *text = xcalloc((size_t)size + 1, 1);
   rewind(file);
-  if (fread(text, 1, (size_t)size, file) != (size_t)size) text[0] = 0;
+  if (fread(text, 1, (size_t)size, file) != (size_t)size)
+    text[0] = 0;
   return text;
 }
 
@@ -80,40 +81,45 @@ static char *read_text(FILE *file) {
 
 /*
  * Block B (500 bp, background 'C'), plus-strand transcript, 0-based [a,b):
- *   exons   [40,70) [100,150) [210,300) [360,420)  (first intron is in the 5'UTR)
- *   5'UTR   [40,70) [100,121)
- *   CDS     [121,150) [210,300) [360,391)  = 29+90+31 = 150 bp = ATG + 48 GCC + TAA
- *   3'UTR   [391,420)
- * Introns start with GT and end with AG. Genome = B + 1000 'C' + revcomp(B), so
- * the same gene appears on the minus strand at 1999-p.
+ *   exons   [40,70) [100,150) [210,300) [360,420)  (first intron is in the
+ * 5'UTR) 5'UTR   [40,70) [100,121) CDS     [121,150) [210,300) [360,391)  =
+ * 29+90+31 = 150 bp = ATG + 48 GCC + TAA 3'UTR   [391,420) Introns start with
+ * GT and end with AG. Genome = B + 1000 'C' + revcomp(B), so the same gene
+ * appears on the minus strand at 1999-p.
  */
 #define TEST_LENGTH 2000
 static const char *const test_gff =
-  "##gff-version 3\n"
-  "t\tanno\tgene\t41\t420\t.\t+\t.\tID=gene1\n"
-  "t\tanno\tmRNA\t41\t420\t.\t+\t.\tID=gene1.t1;Parent=gene1\n"
-  "t\tanno\texon\t41\t70\t.\t+\t.\tID=gene1.t1.exon1;Parent=gene1.t1\n"
-  "t\tanno\texon\t101\t150\t.\t+\t.\tID=gene1.t1.exon2;Parent=gene1.t1\n"
-  "t\tanno\texon\t211\t300\t.\t+\t.\tID=gene1.t1.exon3;Parent=gene1.t1\n"
-  "t\tanno\texon\t361\t420\t.\t+\t.\tID=gene1.t1.exon4;Parent=gene1.t1\n"
-  "t\tanno\tfive_prime_UTR\t41\t70\t.\t+\t.\tID=gene1.t1.utr5p1;Parent=gene1.t1\n"
-  "t\tanno\tfive_prime_UTR\t101\t121\t.\t+\t.\tID=gene1.t1.utr5p2;Parent=gene1.t1\n"
-  "t\tanno\tCDS\t122\t150\t.\t+\t0\tID=gene1.t1.cds1;Parent=gene1.t1\n"
-  "t\tanno\tCDS\t211\t300\t.\t+\t1\tID=gene1.t1.cds2;Parent=gene1.t1\n"
-  "t\tanno\tCDS\t361\t391\t.\t+\t1\tID=gene1.t1.cds3;Parent=gene1.t1\n"
-  "t\tanno\tthree_prime_UTR\t392\t420\t.\t+\t.\tID=gene1.t1.utr3p1;Parent=gene1.t1\n"
-  "t\tanno\tgene\t1581\t1960\t.\t-\t.\tID=gene2\n"
-  "t\tanno\tmRNA\t1581\t1960\t.\t-\t.\tID=gene2.t1;Parent=gene2\n"
-  "t\tanno\texon\t1581\t1640\t.\t-\t.\tID=gene2.t1.exon1;Parent=gene2.t1\n"
-  "t\tanno\texon\t1701\t1790\t.\t-\t.\tID=gene2.t1.exon2;Parent=gene2.t1\n"
-  "t\tanno\texon\t1851\t1900\t.\t-\t.\tID=gene2.t1.exon3;Parent=gene2.t1\n"
-  "t\tanno\texon\t1931\t1960\t.\t-\t.\tID=gene2.t1.exon4;Parent=gene2.t1\n"
-  "t\tanno\tfive_prime_UTR\t1880\t1900\t.\t-\t.\tID=gene2.t1.utr5p1;Parent=gene2.t1\n"
-  "t\tanno\tfive_prime_UTR\t1931\t1960\t.\t-\t.\tID=gene2.t1.utr5p2;Parent=gene2.t1\n"
-  "t\tanno\tCDS\t1610\t1640\t.\t-\t1\tID=gene2.t1.cds1;Parent=gene2.t1\n"
-  "t\tanno\tCDS\t1701\t1790\t.\t-\t1\tID=gene2.t1.cds2;Parent=gene2.t1\n"
-  "t\tanno\tCDS\t1851\t1879\t.\t-\t0\tID=gene2.t1.cds3;Parent=gene2.t1\n"
-  "t\tanno\tthree_prime_UTR\t1581\t1609\t.\t-\t.\tID=gene2.t1.utr3p1;Parent=gene2.t1\n";
+    "##gff-version 3\n"
+    "t\tanno\tgene\t41\t420\t.\t+\t.\tID=gene1\n"
+    "t\tanno\tmRNA\t41\t420\t.\t+\t.\tID=gene1.t1;Parent=gene1\n"
+    "t\tanno\texon\t41\t70\t.\t+\t.\tID=gene1.t1.exon1;Parent=gene1.t1\n"
+    "t\tanno\texon\t101\t150\t.\t+\t.\tID=gene1.t1.exon2;Parent=gene1.t1\n"
+    "t\tanno\texon\t211\t300\t.\t+\t.\tID=gene1.t1.exon3;Parent=gene1.t1\n"
+    "t\tanno\texon\t361\t420\t.\t+\t.\tID=gene1.t1.exon4;Parent=gene1.t1\n"
+    "t\tanno\tfive_prime_UTR\t41\t70\t.\t+\t.\tID=gene1.t1.utr5p1;Parent=gene1."
+    "t1\n"
+    "t\tanno\tfive_prime_UTR\t101\t121\t.\t+\t.\tID=gene1.t1.utr5p2;Parent="
+    "gene1.t1\n"
+    "t\tanno\tCDS\t122\t150\t.\t+\t0\tID=gene1.t1.cds1;Parent=gene1.t1\n"
+    "t\tanno\tCDS\t211\t300\t.\t+\t1\tID=gene1.t1.cds2;Parent=gene1.t1\n"
+    "t\tanno\tCDS\t361\t391\t.\t+\t1\tID=gene1.t1.cds3;Parent=gene1.t1\n"
+    "t\tanno\tthree_prime_UTR\t392\t420\t.\t+\t.\tID=gene1.t1.utr3p1;Parent="
+    "gene1.t1\n"
+    "t\tanno\tgene\t1581\t1960\t.\t-\t.\tID=gene2\n"
+    "t\tanno\tmRNA\t1581\t1960\t.\t-\t.\tID=gene2.t1;Parent=gene2\n"
+    "t\tanno\texon\t1581\t1640\t.\t-\t.\tID=gene2.t1.exon1;Parent=gene2.t1\n"
+    "t\tanno\texon\t1701\t1790\t.\t-\t.\tID=gene2.t1.exon2;Parent=gene2.t1\n"
+    "t\tanno\texon\t1851\t1900\t.\t-\t.\tID=gene2.t1.exon3;Parent=gene2.t1\n"
+    "t\tanno\texon\t1931\t1960\t.\t-\t.\tID=gene2.t1.exon4;Parent=gene2.t1\n"
+    "t\tanno\tfive_prime_UTR\t1880\t1900\t.\t-\t.\tID=gene2.t1.utr5p1;Parent="
+    "gene2.t1\n"
+    "t\tanno\tfive_prime_UTR\t1931\t1960\t.\t-\t.\tID=gene2.t1.utr5p2;Parent="
+    "gene2.t1\n"
+    "t\tanno\tCDS\t1610\t1640\t.\t-\t1\tID=gene2.t1.cds1;Parent=gene2.t1\n"
+    "t\tanno\tCDS\t1701\t1790\t.\t-\t1\tID=gene2.t1.cds2;Parent=gene2.t1\n"
+    "t\tanno\tCDS\t1851\t1879\t.\t-\t0\tID=gene2.t1.cds3;Parent=gene2.t1\n"
+    "t\tanno\tthree_prime_UTR\t1581\t1609\t.\t-\t.\tID=gene2.t1.utr3p1;Parent="
+    "gene2.t1\n";
 
 /** @brief Build the 2000-bp test genome described above (caller frees). */
 static char *test_genome(void) {
@@ -123,12 +129,14 @@ static char *test_genome(void) {
   block[500] = 0;
   char cds[151];
   memcpy(cds, "ATG", 3);
-  for (int c = 1; c < 49; c++) memcpy(cds + 3 * c, "GCC", 3);
+  for (int c = 1; c < 49; c++)
+    memcpy(cds + 3 * c, "GCC", 3);
   memcpy(cds + 147, "TAA", 3);
   int at = 0; /* spliced coordinate */
   for (int e = 0; e < 4; e++)
     for (int p = exons[e][0]; p < exons[e][1]; p++, at++)
-      if (p >= 121 && p < 391) block[p] = cds[at - 51];
+      if (p >= 121 && p < 391)
+        block[p] = cds[at - 51];
   for (int e = 0; e < 3; e++) {
     block[exons[e][1]] = 'G';
     block[exons[e][1] + 1] = 'T';
@@ -137,7 +145,8 @@ static char *test_genome(void) {
   }
   memset(genome, 'C', TEST_LENGTH);
   memcpy(genome, block, 500);
-  for (int p = 0; p < 500; p++) genome[TEST_LENGTH - 1 - p] = complement(block[p]);
+  for (int p = 0; p < 500; p++)
+    genome[TEST_LENGTH - 1 - p] = complement(block[p]);
   return genome;
 }
 
@@ -183,11 +192,13 @@ static char *gff_of_path(const AnnoSequence *s, const uint8_t *path) {
   return text;
 }
 
-/** @brief GFF -> labels -> GFF and GFF -> labels -> probabilities -> Viterbi -> GFF. */
+/** @brief GFF -> labels -> GFF and GFF -> labels -> probabilities -> Viterbi ->
+ * GFF. */
 static void test_round_trip(const AnnoSequence *s) {
   char *direct = gff_of_path(s, s->labels);
   CHECK(!strcmp(direct, test_gff));
-  if (strcmp(direct, test_gff)) fprintf(stderr, "got:\n%s", direct);
+  if (strcmp(direct, test_gff))
+    fprintf(stderr, "got:\n%s", direct);
   float *probability = xcalloc((size_t)s->length * ANNO_CLASSES, sizeof(float));
   for (int64_t i = 0; i < s->length; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
@@ -214,33 +225,41 @@ static void test_viterbi(void) {
   /* an "intron" signal: it may only be reached through a >= 6 bp exon */
   for (int i = 0; i < N; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] = j == (i >= 10 && i < 50 ? ANNO_PLUS_INTRON : 0) ? 0.9f : 0.0125f;
+      p[i * ANNO_CLASSES + j] =
+          j == (i >= 10 && i < 50 ? ANNO_PLUS_INTRON : 0) ? 0.9f : 0.0125f;
   CHECK(anno_decode(bases, N, p, path) == 0);
   CHECK(path[0] == ANNO_INTERGENIC && path[N - 1] == ANNO_INTERGENIC);
   for (int i = 1; i < N; i++)
     CHECK(!(path[i - 1] == ANNO_INTERGENIC && path[i] == ANNO_PLUS_INTRON) &&
           !(path[i - 1] == ANNO_PLUS_INTRON && path[i] == ANNO_INTERGENIC));
-  /* a 4-bp exon signal is widened to the 6-bp minimum (gain 4*6.68 > 8 + 2*6.68) */
+  /* a 4-bp exon signal is widened to the 6-bp minimum (gain 4*6.68 > 8 +
+   * 2*6.68) */
   for (int i = 0; i < N; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] = j == (i >= 20 && i < 24 ? ANNO_PLUS_EXON : 0) ? 0.99f : 0.00125f;
+      p[i * ANNO_CLASSES + j] =
+          j == (i >= 20 && i < 24 ? ANNO_PLUS_EXON : 0) ? 0.99f : 0.00125f;
   CHECK(anno_decode(bases, N, p, path) == 0);
   int exon = 0;
-  for (int i = 0; i < N; i++) exon += path[i] == ANNO_PLUS_EXON;
+  for (int i = 0; i < N; i++)
+    exon += path[i] == ANNO_PLUS_EXON;
   CHECK(exon == ANNO_MIN_EXON_LENGTH);
   /* 5'UTR followed directly by 3'UTR is not a valid transcript */
   for (int i = 0; i < N; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] =
-        j == (i >= 10 && i < 30 ? ANNO_PLUS_5UTR : i >= 30 && i < 50 ? ANNO_PLUS_3UTR : 0)
-        ? 0.9f : 0.0125f;
+      p[i * ANNO_CLASSES + j] = j == (i >= 10 && i < 30   ? ANNO_PLUS_5UTR
+                                      : i >= 30 && i < 50 ? ANNO_PLUS_3UTR
+                                                          : 0)
+                                    ? 0.9f
+                                    : 0.0125f;
   CHECK(anno_decode(bases, N, p, path) == 0);
   for (int i = 1; i < N; i++)
     CHECK(!(path[i - 1] == ANNO_PLUS_5UTR && path[i] == ANNO_PLUS_3UTR));
-  /* a strong 30-bp exon is decoded exactly (gain 30*log(0.99/0.00125) > penalty) */
+  /* a strong 30-bp exon is decoded exactly (gain 30*log(0.99/0.00125) >
+   * penalty) */
   for (int i = 0; i < N; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] = j == (i >= 20 && i < 50 ? ANNO_MINUS_EXON : 0) ? 0.99f : 0.00125f;
+      p[i * ANNO_CLASSES + j] =
+          j == (i >= 20 && i < 50 ? ANNO_MINUS_EXON : 0) ? 0.99f : 0.00125f;
   CHECK(anno_decode(bases, N, p, path) == 0);
   for (int i = 0; i < N; i++)
     CHECK(path[i] == (i >= 20 && i < 50 ? ANNO_MINUS_EXON : ANNO_INTERGENIC));
@@ -253,17 +272,20 @@ static void test_viterbi(void) {
 static void test_orf(void) {
   int64_t start = INT64_MAX, end = 0;
   /* frame 2: ATG AAA TAG -> [2,11) */
-  CHECK(longest_orf("CCATGAAATAGCC", 13, &start, &end) && start == 2 && end == 11);
+  CHECK(longest_orf("CCATGAAATAGCC", 13, &start, &end) && start == 2 &&
+        end == 11);
   start = INT64_MAX;
-  CHECK(longest_orf("ATGCCCCCCTGACC", 14, &start, &end) && start == 0 && end == 12);
+  CHECK(longest_orf("ATGCCCCCCTGACC", 14, &start, &end) && start == 0 &&
+        end == 12);
   start = INT64_MAX;
   CHECK(!longest_orf("ATGCCCCCC", 9, &start, &end)); /* no stop -> no ORF */
-  CHECK(!longest_orf("CCCTAA", 6, &start, &end));     /* no ATG -> no ORF */
+  CHECK(!longest_orf("CCCTAA", 6, &start, &end));    /* no ATG -> no ORF */
   CHECK(is_stop("TAA") && is_stop("TAG") && is_stop("TGA") && !is_stop("TGG"));
   /* exon run without ORF is not written */
   AnnoSequence s = {"x", "CCCCCCCCCCCCCCCCCCCC", 20, NULL};
   uint8_t path[20] = {0};
-  for (int i = 5; i < 15; i++) path[i] = ANNO_PLUS_EXON;
+  for (int i = 5; i < 15; i++)
+    path[i] = ANNO_PLUS_EXON;
   FILE *file = tmpfile();
   unsigned long genes = 0;
   CHECK(anno_write_gff(file, &s, path, &genes) == 0 && genes == 0);
@@ -274,17 +296,21 @@ static void test_orf(void) {
 /** @brief Softmax of extreme logits stays finite and normalised. */
 static void softmax_row(const float *logits, float *probability) {
   float top = logits[0], sum = 0.0f;
-  for (int j = 1; j < ANNO_CLASSES; j++) if (logits[j] > top) top = logits[j];
+  for (int j = 1; j < ANNO_CLASSES; j++)
+    if (logits[j] > top)
+      top = logits[j];
   for (int j = 0; j < ANNO_CLASSES; j++) {
     probability[j] = expf(logits[j] - top);
     sum += probability[j];
   }
-  for (int j = 0; j < ANNO_CLASSES; j++) probability[j] /= sum;
+  for (int j = 0; j < ANNO_CLASSES; j++)
+    probability[j] /= sum;
 }
 
 static void test_softmax(void) {
   float logits[ANNO_CLASSES], p[ANNO_CLASSES];
-  for (int j = 0; j < ANNO_CLASSES; j++) logits[j] = 1000.0f - (float)j;
+  for (int j = 0; j < ANNO_CLASSES; j++)
+    logits[j] = 1000.0f - (float)j;
   softmax_row(logits, p);
   double sum = 0.0, z = 0.0;
   for (int j = 0; j < ANNO_CLASSES; j++) {
@@ -294,7 +320,8 @@ static void test_softmax(void) {
   }
   CHECK(fabs(sum - 1.0) < 1e-6);
   CHECK(fabs(p[0] - 1.0 / z) < 1e-6 && fabs(p[1] - exp(-1.0) / z) < 1e-6);
-  for (int j = 0; j < ANNO_CLASSES; j++) logits[j] = -1e30f;
+  for (int j = 0; j < ANNO_CLASSES; j++)
+    logits[j] = -1e30f;
   softmax_row(logits, p);
   CHECK(fabs(p[3] - 1.0 / ANNO_CLASSES) < 1e-6);
 }
@@ -304,8 +331,10 @@ static void test_cwt(void) {
   enum { N = 3000 };
   char *bases = xcalloc(N + 1, 1), *reverse = xcalloc(N + 1, 1);
   uint64_t seed = 1;
-  for (int i = 0; i < N; i++) bases[i] = "ACGT"[random_below(&seed, 4)];
-  for (int i = 0; i < N; i++) reverse[i] = complement(bases[N - 1 - i]);
+  for (int i = 0; i < N; i++)
+    bases[i] = "ACGT"[random_below(&seed, 4)];
+  for (int i = 0; i < N; i++)
+    reverse[i] = complement(bases[N - 1 - i]);
   float *a = xcalloc((size_t)N * ANNO_CWT_CHANNELS * 2, sizeof(float));
   float *b = xcalloc((size_t)N * ANNO_CWT_CHANNELS * 2, sizeof(float));
   anno_cwt(bases, N, 0, N, a);
@@ -323,7 +352,8 @@ static void test_cwt(void) {
   float *power = test_sequence_power(&sequence);
   worst = 0.0;
   for (int i = 0; i < N * ANNO_CWT_CHANNELS; i++)
-    worst = fmax(worst, fabs(power[i] - (a[2 * i] * a[2 * i] + a[2 * i + 1] * a[2 * i + 1])));
+    worst = fmax(worst, fabs(power[i] - (a[2 * i] * a[2 * i] +
+                                         a[2 * i + 1] * a[2 * i + 1])));
   CHECK(worst < 1e-5);
   /* a constant (poly-A) signal far from the ends has ~zero response */
   memset(bases, 'A', N);
@@ -337,25 +367,32 @@ static void test_cwt(void) {
   free(reverse);
 }
 
-/** @brief cwt subcommand: plus rows, then minus rows of the reverse complement. */
+/** @brief cwt subcommand: plus rows, then minus rows of the reverse complement.
+ */
 static void test_cwt_command(const AnnoSequence *s) {
   run_cwt("test.fasta", "test-cwt", 2);
   FILE *index = fopen("test-cwt/contigs.tsv", "r");
   char line[256] = "";
-  CHECK(index && fgets(line, sizeof(line), index) && !strcmp(line, "# anno-cwt-v2\n"));
+  CHECK(index && fgets(line, sizeof(line), index) &&
+        !strcmp(line, "# anno-cwt-v2\n"));
   CHECK(fgets(line, sizeof(line), index) && !strcmp(line, "# scales\t4,5,6\n"));
-  if (index) fclose(index);
+  if (index)
+    fclose(index);
   FILE *matrix = fopen("test-cwt/matrix.bin", "rb");
   const size_t row = ANNO_CWT_CHANNELS * 2, n = (size_t)s->length;
   float *data = xcalloc(2 * n * row, sizeof(float));
-  CHECK(matrix && fread(data, sizeof(float), 2 * n * row, matrix) == 2 * n * row);
-  if (matrix) fclose(matrix);
+  CHECK(matrix &&
+        fread(data, sizeof(float), 2 * n * row, matrix) == 2 * n * row);
+  if (matrix)
+    fclose(matrix);
   char *reverse = xcalloc(n + 1, 1);
-  for (size_t i = 0; i < n; i++) reverse[i] = complement(s->bases[n - 1 - i]);
+  for (size_t i = 0; i < n; i++)
+    reverse[i] = complement(s->bases[n - 1 - i]);
   float *expected = xcalloc(n * row, sizeof(float));
   anno_cwt(reverse, s->length, 0, s->length, expected);
   double worst = 0.0;
-  for (size_t i = 0; i < n * row; i++) worst = fmax(worst, fabs(data[n * row + i] - expected[i]));
+  for (size_t i = 0; i < n * row; i++)
+    worst = fmax(worst, fabs(data[n * row + i] - expected[i]));
   CHECK(worst < 1e-4);
   free(reverse);
   free(expected);
@@ -365,22 +402,26 @@ static void test_cwt_command(const AnnoSequence *s) {
   remove("test-cwt");
 }
 
-
 /** @brief KANN model round trip and identical predictions. */
 static void test_model_file(void) {
-  UnetConfig config = {.depth = 2, .kernel = 9, .pool = 2, .channels = {32, 32}};
+  UnetConfig config = {
+      .depth = 2, .kernel = 9, .pool = 2, .channels = {32, 32}};
   Unet *unet = unet_create(&config), *loaded = NULL;
   const char *path = "test-model.ann";
   CHECK(unet_save(path, unet) == 0);
   CHECK(unet_load(path, &loaded) == 0 && loaded);
-  float input[100 * ANNO_INPUT_CHANNELS], p[100 * ANNO_CLASSES], q[100 * ANNO_CLASSES];
+  float input[100 * ANNO_INPUT_CHANNELS], p[100 * ANNO_CLASSES],
+      q[100 * ANNO_CLASSES];
   uint64_t seed = 3;
-  for (int i = 0; i < 100 * ANNO_INPUT_CHANNELS; i++) input[i] = test_random_unit(&seed);
-  CHECK(unet_predict(unet, input, 100, p) == 0 && unet_predict(loaded, input, 100, q) == 0);
+  for (int i = 0; i < 100 * ANNO_INPUT_CHANNELS; i++)
+    input[i] = test_random_unit(&seed);
+  CHECK(unet_predict(unet, input, 100, p) == 0 &&
+        unet_predict(loaded, input, 100, q) == 0);
   CHECK(!memcmp(p, q, sizeof(p)));
   for (int i = 0; i < 100; i++) {
     double sum = 0.0;
-    for (int j = 0; j < ANNO_CLASSES; j++) sum += p[i * ANNO_CLASSES + j];
+    for (int j = 0; j < ANNO_CLASSES; j++)
+      sum += p[i * ANNO_CLASSES + j];
     CHECK(fabs(sum - 1.0) < 1e-5);
   }
   remove(path);
@@ -388,13 +429,15 @@ static void test_model_file(void) {
   unet_destroy(loaded);
 }
 
-/** @brief Whether anno_read_labels() rejects an annotation (runs in a child). */
+/** @brief Whether anno_read_labels() rejects an annotation (runs in a child).
+ */
 static int labels_rejected(const char *fasta, const char *line) {
   write_text("test-bad.gff3", line);
   fflush(NULL);
   pid_t child = fork();
   if (!child) {
-    if (!freopen("/dev/null", "w", stderr)) _exit(2);
+    if (!freopen("/dev/null", "w", stderr))
+      _exit(2);
     int count = 0;
     AnnoSequence *sequences = anno_read_fasta(fasta, &count);
     anno_read_labels("test-bad.gff3", sequences, count);
@@ -428,7 +471,8 @@ static void test_pipeline(AnnoSequence *s) {
   int ok = 1;
   for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
     int tabs = 0;
-    for (char *c = line; *c; c++) tabs += *c == '\t';
+    for (char *c = line; *c; c++)
+      tabs += *c == '\t';
     ok &= tabs == 8;
   }
   CHECK(ok);

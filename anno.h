@@ -1,7 +1,7 @@
 /**
  * @file anno.h
- * @brief Public API of anno: CWT + KANN 1D convolution emissions, 9-state grammar
- *        Viterbi decoding, longest-ORF resolution and GFF3 output.
+ * @brief Public API of anno: CWT + local 1D convolution emissions, 9-state
+ * grammar Viterbi decoding, longest-ORF resolution and GFF3 output.
  *
  * Coordinates are 0-based half-open everywhere inside the program; GFF3
  * input and output use 1-based inclusive coordinates.
@@ -15,36 +15,37 @@
 
 /** @name Fixed sizes */
 /**@{*/
-#define ANNO_CLASSES 9            /**< UNet classes == decoded grammar states */
-#define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
-#define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
-#define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
-#define ANNO_UNET_WINDOW 16384    /**< UNet training / inference window      */
-#define ANNO_UNET_MARGIN 4096     /**< inference context discarded per side  */
-#define ANNO_MAX_DEPTH 6          /**< maximum number of UNet levels         */
+#define ANNO_CLASSES 9         /**< UNet classes == decoded grammar states */
+#define ANNO_CWT_CHANNELS 3    /**< Morlet CWT scales (power channels)    */
+#define ANNO_INPUT_CHANNELS 7  /**< A/C/G/T one-hot + CWT power           */
+#define ANNO_CWT_WINDOW 1024   /**< CWT block processed by one job        */
+#define ANNO_UNET_WINDOW 16384 /**< UNet training / inference window      */
+#define ANNO_MAX_DEPTH 6       /**< maximum number of UNet levels         */
 /**@}*/
 
 /** @name Grammar constants */
 /**@{*/
 #define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
-#define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp)            */
+#define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp) */
 #define ANNO_EMISSION_EPSILON 1e-6f
-#define ANNO_TRANSCRIPT_PENALTY 5.0 /**< log penalty for opening a transcript */
+#define ANNO_TRANSCRIPT_PENALTY 5.0 /**< log penalty for opening a transcript  \
+                                     */
 /**@}*/
 
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS 16
-#define ANNO_LEARNING_RATE 1e-2f
-#define ANNO_EPSILON 1e-5f
+#define ANNO_BATCH_WINDOWS 16 /**< fixed batch for bounded runtime memory use  \
+                               */
+#define ANNO_LEARNING_RATE 1e-2f /**< Default optimizer learning rate. */
+#define ANNO_EPSILON 1e-5f       /**< Stabilizes the Soft F1 calculation. */
 /**@}*/
 
 /** UNet output classes; each class is also one decoded grammar state. */
 typedef enum {
   ANNO_INTERGENIC = 0,
   ANNO_PLUS_5UTR = 1,
-  ANNO_PLUS_EXON = 2,  /**< coding part of a plus-strand exon  */
+  ANNO_PLUS_EXON = 2, /**< coding part of a plus-strand exon  */
   ANNO_PLUS_INTRON = 3,
   ANNO_PLUS_3UTR = 4,
   ANNO_MINUS_5UTR = 5,
@@ -55,10 +56,10 @@ typedef enum {
 
 /** Shape of the 1D UNet. */
 typedef struct {
-  int depth;                       /**< number of resolution levels       */
-  int kernel;                      /**< odd convolution width             */
-  int pool;                        /**< average-pool / upsample factor    */
-  int channels[ANNO_MAX_DEPTH];    /**< feature channels per level        */
+  int depth;                    /**< number of resolution levels       */
+  int kernel;                   /**< odd convolution width             */
+  int pool;                     /**< average-pool / upsample factor    */
+  int channels[ANNO_MAX_DEPTH]; /**< feature channels per level        */
 } UnetConfig;
 
 /** 1D UNet with its input normalisation; opaque. */
@@ -66,19 +67,19 @@ typedef struct Unet Unet;
 
 /** One sequence record. The struct owns every pointer it holds. */
 typedef struct {
-  char *name;       /**< FASTA ID                                     */
-  char *bases;      /**< upper-case bases, NUL terminated             */
-  int64_t length;   /**< number of bases                              */
-  uint8_t *labels;  /**< per-base AnnoClass (training only) or NULL   */
+  char *name;      /**< FASTA ID                                     */
+  char *bases;     /**< upper-case bases, NUL terminated             */
+  int64_t length;  /**< number of bases                              */
+  uint8_t *labels; /**< per-base AnnoClass (training only) or NULL   */
 } AnnoSequence;
 
 /**
- * @brief Return the default KANN convolution configuration.
+ * @brief Return the default convolution configuration.
  * @return Default model configuration.
  */
 UnetConfig unet_default_config(void);
 /**
- * @brief Create a KANN-backed model.
+ * @brief Create a neural-network model.
  * @param config Model configuration; must not be NULL.
  * @return New model, or NULL when config is invalid or allocation fails.
  */
@@ -99,15 +100,22 @@ void unet_destroy(Unet *unet);
  */
 int unet_predict(const Unet *unet, const float *input, int64_t length,
                  float *probability);
+/** Evaluate channel-major input ([channel][ANNO_UNET_WINDOW]). */
+int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
+                          float *probability);
+/** Train one bounded channel-major batch using masked Soft F1 loss. */
+int unet_train_batch(Unet *unet, const float *input, const float *truth,
+                     const float *mask, size_t batch, float learning_rate,
+                     float *loss);
 /**
- * @brief Read a KANN model.
+ * @brief Read a neural-network model.
  * @param path Model file path.
  * @param out Receives the loaded model.
  * @return 0 on success, or an errno value otherwise.
  */
 int unet_load(const char *path, Unet **out);
 /**
- * @brief Write a KANN model.
+ * @brief Write a neural-network model.
  * @param path Model file path.
  * @param unet Model to write.
  * @return 0 on success, or an errno value otherwise.
