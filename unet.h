@@ -30,6 +30,14 @@ Unet *unet_create(const UnetConfig *config);
  * @param unet Model to release; NULL is accepted.
  */
 void unet_destroy(Unet *unet);
+/**
+ * @brief Evaluate interleaved input features.
+ * @param unet Model to evaluate.
+ * @param input Interleaved input [position][channel].
+ * @param length Number of input positions.
+ * @param probability Length x ANNO_CLASSES output probabilities.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_predict(const Unet *unet, const float *input, int64_t length,
                  float *probability);
 /**
@@ -43,7 +51,7 @@ int unet_predict(const Unet *unet, const float *input, int64_t length,
 int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
                           float *probability);
 /**
- * @brief Train one bounded batch using the historical Soft F1 objective.
+ * @brief Train one bounded batch using the masked Soft F1 objective.
  *
  * The objective is the mean per-class Soft F1 loss, evaluated only at
  * positions enabled by mask.
@@ -59,7 +67,19 @@ int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
 int unet_train_batch(Unet *unet, const float *input, const float *truth,
                      const float *mask, size_t batch, float learning_rate,
                      float *loss);
+/**
+ * @brief Write a UNet model to a binary file.
+ * @param path Model file path.
+ * @param unet Model to write.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_save(const char *path, const Unet *unet);
+/**
+ * @brief Read a UNet model from a binary file.
+ * @param path Model file path.
+ * @param out Receives the loaded model.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_load(const char *path, Unet **out);
 
 #ifdef __cplusplus

@@ -59,6 +59,11 @@ struct Unet {
   Layer layer[MAX_LAYERS];
 };
 
+/**
+ * @brief Validate a UNet configuration.
+ * @param c Configuration to validate.
+ * @return Nonzero when the configuration is valid, otherwise zero.
+ */
 static int good_config(const UnetConfig *c) {
   if (!c || c->depth < MIN_DIMENSION || c->depth > ANNO_MAX_DEPTH ||
       c->kernel < MIN_DIMENSION || !(c->kernel & MIN_DIMENSION) ||
@@ -70,6 +75,10 @@ static int good_config(const UnetConfig *c) {
   return 1;
 }
 
+/**
+ * @brief Return the default UNet configuration.
+ * @return Default model configuration.
+ */
 UnetConfig unet_default_config(void) {
   return (UnetConfig){INITIAL_DEPTH,
                       INITIAL_KERNEL,
@@ -78,6 +87,11 @@ UnetConfig unet_default_config(void) {
                        INITIAL_CHANNEL_3}};
 }
 
+/**
+ * @brief Release all memory owned by a UNet.
+ * @param u Model to release; NULL is accepted.
+ * @return None.
+ */
 static void release(Unet *u) {
   if (!u)
     return;
@@ -88,6 +102,15 @@ static void release(Unet *u) {
   free(u);
 }
 
+/**
+ * @brief Append and initialize a convolution layer.
+ * @param u Model receiving the layer.
+ * @param in Number of input channels.
+ * @param out Number of output channels.
+ * @param k Convolution kernel width.
+ * @param seed Mutable random-number generator state.
+ * @return Nonzero on success, otherwise zero on allocation failure.
+ */
 static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   Layer *l = &u->layer[u->nlayer++];
   l->in = in;
@@ -103,6 +126,11 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   return 1;
 }
 
+/**
+ * @brief Create and initialize a UNet model.
+ * @param c Model configuration.
+ * @return Newly allocated model, or NULL for invalid input or allocation failure.
+ */
 Unet *unet_create(const UnetConfig *c) {
   if (!good_config(c))
     return NULL;
@@ -136,8 +164,22 @@ Unet *unet_create(const UnetConfig *c) {
   return u;
 }
 
+/**
+ * @brief Destroy a UNet model.
+ * @param u Model to destroy; NULL is accepted.
+ * @return None.
+ */
 void unet_destroy(Unet *u) { release(u); }
 
+/**
+ * @brief Apply one convolution layer.
+ * @param l Layer parameters.
+ * @param x Channel-major input activation.
+ * @param y Channel-major output activation.
+ * @param n Number of positions.
+ * @param relu Whether to apply ReLU to the output.
+ * @return None.
+ */
 static void conv(const Layer *l, const float *x, float *y, int n, int relu) {
   int r = l->k / 2;
 #pragma omp parallel for collapse(2)
@@ -154,6 +196,16 @@ static void conv(const Layer *l, const float *x, float *y, int n, int relu) {
       y[(size_t)o * n + p] = relu && v < 0 ? 0 : v;
     }
 }
+
+/**
+ * @brief Apply average pooling to a channel-major tensor.
+ * @param x Channel-major input tensor.
+ * @param y Channel-major output tensor.
+ * @param c Number of channels.
+ * @param n Number of input positions.
+ * @param f Pooling factor.
+ * @return None.
+ */
 static void pool(const float *x, float *y, int c, int n, int f) {
 #pragma omp parallel for collapse(2)
   for (int ch = 0; ch < c; ++ch)
@@ -164,6 +216,16 @@ static void pool(const float *x, float *y, int c, int n, int f) {
       y[(size_t)ch * (n / f) + p] = s / f;
     }
 }
+
+/**
+ * @brief Expand each position by repeating it.
+ * @param x Channel-major input tensor.
+ * @param y Channel-major output tensor.
+ * @param c Number of channels.
+ * @param n Number of input positions.
+ * @param f Upsampling factor.
+ * @return None.
+ */
 static void upsample(const float *x, float *y, int c, int n, int f) {
 #pragma omp parallel for collapse(2)
   for (int ch = 0; ch < c; ++ch)
@@ -182,6 +244,11 @@ typedef struct {
   int n_op;
 } Workspace;
 
+/**
+ * @brief Free all tensors and operation metadata in a workspace.
+ * @param a Workspace to clear.
+ * @return None.
+ */
 static void workspace_free(Workspace *a) {
   for (int i = 0; i < a->count; ++i) {
     free(a->a[i]);
@@ -192,6 +259,13 @@ static void workspace_free(Workspace *a) {
   memset(a, 0, sizeof(*a));
 }
 
+/**
+ * @brief Allocate one activation and gradient tensor pair.
+ * @param a Workspace receiving the tensors.
+ * @param c Number of channels.
+ * @param n Number of positions.
+ * @return Nonzero on success, otherwise zero on allocation failure.
+ */
 static int workspace_add(Workspace *a, int c, int n) {
   int i = a->count++;
   size_t z = (size_t)c * n;
@@ -201,6 +275,18 @@ static int workspace_add(Workspace *a, int c, int n) {
   a->d[i] = (float *)calloc(z, sizeof(float));
   return a->a[i] && a->d[i];
 }
+
+/**
+ * @brief Record one forward operation for backpropagation.
+ * @param a Workspace receiving the operation.
+ * @param type Operation kind.
+ * @param layer Associated convolution layer, or NO_LAYER.
+ * @param in Input workspace index.
+ * @param out Output workspace index.
+ * @param aux Operation-specific parameter.
+ * @param skip Skip-connection workspace index, or NO_SKIP.
+ * @return None.
+ */
 static void record(Workspace *a, int type, int layer, int in, int out, int aux,
                    int skip) {
   a->op[a->n_op].type = type;
@@ -211,6 +297,16 @@ static void record(Workspace *a, int type, int layer, int in, int out, int aux,
   a->op[a->n_op].skip = skip;
   ++a->n_op;
 }
+
+/**
+ * @brief Run the UNet forward pass and softmax output.
+ * @param u Model to evaluate.
+ * @param x Channel-major input tensor.
+ * @param len Number of valid input positions.
+ * @param a Workspace used by the pass.
+ * @param prob Position-major class probabilities.
+ * @return 0 on success, or ENOMEM on allocation failure.
+ */
 static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
                        float *prob) {
   int n = ANNO_UNET_WINDOW, ai = 0, li = 0;
@@ -298,6 +394,15 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
   }
   return 0;
 }
+
+/**
+ * @brief Evaluate channel-major input features.
+ * @param u Model to evaluate.
+ * @param x Channel-major input [channel][position].
+ * @param n Number of input positions.
+ * @param p Position-major output probabilities.
+ * @return 0 on success, or an errno value otherwise.
+ */
 int unet_predict_channels(const Unet *u, const float *x, int64_t n, float *p) {
   if (!u || !x || !p || n < 1 || n > ANNO_UNET_WINDOW)
     return EINVAL;
@@ -334,15 +439,15 @@ int unet_predict(const Unet *u, const float *in, int64_t n, float *p) {
 
 /**
  * @brief Backpropagate through one convolution layer.
- *
- * @param layer Layer parameters.
- * @param input Layer input activation.
- * @param gradient Layer output gradient.
- * @param input_gradient Destination input gradient.
- * @param length Activation length.
+ * @param l Layer parameters.
+ * @param x Layer input activation.
+ * @param y Layer output gradient.
+ * @param dx Destination input gradient.
+ * @param n Activation length.
  * @param relu Whether the output used ReLU.
- * @param weight_gradient Destination weight gradient.
- * @param bias_gradient Destination bias gradient.
+ * @param gw Destination weight gradient.
+ * @param gb Destination bias gradient.
+ * @return None.
  */
 static void backward_layer(const Layer *l, const float *x, const float *y,
                            float *dx, int n, int relu, float *gw, float *gb) {
@@ -378,10 +483,15 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
   }
 }
 /**
- * @brief Train one batch using the historical Soft F1 objective.
- *
- * This is the objective used by the former KANN implementation:
- * `mean(class_soft_f1_loss)`.
+ * @brief Train one batch using the masked Soft F1 objective.
+ * @param u Model to update.
+ * @param x Channel-major input batch.
+ * @param y Channel-major one-hot target batch.
+ * @param m Position mask batch.
+ * @param batch Number of batch elements.
+ * @param lr Gradient-descent learning rate.
+ * @param loss Receives the mean loss; may be NULL.
+ * @return 0 on success, or an errno value otherwise.
  */
 int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
                      size_t batch, float lr, float *loss) {
@@ -554,7 +664,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
   return 0;
 }
 /**
- * @brief Write a neural-network model.
+ * @brief Write a UNet model to a binary file.
  * @param path Model file path.
  * @param u Model to write.
  * @return 0 on success, or an errno value otherwise.
@@ -577,7 +687,7 @@ int unet_save(const char *path, const Unet *u) {
 }
 
 /**
- * @brief Read a neural-network model.
+ * @brief Read a UNet model from a binary file.
  * @param path Model file path.
  * @param out Receives the loaded model.
  * @return 0 on success, or an errno value otherwise.
