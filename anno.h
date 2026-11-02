@@ -43,7 +43,7 @@
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
 #define ANNO_BATCH_WINDOWS                                                     \
-  16 /**< fixed batch for bounded runtime memory use                           \
+  128 /**< fixed batch for bounded runtime memory use                           \
       */
 #define ANNO_LEARNING_RATE 1e-2f /**< Default optimizer learning rate. */
 #define ANNO_EPSILON 1e-5f       /**< Stabilizes the Soft F1 calculation. */
