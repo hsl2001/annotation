@@ -48,7 +48,8 @@ Arr = NDArray[Any]
 
 PLOT_NAMES: tuple[str, ...] = (
     "exons", "introns", "exons-mutated", "exon-kmer", "control", "control-aggt",
-    "control-aggt-p1", "first-exons", "last-exons", "control-no-repeat",
+    "control-aggt-p1", "single-exons", "first-exons", "last-exons", "first-last-exons",
+    "control-no-repeat",
     "control-aggt-no-repeat", "control-aggt-p1-no-repeat", "control-gtag", "control-gtag-no-repeat",
 )
 PLOT_CHOICES: tuple[str, ...] = ("all", *PLOT_NAMES)
@@ -653,7 +654,8 @@ class GenomeData:
             raise ValueError("No exon features found; CDS is not silently substituted for exon")
 
         sites: dict[str, set[int]] = defaultdict(set)
-        first_exons, last_exons, multi_exons, introns = set(), set(), set(), set()
+        single_exons, first_exons, last_exons = set(), set(), set()
+        first_last_start, first_last_end, multi_exons, introns = set(), set(), set(), set()
         kmer_bounds: dict[Interval, tuple[int, int]] = {}
         for raw_exons in tx_exons.values():
             exons = sorted(set(raw_exons), key=lambda x: (x[1], x[2]))
@@ -670,7 +672,10 @@ class GenomeData:
             first_exons.update(x for x in exons if (x[1] if plus else x[2]) == f_pos)
             last_exons.update(x for x in exons if (x[2] if plus else x[1]) == l_pos)
             if len(exons) < 2:
+                single_exons.update(exons)
                 continue
+            first_last_start.update(x for x in exons if (x[1] if plus else x[2]) == f_pos)
+            first_last_end.update(x for x in exons if (x[2] if plus else x[1]) == l_pos)
             multi_exons.update(exons)
             ordered_tx = exons if plus else exons[::-1]
             bounds_tx = [c.bounds(x[1], x[2], strand) for x in ordered_tx]
@@ -690,8 +695,11 @@ class GenomeData:
                 "exons": sort_intervals(intervals),
                 "introns": sort_intervals(introns),
                 "multi-exons": sort_intervals(multi_exons),
+                "single-exons": sort_intervals(single_exons),
                 "first-exons": sort_intervals(first_exons),
                 "last-exons": sort_intervals(last_exons),
+                "first-last-start": sort_intervals(first_last_start),
+                "first-last-end": sort_intervals(first_last_end),
             },
             kmer_bounds,
             bool(rep_spans),
@@ -994,11 +1002,14 @@ class CwtPlotter:
             kmer_cache = cwt.kmer_maxima(multi_exons, genome.sequences, multi_agg[1], genome.kmer_bounds)
         abs_tasks: list[Any] = []
 
-        def queue_abs(agg: tuple[Arr, Arr], n_iv: int, out: Path) -> None:
+        def queue_abs(
+            agg: tuple[Arr, Arr], n_iv: int, out: Path,
+            boundary_indices: Sequence[int] = range(len(BOUNDARIES)),
+        ) -> None:
             img = np.log1p(agg[0])
             abs_tasks.extend(
                 (b, np.ascontiguousarray(img[:, i]), np.ascontiguousarray(agg[1][i]), cwt.widths, cwt.parameter, n_iv, out)
-                for i, b in enumerate(BOUNDARIES)
+                for i, b in enumerate(BOUNDARIES) if i in boundary_indices
             )
 
         for name in names:
@@ -1006,6 +1017,13 @@ class CwtPlotter:
             if name == "exon-kmer":
                 assert kmer_cache is not None
                 cls.render_exon_kmer(kmer_cache[0], kmer_cache[1], kmer_cache[2], out_dir)
+            elif name == "first-last-exons":
+                first = genome.exon_sets["first-last-start"]
+                last = genome.exon_sets["first-last-end"]
+                if not first or not last:
+                    raise ValueError("No multi-exon features found for first-last-exons")
+                queue_abs(cwt.aggregate_boundaries(first, args.rows), len(first), out_dir, (0,))
+                queue_abs(cwt.aggregate_boundaries(last, args.rows), len(last), out_dir, (1,))
             else:
                 group = name.removesuffix("-mutated")
                 base_group, repeat_free = group.removesuffix("-no-repeat"), group.endswith("-no-repeat")

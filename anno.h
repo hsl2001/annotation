@@ -38,7 +38,6 @@
 #define ANNO_BATCH_WINDOWS 16
 #define ANNO_LEARNING_RATE 1e-2f
 #define ANNO_EPSILON 1e-5f
-#define ANNO_GRADIENT_CLIP 5.0f
 /**@}*/
 
 /** UNet output classes; each class is also one decoded grammar state. */

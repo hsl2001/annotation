@@ -125,6 +125,17 @@ KAD_FUNC_OP1(kad_tanh, 7)
 KAD_FUNC_OP1(kad_relu, 8)
 KAD_FUNC_OP1(kad_1minus, 11)
 KAD_FUNC_OP1(kad_softmax, 14)
+kad_node_t *kad_softmax_axis(kad_node_t *x, int axis)
+{
+	kad_node_t *s;
+	int32_t *aux = (int32_t*)malloc(sizeof(*aux));
+	if (!aux) return 0;
+	*aux = axis;
+	s = kad_new_core(0, 38, 1);
+	s->child[0] = x;
+	s->ptr = aux, s->ptr_size = sizeof(*aux);
+	return kad_finalize_node(s);
+}
 KAD_FUNC_OP1(kad_stdnorm, 32)
 
 kad_node_t *kad_ce_multi_weighted(kad_node_t *pred, kad_node_t *truth, kad_node_t *weight)
@@ -1821,6 +1832,52 @@ int kad_op_softmax(kad_node_t *p, int action)
 	return 0;
 }
 
+int kad_op_softmax_axis(kad_node_t *p, int action)
+{
+	kad_node_t *q = p->child[0];
+	int axis = *(int32_t*)p->ptr;
+	int outer = 1, inner = 1, width;
+	for (int i = 0; i < axis; i++) outer *= q->d[i];
+	width = q->d[axis];
+	for (int i = axis + 1; i < q->n_d; i++) inner *= q->d[i];
+	if (action == KAD_SYNC_DIM) {
+		p->n_d = q->n_d;
+		for (int i = 0; i < q->n_d; i++) p->d[i] = q->d[i];
+	} else if (action == KAD_FORWARD) {
+		for (int o = 0; o < outer; o++) {
+			for (int k = 0; k < inner; k++) {
+				float maximum = -FLT_MAX, sum = 0.0f;
+				for (int j = 0; j < width; j++) {
+					float value = q->x[(o * width + j) * inner + k];
+					if (value > maximum) maximum = value;
+				}
+				for (int j = 0; j < width; j++) {
+					float value = expf(q->x[(o * width + j) * inner + k] -
+					                  maximum);
+					p->x[(o * width + j) * inner + k] = value;
+					sum += value;
+				}
+				for (int j = 0; j < width; j++)
+					p->x[(o * width + j) * inner + k] /= sum;
+			}
+		}
+	} else if (action == KAD_BACKWARD && kad_is_back(q)) {
+		for (int o = 0; o < outer; o++) {
+			for (int k = 0; k < inner; k++) {
+				float dot = 0.0f;
+				for (int j = 0; j < width; j++)
+					dot += p->g[(o * width + j) * inner + k] *
+					       p->x[(o * width + j) * inner + k];
+				for (int j = 0; j < width; j++) {
+					int index = (o * width + j) * inner + k;
+					q->g[index] += p->x[index] * (p->g[index] - dot);
+				}
+			}
+		}
+	}
+	return 0;
+}
+
 /********** Multi-node pooling **********/
 
 int kad_op_avg(kad_node_t *p, int action)
@@ -2395,14 +2452,15 @@ kad_op_f kad_op_list[KAD_MAX_OP] = {
 	kad_op_sin,        /* 34: sin() */
 	kad_op_stack,      /* 35: tf.stack, but on the first axis only */
 	kad_op_reverse,     /* 36: tf.reverse, but on one axis only */
-	kad_op_upsample1d   /* 37: nearest-neighbor 1D upsampling */
+	kad_op_upsample1d,  /* 37: nearest-neighbor 1D upsampling */
+	kad_op_softmax_axis /* 38: axis-selectable softmax */
 };
 
 char *kad_op_name[KAD_MAX_OP] = {
 	0, "add", "mul", "cmul", "ce_bin_neg", "square", "sigm", "tanh", "relu", "matmul", "avg", "1minus", "select", "ce_multi", "softmax",
 	"dropout", "conv2d", "max2d", "conv1d", "max1d", "slice", "max", "ce_bin", "sub", "sample_normal", "reduce_sum", "reduce_mean", "log",
 	"avg1d", "mse", "reshape", "concat", "stdnorm", "exp", "sin", "stack",
-	"reverse", "upsample1d"
+	"reverse", "upsample1d", "softmax_axis"
 };
 
 /**************************

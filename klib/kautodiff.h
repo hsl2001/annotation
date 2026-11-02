@@ -178,6 +178,7 @@ kad_node_t *kad_sigm(kad_node_t *x);   /* f(x) = 1/(1+exp(-x))               (el
 kad_node_t *kad_tanh(kad_node_t *x);   /* f(x) = (1-exp(-2x)) / (1+exp(-2x)) (element-wise tanh) */
 kad_node_t *kad_relu(kad_node_t *x);   /* f(x) = max{0,x}                    (element-wise rectifier, aka ReLU) */
 kad_node_t *kad_softmax(kad_node_t *x);/* f_i(x_1,...,x_n) = exp(x_i) / \sum_j exp(x_j) (softmax: tf.nn.softmax(x,dim=-1)) */
+kad_node_t *kad_softmax_axis(kad_node_t *x, int axis);
 kad_node_t *kad_1minus(kad_node_t *x); /* f(x) = 1 - x */
 kad_node_t *kad_exp(kad_node_t *x);    /* f(x) = exp(x) */
 kad_node_t *kad_log(kad_node_t *x);    /* f(x) = log(x) */

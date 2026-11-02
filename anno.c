@@ -757,21 +757,19 @@ static kann_t *kann_unet(const UnetConfig *config) {
   mask->ext_label = 1;
   kad_node_t *minus_one = kann_new_scalar(KAD_CONST, -1.0f);
   kad_node_t *epsilon = kann_new_scalar(KAD_CONST, ANNO_EPSILON);
-  kad_node_t *exp_logits = kad_exp(x);
-  kad_node_t *normalizer = kad_reduce_sum(exp_logits, 1);
-  kad_node_t *inverse = kad_exp(kad_mul(kad_log(normalizer), minus_one));
+  kad_node_t *probabilities = kad_softmax_axis(x, 1);
   kad_node_t *loss[ANNO_CLASSES];
-  if (!exp_logits || !normalizer || !inverse || !epsilon)
+  kad_node_t *cross_entropy[ANNO_CLASSES];
+  if (!probabilities || !epsilon)
     fail("invalid Soft F1 probability graph");
   for (int j = 0; j < ANNO_CLASSES; j++) {
-    kad_node_t *p_exp = kad_slice(exp_logits, 1, j, j + 1);
-    kad_node_t *p = kad_mul(p_exp, inverse);
+    kad_node_t *p = kad_slice(probabilities, 1, j, j + 1);
     kad_node_t *y = kad_slice(truth, 1, j, j + 1);
-    p = kad_mul(p, mask);
-    y = kad_mul(y, mask);
-    kad_node_t *intersection = kad_reduce_sum(kad_mul(p, y), 2);
-    kad_node_t *sum_p = kad_reduce_sum(p, 2);
-    kad_node_t *sum_y = kad_reduce_sum(y, 2);
+    kad_node_t *masked_p = kad_mul(p, mask);
+    kad_node_t *masked_y = kad_mul(y, mask);
+    kad_node_t *intersection = kad_reduce_sum(kad_mul(masked_p, masked_y), 2);
+    kad_node_t *sum_p = kad_reduce_sum(masked_p, 2);
+    kad_node_t *sum_y = kad_reduce_sum(masked_y, 2);
     kad_node_t *numerator = kad_add(kad_mul(intersection,
                                              kann_new_scalar(KAD_CONST, 2.0f)),
                                     epsilon);
@@ -780,14 +778,19 @@ static kann_t *kann_unet(const UnetConfig *config) {
                                kad_exp(kad_mul(kad_log(denominator),
                                                minus_one)));
     kad_node_t *class_loss = kad_1minus(dice);
-    if (!p_exp || !p || !y || !intersection || !sum_p || !sum_y || !numerator ||
+    cross_entropy[j] = kad_ce_bin(masked_p, masked_y);
+    if (!p || !y || !masked_p || !masked_y || !intersection || !sum_p || !sum_y ||
+        !cross_entropy[j] || !numerator ||
         !denominator || !dice || !class_loss)
       fail("invalid Soft F1 loss graph");
     class_loss = kad_reduce_mean(class_loss, 0);
     loss[j] = kad_reduce_mean(class_loss, 0);
     if (!loss[j]) fail("invalid Soft F1 reduction");
   }
-  kad_node_t *cost = kad_avg(ANNO_CLASSES, loss);
+  kad_node_t *dice_cost = kad_avg(ANNO_CLASSES, loss);
+  kad_node_t *ce_cost = kad_avg(ANNO_CLASSES, cross_entropy);
+  kad_node_t *cost = kad_add(dice_cost,
+                             kad_mul(kann_new_scalar(KAD_CONST, 0.2f), ce_cost));
   cost->ext_flag |= KANN_F_COST;
   kann_t *ann = kann_new(cost, 0);
   kann_set_batch_size(ann, 1);
@@ -977,6 +980,15 @@ typedef struct {
   int64_t valid;
 } TrainingWindow;
 
+static uint64_t training_random_next(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  *state = value;
+  return value * UINT64_C(2685821657736338717);
+}
+
 typedef struct {
   const TrainingWindow *windows;
   size_t batch_start;
@@ -1030,10 +1042,32 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
     total_windows += (size_t)((sequences[i].length + KANN_LENGTH - 1) /
                               KANN_LENGTH);
   if (!total_windows) fail("no training windows");
+  TrainingWindow *all_windows = xcalloc(total_windows, sizeof(*all_windows));
   TrainingWindow *batch_windows =
     xcalloc(ANNO_BATCH_WINDOWS, sizeof(*batch_windows));
+  size_t all_index = 0;
+  for (int sequence = 0; sequence < count; sequence++) {
+    int64_t sequence_windows =
+      (sequences[sequence].length + KANN_LENGTH - 1) / KANN_LENGTH;
+    for (int64_t window = 0; window < sequence_windows; window++) {
+      int64_t start = window * KANN_LENGTH;
+      int64_t valid = sequences[sequence].length - start;
+      if (valid > KANN_LENGTH) valid = KANN_LENGTH;
+      all_windows[all_index++] =
+        (TrainingWindow){&sequences[sequence], start, valid};
+    }
+  }
+  uint64_t shuffle_state = UINT64_C(0x9e3779b97f4a7c15);
   double started = now_seconds();
   for (int iteration = 0; iteration < iterations; iteration++) {
+    for (size_t i = total_windows; i > 1; i--) {
+      size_t j = (size_t)(training_random_next(&shuffle_state) % i);
+      TrainingWindow swap = all_windows[i - 1];
+      all_windows[i - 1] = all_windows[j];
+      all_windows[j] = swap;
+    }
+    double epoch_loss = 0.0;
+    size_t epoch_batches = 0;
     for (size_t batch_start = 0; batch_start < total_windows;
          batch_start += ANNO_BATCH_WINDOWS) {
       size_t batch_end = batch_start + ANNO_BATCH_WINDOWS;
@@ -1043,22 +1077,9 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
       memset(y, 0, (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES *
              KANN_LENGTH * sizeof(float));
       memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * KANN_LENGTH * sizeof(float));
-      size_t cursor = 0;
-      size_t skipped = 0;
-      for (int sequence = 0; sequence < count; sequence++) {
-        int64_t sequence_windows =
-          (sequences[sequence].length + KANN_LENGTH - 1) / KANN_LENGTH;
-        for (int64_t window = 0; window < sequence_windows; window++) {
-          if (skipped++ < batch_start) continue;
-          if (cursor == batch_end - batch_start) break;
-          int64_t start = window * KANN_LENGTH;
-          int64_t valid = sequences[sequence].length - start;
-          if (valid > KANN_LENGTH) valid = KANN_LENGTH;
-          batch_windows[cursor++] =
-            (TrainingWindow){&sequences[sequence], start, valid};
-        }
-        if (cursor == batch_end - batch_start) break;
-      }
+      size_t batch_size = batch_end - batch_start;
+      memcpy(batch_windows, all_windows + batch_start,
+             batch_size * sizeof(*batch_windows));
       TrainingBatchJob batch = {
         batch_windows, 0, x, y, mask,
         (iteration + (int)(batch_start / ANNO_BATCH_WINDOWS)) & 1
@@ -1070,18 +1091,20 @@ static Unet *train_unet(const AnnoSequence *sequences, int count, int iterations
       kann_feed_bind(unet->ann, KANN_F_TRUTH, 1, &mask);
       kann_set_batch_size(unet->ann, (int)(batch_end - batch_start));
       float loss = kann_cost(unet->ann, 0, 1);
-      kann_grad_clip(ANNO_GRADIENT_CLIP, nvar, unet->ann->g);
       kann_RMSprop(nvar, ANNO_LEARNING_RATE, NULL, 0.9f, unet->ann->g,
                    unet->ann->x, r);
       if (!isfinite(loss)) fail("non-finite KANN loss");
-      if (batch_end == total_windows &&
-          (iteration == 0 || iteration + 1 == iterations ||
-           (iteration + 1) % 10 == 0))
-        say("iteration %d/%d loss %.4f %.1fs", iteration + 1, iterations, loss,
-            now_seconds() - started);
+      epoch_loss += loss;
+      epoch_batches++;
     }
+    if (iteration == 0 || iteration + 1 == iterations ||
+        (iteration + 1) % 10 == 0)
+      say("iteration %d/%d loss %.4f batches %zu %.1fs",
+          iteration + 1, iterations, epoch_loss / (double)epoch_batches,
+          epoch_batches, now_seconds() - started);
   }
   kann_mt(unet->ann, 0, 0);
+  free(all_windows);
   free(batch_windows);
   free(x); free(y); free(mask); free(r);
   return unet;
