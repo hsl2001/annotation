@@ -368,42 +368,6 @@ static void test_cwt(void) {
   free(reverse);
 }
 
-/** @brief cwt subcommand: plus rows, then minus rows of the reverse complement.
- */
-static void test_cwt_command(const AnnoSequence *s) {
-  run_cwt("test.fasta", "test-cwt", 2);
-  FILE *index = fopen("test-cwt/contigs.tsv", "r");
-  char line[256] = "";
-  CHECK(index && fgets(line, sizeof(line), index) &&
-        !strcmp(line, "# anno-cwt-v2\n"));
-  CHECK(fgets(line, sizeof(line), index) && !strcmp(line, "# scales\t4,5,6\n"));
-  if (index)
-    fclose(index);
-  FILE *matrix = fopen("test-cwt/matrix.bin", "rb");
-  const size_t row = ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
-               n = (size_t)s->length;
-  float *data = xcalloc(ANNO_STRANDS * n * row, sizeof(float));
-  CHECK(matrix && fread(data, sizeof(float), ANNO_STRANDS * n * row, matrix) ==
-                      ANNO_STRANDS * n * row);
-  if (matrix)
-    fclose(matrix);
-  char *reverse = xcalloc(n + 1, 1);
-  for (size_t i = 0; i < n; i++)
-    reverse[i] = complement(s->bases[n - 1 - i]);
-  float *expected = xcalloc(n * row, sizeof(float));
-  anno_cwt(reverse, s->length, 0, s->length, expected);
-  double worst = 0.0;
-  for (size_t i = 0; i < n * row; i++)
-    worst = fmax(worst, fabs(data[n * row + i] - expected[i]));
-  CHECK(worst < 1e-4);
-  free(reverse);
-  free(expected);
-  free(data);
-  remove("test-cwt/contigs.tsv");
-  remove("test-cwt/matrix.bin");
-  remove("test-cwt");
-}
-
 /** @brief KANN model round trip and identical predictions. */
 static void test_model_file(void) {
   UnetConfig config = {
@@ -493,7 +457,6 @@ int main(void) {
   test_orf();
   test_softmax();
   test_cwt();
-  test_cwt_command(&sequences[0]);
   test_model_file();
   test_label_errors("test.fasta");
   test_pipeline(sequences);

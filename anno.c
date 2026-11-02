@@ -834,75 +834,6 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
   }
 }
 
-/**
- * @brief Write CWT matrices and contig offsets for the cwt subcommand.
- *        reverse-complement rows) and {dir}/contigs.tsv for plot.py.
- *        Minus rows are the conjugated, mirrored plus rows (no recompute).
- * @param fasta Input FASTA file.
- * @param directory Output directory.
- * @param threads Number of worker threads.
- * @return None.
- */
-static void run_cwt(const char *fasta, const char *directory, int threads) {
-  (void)threads;
-  int count = 0;
-  AnnoSequence *sequences = anno_read_fasta(fasta, &count);
-  char command_path[ANNO_PATH_BUFFER];
-  if (snprintf(command_path, sizeof(command_path), "%s/matrix.bin",
-               directory) >= (int)sizeof(command_path))
-    fail("CWT directory path too long");
-  if (mkdir(directory, 0777) && errno != EEXIST)
-    fail("cannot create %s", directory);
-  FILE *matrix = fopen(command_path, "w+b");
-  snprintf(command_path, sizeof(command_path), "%s/contigs.tsv", directory);
-  FILE *index = fopen(command_path, "w");
-  if (!matrix || !index)
-    fail("cannot create CWT output in %s", directory);
-  fprintf(index,
-          "# anno-cwt-v2\n# scales\t%d,%d,%d\nseqid\tlength\tplus_offset\t"
-          "minus_offset\n",
-          cwt_scales[0], cwt_scales[1], cwt_scales[2]);
-  const int64_t chunk = (int64_t)ANNO_CWT_WINDOW * 256;
-  const size_t row = ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS;
-  float *buffer = xcalloc(mul_size((size_t)chunk, row), sizeof(float));
-  int64_t rows = 0;
-  for (int i = 0; i < count; i++) {
-    const AnnoSequence *s = &sequences[i];
-    fprintf(index, "%s\t%lld\t%lld\t%lld\n", s->name, (long long)s->length,
-            (long long)rows, (long long)(rows + s->length));
-    long base = (long)(rows * (int64_t)row * (int64_t)sizeof(float));
-    for (int64_t start = 0; start < s->length; start += chunk) {
-      int64_t n = s->length - start < chunk ? s->length - start : chunk;
-      anno_cwt(s->bases, s->length, start, start + n, buffer);
-      if (fwrite(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n)
-        fail("cannot write CWT matrix");
-    }
-    for (int64_t end = s->length; end > 0; end -= chunk) {
-      int64_t n = end < chunk ? end : chunk, start = end - n;
-      if (fseek(matrix,
-                base + (long)(start * (int64_t)row * (int64_t)sizeof(float)),
-                SEEK_SET) ||
-          fread(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n ||
-          fseek(matrix, 0, SEEK_END))
-        fail("cannot reread CWT matrix");
-      for (int64_t a = 0, b = n - 1; a <= b; a++, b--)
-        for (size_t k = 0; k < row; k++) {
-          float x = buffer[(size_t)a * row + k],
-                y = buffer[(size_t)b * row + k];
-          buffer[(size_t)a * row + k] = (k & 1) ? -y : y;
-          buffer[(size_t)b * row + k] = (k & 1) ? -x : x;
-        }
-      if (fwrite(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n)
-        fail("cannot write CWT matrix");
-    }
-    rows += ANNO_STRANDS * s->length;
-  }
-  free(buffer);
-  if (fclose(matrix) || fclose(index))
-    fail("cannot close CWT output");
-  anno_sequences_free(sequences, count);
-}
-
 /* ------------------------------------------------------------------------ */
 /* 1D UNet                                                                  */
 /* ------------------------------------------------------------------------ */
@@ -1711,7 +1642,6 @@ static unsigned long predict_genome(const Unet *unet,
 static void usage(void) {
   fprintf(stderr,
           "Usage: anno [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
-          "       anno [-p N] cwt genome.fasta[.gz] directory\n"
           "  with an annotation: train a UNet and write it to -m\n"
           "  without:            predict genes (GFF3 on stdout unless -o)\n"
           "Options:\n"
@@ -1771,14 +1701,6 @@ int main(int argc, char **argv) {
   omp_set_num_threads(threads);
 #endif
   int a = optind;
-  if (a < argc && !strcmp(argv[a], "cwt")) {
-    if (argc - a != 3) {
-      usage();
-      return EXIT_FAILURE;
-    }
-    run_cwt(argv[a + 1], argv[a + 2], threads);
-    return EXIT_SUCCESS;
-  }
   if (argc - a < 1 || argc - a > 2) {
     usage();
     return EXIT_FAILURE;
