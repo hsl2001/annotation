@@ -7,11 +7,11 @@ LIBS = -lz -lm
 
 all: anno
 
-anno: anno.c anno.h ann.c ann.h
-	$(CC) $(CFLAGS) -o $@ anno.c ann.c $(LIBS)
+anno: anno.c anno.h unet.c unet.h
+	$(CC) $(CFLAGS) -o $@ anno.c unet.c $(LIBS)
 
-test-anno: test.c anno.h ann.c ann.h
-	$(CC) $(CFLAGS) -o $@ test.c ann.c $(LIBS)
+test-anno: test.c anno.h unet.c unet.h
+	$(CC) $(CFLAGS) -o $@ test.c unet.c $(LIBS)
 
 test: anno test-anno
 	./test-anno

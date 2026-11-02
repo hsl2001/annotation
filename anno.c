@@ -10,7 +10,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "anno.h"
-#include "ann.h"
+#include "unet.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -24,6 +24,25 @@
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
+
+uint64_t anno_random_next(uint64_t *state) {
+  uint64_t value = *state;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  *state = value;
+  return value * UINT64_C(2685821657736338717);
+}
+
+uint64_t anno_random_seed(void) { return UINT64_C(0x9e3779b97f4a7c15); }
+
+float anno_random_unit(uint64_t *state) {
+  return (float)(anno_random_next(state) >> 40) / 16777216.0f;
+}
+
+float anno_random_symmetric(uint64_t *state) {
+  return 2.0f * anno_random_unit(state) - 1.0f;
+}
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -684,15 +703,16 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
  */
 void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
               float *out) {
-  static const double signal[4][2] = {{1, 1}, {-1, 1}, {-1, -1}, {1, -1}};
+  static const double signal[ANNO_NUCLEOTIDES][ANNO_COMPLEX_COMPONENTS] = {
+      {1, 1}, {-1, 1}, {-1, -1}, {1, -1}};
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
-    int radius = 4 * cwt_scales[s];
+    int radius = ANNO_CWT_RADIUS_FACTOR * cwt_scales[s];
     double g[64], c[64], sn[64];
     for (int o = -radius; o <= radius; o++) {
       double x = (double)o / cwt_scales[s];
       g[o + radius] = exp(-0.5 * x * x);
-      c[o + radius] = g[o + radius] * cos(6.0 * x);
-      sn[o + radius] = g[o + radius] * sin(6.0 * x);
+      c[o + radius] = g[o + radius] * cos(ANNO_MORLET_FREQUENCY * x);
+      sn[o + radius] = g[o + radius] * sin(ANNO_MORLET_FREQUENCY * x);
     }
     for (int64_t p = start; p < end; p++) {
       double real = 0, imaginary = 0, norm = 0;
@@ -707,7 +727,8 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
         norm += g[o + radius];
       }
       float *value =
-          out + ((size_t)(p - start) * ANNO_CWT_CHANNELS + (size_t)s) * 2;
+          out + ((size_t)(p - start) * ANNO_CWT_CHANNELS + (size_t)s) *
+                    ANNO_COMPLEX_COMPONENTS;
       value[0] = norm > 0 ? (float)(real / norm) : 0.0f;
       value[1] = norm > 0 ? (float)(imaginary / norm) : 0.0f;
     }
@@ -726,13 +747,16 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
 static void cwt_power(const char *bases, int64_t length, int64_t start,
                       int64_t end, float *out) {
   for (int64_t block = start; block < end; block += ANNO_CWT_WINDOW) {
-    float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * 2];
+    float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS];
     int64_t stop =
         block + ANNO_CWT_WINDOW < end ? block + ANNO_CWT_WINDOW : end;
     anno_cwt(bases, length, block, stop, values);
     for (int64_t i = 0; i < (stop - block) * ANNO_CWT_CHANNELS; i++)
       out[(size_t)(block - start) * ANNO_CWT_CHANNELS + (size_t)i] =
-          values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
+          values[ANNO_COMPLEX_COMPONENTS * i] *
+              values[ANNO_COMPLEX_COMPONENTS * i] +
+          values[ANNO_COMPLEX_COMPONENTS * i + 1] *
+              values[ANNO_COMPLEX_COMPONENTS * i + 1];
   }
 }
 
@@ -757,8 +781,8 @@ static void complex_job(void *pointer, int64_t job) {
     end = context->sequence->length;
   if (start < end)
     anno_cwt(context->sequence->bases, context->sequence->length, start, end,
-             context->out +
-                 (size_t)(start - context->start) * ANNO_CWT_CHANNELS * 2);
+             context->out + (size_t)(start - context->start) *
+                                ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS);
 }
 
 /**
@@ -773,7 +797,7 @@ static void complex_job(void *pointer, int64_t job) {
 static void run_cwt(const char *fasta, const char *directory, int threads) {
   int count = 0;
   AnnoSequence *sequences = anno_read_fasta(fasta, &count);
-  char command_path[4096];
+  char command_path[ANNO_PATH_BUFFER];
   if (snprintf(command_path, sizeof(command_path), "%s/matrix.bin",
                directory) >= (int)sizeof(command_path))
     fail("CWT directory path too long");
@@ -789,7 +813,7 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
           "minus_offset\n",
           cwt_scales[0], cwt_scales[1], cwt_scales[2]);
   const int64_t chunk = (int64_t)ANNO_CWT_WINDOW * 256;
-  const size_t row = ANNO_CWT_CHANNELS * 2;
+  const size_t row = ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS;
   float *buffer = xcalloc(mul_size((size_t)chunk, row), sizeof(float));
   int64_t rows = 0;
   for (int i = 0; i < count; i++) {
@@ -823,7 +847,7 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
       if (fwrite(buffer, sizeof(float) * row, (size_t)n, matrix) != (size_t)n)
         fail("cannot write CWT matrix");
     }
-    rows += 2 * s->length;
+    rows += ANNO_STRANDS * s->length;
   }
   free(buffer);
   if (fclose(matrix) || fclose(index))
@@ -834,8 +858,6 @@ static void run_cwt(const char *fasta, const char *directory, int threads) {
 /* ------------------------------------------------------------------------ */
 /* 1D UNet                                                                  */
 /* ------------------------------------------------------------------------ */
-
-#define ANN_LENGTH ANNO_UNET_WINDOW
 
 static uint8_t ann_swap_strand(uint8_t label) {
   return label == ANNO_INTERGENIC ? label : label <= 4 ? label + 4 : label - 4;
@@ -867,16 +889,16 @@ static void features(const AnnoSequence *sequence, const float *power,
     if (flip && base >= 0)
       base = 3 - base;
     if (base >= 0)
-      input[(size_t)base * ANN_LENGTH + q] = 1.0f;
+      input[(size_t)base * ANNO_UNET_WINDOW + q] = 1.0f;
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
-      input[(size_t)(4 + s) * ANN_LENGTH + q] =
+      input[(size_t)(ANNO_NUCLEOTIDES + s) * ANNO_UNET_WINDOW + q] =
           (power[(size_t)(p - power_start) * ANNO_CWT_CHANNELS + s] - mean[s]) /
           variance[s];
     if (truth) {
       uint8_t label = labels[flip ? start + valid - 1 - q : start + q];
       if (flip)
         label = ann_swap_strand(label);
-      truth[(size_t)label * ANN_LENGTH + q] = 1.0f;
+      truth[(size_t)label * ANNO_UNET_WINDOW + q] = 1.0f;
     }
   }
 }
@@ -885,14 +907,6 @@ typedef struct {
   const AnnoSequence *sequence;
   int64_t start, valid;
 } TrainingWindow;
-static uint64_t training_random_next(uint64_t *state) {
-  uint64_t value = *state;
-  value ^= value >> 12;
-  value ^= value << 25;
-  value ^= value >> 27;
-  *state = value;
-  return value * UINT64_C(2685821657736338717);
-}
 typedef struct {
   const TrainingWindow *windows;
   size_t batch_start;
@@ -910,11 +924,11 @@ static void training_batch_job(void *pointer, int64_t job) {
             window->start + window->valid, power);
   features(window->sequence, power, window->start, window->start, window->valid,
            context->flip,
-           context->input + slot * ANNO_INPUT_CHANNELS * ANN_LENGTH,
+           context->input + slot * ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
            window->sequence->labels,
-           context->truth + slot * ANNO_CLASSES * ANN_LENGTH);
+           context->truth + slot * ANNO_CLASSES * ANNO_UNET_WINDOW);
   for (int64_t q = 0; q < window->valid; q++)
-    context->mask[slot * ANN_LENGTH + q] = 1.0f;
+    context->mask[slot * ANNO_UNET_WINDOW + q] = 1.0f;
   free(power);
 }
 
@@ -928,32 +942,35 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
 #endif
   size_t total_windows = 0;
   for (int i = 0; i < count; i++)
-    total_windows +=
-        (size_t)((sequences[i].length + ANN_LENGTH - 1) / ANN_LENGTH);
+    total_windows += (size_t)((sequences[i].length + ANNO_UNET_WINDOW - 1) /
+                              ANNO_UNET_WINDOW);
   if (!total_windows)
     fail("no training windows");
   TrainingWindow *all = xcalloc(total_windows, sizeof(*all));
   size_t n = 0;
   for (int i = 0; i < count; ++i)
-    for (int64_t w = 0; w * ANN_LENGTH < sequences[i].length; ++w) {
-      int64_t start = w * ANN_LENGTH, valid = sequences[i].length - start;
-      if (valid > ANN_LENGTH)
-        valid = ANN_LENGTH;
+    for (int64_t w = 0; w * ANNO_UNET_WINDOW < sequences[i].length; ++w) {
+      int64_t start = w * ANNO_UNET_WINDOW;
+      int64_t valid = sequences[i].length - start;
+      if (valid > ANNO_UNET_WINDOW)
+        valid = ANNO_UNET_WINDOW;
       all[n++] = (TrainingWindow){&sequences[i], start, valid};
     }
-  float *x =
-      xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * ANN_LENGTH,
-              sizeof(float));
-  float *y = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANN_LENGTH,
+  float *x = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS *
+                         ANNO_UNET_WINDOW,
                      sizeof(float));
-  float *mask = xcalloc((size_t)ANNO_BATCH_WINDOWS * ANN_LENGTH, sizeof(float));
+  float *y =
+      xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANNO_UNET_WINDOW,
+              sizeof(float));
+  float *mask =
+      xcalloc((size_t)ANNO_BATCH_WINDOWS * ANNO_UNET_WINDOW, sizeof(float));
   TrainingWindow *batch_windows =
       xcalloc(ANNO_BATCH_WINDOWS, sizeof(*batch_windows));
-  uint64_t state = UINT64_C(0x9e3779b97f4a7c15);
+  uint64_t state = anno_random_seed();
   double started = now_seconds();
   for (int iteration = 0; iteration < iterations; ++iteration) {
     for (size_t i = total_windows; i > 1; --i) {
-      size_t j = training_random_next(&state) % i;
+      size_t j = anno_random_next(&state) % i;
       TrainingWindow t = all[i - 1];
       all[i - 1] = all[j];
       all[j] = t;
@@ -965,12 +982,13 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
       if (size > ANNO_BATCH_WINDOWS)
         size = ANNO_BATCH_WINDOWS;
       memset(x, 0,
-             (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS * ANN_LENGTH *
-                 sizeof(float));
+             (size_t)ANNO_BATCH_WINDOWS * ANNO_INPUT_CHANNELS *
+                 ANNO_UNET_WINDOW * sizeof(float));
       memset(y, 0,
-             (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANN_LENGTH *
+             (size_t)ANNO_BATCH_WINDOWS * ANNO_CLASSES * ANNO_UNET_WINDOW *
                  sizeof(float));
-      memset(mask, 0, (size_t)ANNO_BATCH_WINDOWS * ANN_LENGTH * sizeof(float));
+      memset(mask, 0,
+             (size_t)ANNO_BATCH_WINDOWS * ANNO_UNET_WINDOW * sizeof(float));
       memcpy(batch_windows, all + first, size * sizeof(*batch_windows));
       TrainingBatchJob job = {batch_windows,
                               0,
@@ -985,9 +1003,7 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
       epoch_loss += loss;
       ++batches;
     }
-    if (iteration == 0 || iteration + 1 == iterations ||
-        (iteration + 1) % 10 == 0)
-      say("iteration %d/%d loss %.4f batches %zu %.1fs", iteration + 1,
+    say("iteration %d/%d loss %.4f batches %zu %.1fs", iteration + 1,
           iterations, epoch_loss / batches, batches, now_seconds() - started);
   }
   free(all);
@@ -1571,7 +1587,7 @@ static unsigned long predict_genome(const Unet *unet,
   (void)threads;
   Bedgraph bedgraph = {0};
   for (int j = 0; prefix && j < ANNO_CLASSES; j++) {
-    char path[4096];
+    char path[ANNO_PATH_BUFFER];
     if (snprintf(path, sizeof(path), "%s.%s.bedgraph", prefix,
                  class_names[j]) >= (int)sizeof(path))
       fail("output prefix too long");
@@ -1586,20 +1602,22 @@ static unsigned long predict_genome(const Unet *unet,
     Decoder *decoder = decoder_create(s->length);
     for (int j = 0; j < ANNO_CLASSES; j++)
       bedgraph.value[j] = -1;
-    int64_t window_count = (s->length + ANN_LENGTH - 1) / ANN_LENGTH;
+    int64_t window_count =
+        (s->length + ANNO_UNET_WINDOW - 1) / ANNO_UNET_WINDOW;
     float *input =
-        xcalloc((size_t)ANNO_INPUT_CHANNELS * ANN_LENGTH, sizeof(float));
+        xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW, sizeof(float));
     float *power =
-        xcalloc((size_t)ANN_LENGTH * ANNO_CWT_CHANNELS, sizeof(float));
+        xcalloc((size_t)ANNO_UNET_WINDOW * ANNO_CWT_CHANNELS, sizeof(float));
     float *probability =
-        xcalloc((size_t)ANN_LENGTH * ANNO_CLASSES, sizeof(float));
+        xcalloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES, sizeof(float));
     for (int64_t window = 0; window < window_count; window++) {
-      int64_t start = window * ANN_LENGTH;
-      int64_t valid =
-          s->length - start < ANN_LENGTH ? s->length - start : ANN_LENGTH;
+      int64_t start = window * ANNO_UNET_WINDOW;
+      int64_t valid = s->length - start < ANNO_UNET_WINDOW ? s->length - start
+                                                           : ANNO_UNET_WINDOW;
       memset(input, 0,
-             (size_t)ANNO_INPUT_CHANNELS * ANN_LENGTH * sizeof(float));
-      memset(power, 0, (size_t)ANN_LENGTH * ANNO_CWT_CHANNELS * sizeof(float));
+             (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW * sizeof(float));
+      memset(power, 0,
+             (size_t)ANNO_UNET_WINDOW * ANNO_CWT_CHANNELS * sizeof(float));
       cwt_power(s->bases, s->length, start, start + valid, power);
       features(s, power, start, start, valid, 0, input, NULL, NULL);
       memset(probability, 0, (size_t)valid * ANNO_CLASSES * sizeof(float));
@@ -1732,7 +1750,7 @@ int main(int argc, char **argv) {
       fail("cannot read model %s: %s", model_path, strerror(status));
     FILE *gff = stdout;
     if (prefix) {
-      char path[4096];
+      char path[ANNO_PATH_BUFFER];
       if (snprintf(path, sizeof(path), "%s.gff3", prefix) >= (int)sizeof(path))
         fail("output prefix too long");
       if (!(gff = fopen(path, "w")))

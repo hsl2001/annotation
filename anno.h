@@ -15,12 +15,18 @@
 
 /** @name Fixed sizes */
 /**@{*/
-#define ANNO_CLASSES 9         /**< UNet classes == decoded grammar states */
-#define ANNO_CWT_CHANNELS 3    /**< Morlet CWT scales (power channels)    */
-#define ANNO_INPUT_CHANNELS 7  /**< A/C/G/T one-hot + CWT power           */
-#define ANNO_CWT_WINDOW 1024   /**< CWT block processed by one job        */
-#define ANNO_UNET_WINDOW 16384 /**< UNet training / inference window      */
-#define ANNO_MAX_DEPTH 6       /**< maximum number of UNet levels         */
+#define ANNO_NUCLEOTIDES 4        /**< A/C/G/T base channels */
+#define ANNO_STRANDS 2            /**< plus and minus strands */
+#define ANNO_COMPLEX_COMPONENTS 2 /**< real and imaginary components */
+#define ANNO_PATH_BUFFER 4096     /**< maximum generated path length */
+#define ANNO_CLASSES 9            /**< UNet classes == decoded grammar states */
+#define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
+#define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
+#define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
+#define ANNO_UNET_WINDOW 16384    /**< UNet training / inference window      */
+#define ANNO_MAX_DEPTH 6          /**< maximum number of UNet levels         */
+#define ANNO_CWT_RADIUS_FACTOR 4  /**< Morlet radius in scale units */
+#define ANNO_MORLET_FREQUENCY 6.0 /**< Morlet carrier frequency */
 /**@}*/
 
 /** @name Grammar constants */
@@ -28,15 +34,17 @@
 #define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
 #define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp) */
 #define ANNO_EMISSION_EPSILON 1e-6f
-#define ANNO_TRANSCRIPT_PENALTY 5.0 /**< log penalty for opening a transcript  \
-                                     */
+#define ANNO_TRANSCRIPT_PENALTY                                                \
+  5.0 /**< log penalty for opening a transcript                                \
+       */
 /**@}*/
 
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS 16 /**< fixed batch for bounded runtime memory use  \
-                               */
+#define ANNO_BATCH_WINDOWS                                                     \
+  16 /**< fixed batch for bounded runtime memory use                           \
+      */
 #define ANNO_LEARNING_RATE 1e-2f /**< Default optimizer learning rate. */
 #define ANNO_EPSILON 1e-5f       /**< Stabilizes the Soft F1 calculation. */
 /**@}*/
@@ -72,6 +80,30 @@ typedef struct {
   int64_t length;  /**< number of bases                              */
   uint8_t *labels; /**< per-base AnnoClass (training only) or NULL   */
 } AnnoSequence;
+
+/**
+ * @brief Advance the repository-wide deterministic random-number generator.
+ * @param state Mutable generator state.
+ * @return Next pseudo-random 64-bit value.
+ */
+uint64_t anno_random_next(uint64_t *state);
+/**
+ * @brief Return the repository-wide deterministic random seed.
+ * @return Initial pseudo-random generator state.
+ */
+uint64_t anno_random_seed(void);
+/**
+ * @brief Return a deterministic random float in the interval [0, 1).
+ * @param state Mutable generator state.
+ * @return Pseudo-random unit float.
+ */
+float anno_random_unit(uint64_t *state);
+/**
+ * @brief Return a deterministic random float in the interval [-1, 1).
+ * @param state Mutable generator state.
+ * @return Pseudo-random symmetric float.
+ */
+float anno_random_symmetric(uint64_t *state);
 
 /**
  * @brief Return the default convolution configuration.

@@ -11,24 +11,14 @@
 
 static int failures = 0, checks = 0;
 
-/** @brief Advance the deterministic test random-number generator. */
-static uint64_t random_next(uint64_t *state) {
-  uint64_t value = *state;
-  value ^= value >> 12;
-  value ^= value << 25;
-  value ^= value >> 27;
-  *state = value;
-  return value * UINT64_C(2685821657736338717);
-}
-
 /** @brief Return a deterministic random integer below the given bound. */
 static unsigned random_below(uint64_t *state, unsigned bound) {
-  return (unsigned)(random_next(state) % bound);
+  return (unsigned)(anno_random_next(state) % bound);
 }
 
 /** @brief Return a deterministic pseudo-random float in [0, 1). */
 static float test_random_unit(uint64_t *state) {
-  return (float)(random_next(state) >> 40) / 16777216.0f;
+  return anno_random_unit(state);
 }
 
 static float *test_sequence_power(const AnnoSequence *sequence) {
@@ -38,11 +28,14 @@ static float *test_sequence_power(const AnnoSequence *sequence) {
     int64_t end = start + ANNO_CWT_WINDOW;
     if (end > sequence->length)
       end = sequence->length;
-    float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * 2];
+    float values[ANNO_CWT_WINDOW * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS];
     anno_cwt(sequence->bases, sequence->length, start, end, values);
     for (int64_t i = 0; i < (end - start) * ANNO_CWT_CHANNELS; i++)
       power[(size_t)start * ANNO_CWT_CHANNELS + (size_t)i] =
-          values[2 * i] * values[2 * i] + values[2 * i + 1] * values[2 * i + 1];
+          values[ANNO_COMPLEX_COMPONENTS * i] *
+              values[ANNO_COMPLEX_COMPONENTS * i] +
+          values[ANNO_COMPLEX_COMPONENTS * i + 1] *
+              values[ANNO_COMPLEX_COMPONENTS * i + 1];
   }
   return power;
 }
@@ -335,15 +328,19 @@ static void test_cwt(void) {
     bases[i] = "ACGT"[random_below(&seed, 4)];
   for (int i = 0; i < N; i++)
     reverse[i] = complement(bases[N - 1 - i]);
-  float *a = xcalloc((size_t)N * ANNO_CWT_CHANNELS * 2, sizeof(float));
-  float *b = xcalloc((size_t)N * ANNO_CWT_CHANNELS * 2, sizeof(float));
+  float *a = xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
+                     sizeof(float));
+  float *b = xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
+                     sizeof(float));
   anno_cwt(bases, N, 0, N, a);
   anno_cwt(reverse, N, 0, N, b);
   double worst = 0.0;
   for (int i = 0; i < N; i++)
     for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
-      const float *x = a + ((size_t)i * ANNO_CWT_CHANNELS + s) * 2;
-      const float *y = b + ((size_t)(N - 1 - i) * ANNO_CWT_CHANNELS + s) * 2;
+      const float *x =
+          a + ((size_t)i * ANNO_CWT_CHANNELS + s) * ANNO_COMPLEX_COMPONENTS;
+      const float *y = b + ((size_t)(N - 1 - i) * ANNO_CWT_CHANNELS + s) *
+                               ANNO_COMPLEX_COMPONENTS;
       worst = fmax(worst, fabs(x[0] - y[0]) + fabs(x[1] + y[1]));
     }
   CHECK(worst < 1e-4);
@@ -352,14 +349,18 @@ static void test_cwt(void) {
   float *power = test_sequence_power(&sequence);
   worst = 0.0;
   for (int i = 0; i < N * ANNO_CWT_CHANNELS; i++)
-    worst = fmax(worst, fabs(power[i] - (a[2 * i] * a[2 * i] +
-                                         a[2 * i + 1] * a[2 * i + 1])));
+    worst =
+        fmax(worst, fabs(power[i] - (a[ANNO_COMPLEX_COMPONENTS * i] *
+                                         a[ANNO_COMPLEX_COMPONENTS * i] +
+                                     a[ANNO_COMPLEX_COMPONENTS * i + 1] *
+                                         a[ANNO_COMPLEX_COMPONENTS * i + 1])));
   CHECK(worst < 1e-5);
   /* a constant (poly-A) signal far from the ends has ~zero response */
   memset(bases, 'A', N);
   anno_cwt(bases, N, N / 2, N / 2 + 1, a);
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++)
-    CHECK(fabs(a[2 * s]) < 1e-3 && fabs(a[2 * s + 1]) < 1e-3);
+    CHECK(fabs(a[ANNO_COMPLEX_COMPONENTS * s]) < 1e-3 &&
+          fabs(a[ANNO_COMPLEX_COMPONENTS * s + 1]) < 1e-3);
   free(power);
   free(a);
   free(b);
@@ -379,10 +380,11 @@ static void test_cwt_command(const AnnoSequence *s) {
   if (index)
     fclose(index);
   FILE *matrix = fopen("test-cwt/matrix.bin", "rb");
-  const size_t row = ANNO_CWT_CHANNELS * 2, n = (size_t)s->length;
-  float *data = xcalloc(2 * n * row, sizeof(float));
-  CHECK(matrix &&
-        fread(data, sizeof(float), 2 * n * row, matrix) == 2 * n * row);
+  const size_t row = ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
+               n = (size_t)s->length;
+  float *data = xcalloc(ANNO_STRANDS * n * row, sizeof(float));
+  CHECK(matrix && fread(data, sizeof(float), ANNO_STRANDS * n * row, matrix) ==
+                      ANNO_STRANDS * n * row);
   if (matrix)
     fclose(matrix);
   char *reverse = xcalloc(n + 1, 1);

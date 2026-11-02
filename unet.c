@@ -2,10 +2,10 @@
  * @file ann.c
  * @brief Standalone fixed-shape 1D UNet runtime.
  *
- * Tensors are channel-major.  Every forward pass uses the same fixed
- * ANNO_UNET_WINDOW arena; short sequences simply leave the tail zeroed.
+ * Tensors are channel-major.  Every forward pass uses the same fixed window
+ * size
  */
-#include "ann.h"
+#include "unet.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -16,8 +16,10 @@ enum {
   ENCODER_OPERATIONS = 2,
   DECODER_OPERATIONS = 2,
   OUTPUT_OPERATIONS = 1,
-  ARENAS_PER_LEVEL = 5,
-  EXTRA_ARENAS = 4,
+  /* Two convolutions, one pool, one skip, one upsample. */
+  WORKSPACES_PER_LEVEL = 5,
+  /* Input, bottleneck, output, and alignment storage. */
+  EXTRA_WORKSPACES = 4,
   CONV_OPERATION = 1,
   POOL_OPERATION = 2,
   CONCAT_OPERATION = 3,
@@ -35,20 +37,14 @@ enum {
   INITIAL_CHANNEL_1 = 32,
   INITIAL_CHANNEL_2 = 64,
   INITIAL_CHANNEL_3 = 128,
-  RANDOM_SEED = 0x9e3779b9u,
-  RANDOM_MULTIPLIER = 1664525u,
-  RANDOM_INCREMENT = 1013904223u,
-  RANDOM_SHIFT = 8,
-  RANDOM_MASK = 65535,
-  RANDOM_SCALE = 32768,
 };
 
-#define INITIAL_WEIGHT_SCALE 0.02f
 
 #define MAX_LAYERS                                                             \
   (ANNO_MAX_DEPTH * (ENCODER_OPERATIONS + DECODER_OPERATIONS) +                \
    OUTPUT_OPERATIONS)
-#define MAX_ARENAS (ANNO_MAX_DEPTH * ARENAS_PER_LEVEL + EXTRA_ARENAS)
+#define MAX_WORKSPACES                                                         \
+  (ANNO_MAX_DEPTH * WORKSPACES_PER_LEVEL + EXTRA_WORKSPACES)
 
 typedef struct {
   int in;
@@ -92,7 +88,7 @@ static void release(Unet *u) {
   free(u);
 }
 
-static int add_layer(Unet *u, int in, int out, int k, unsigned *seed) {
+static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   Layer *l = &u->layer[u->nlayer++];
   l->in = in;
   l->out = out;
@@ -102,10 +98,7 @@ static int add_layer(Unet *u, int in, int out, int k, unsigned *seed) {
   if (!l->w || !l->b)
     return 0;
   for (size_t i = 0; i < (size_t)in * out * k; ++i) {
-    *seed = *seed * RANDOM_MULTIPLIER + RANDOM_INCREMENT;
-    l->w[i] =
-        ((float)((*seed >> RANDOM_SHIFT) & RANDOM_MASK) / RANDOM_SCALE - 1.0f) *
-        INITIAL_WEIGHT_SCALE;
+    l->w[i] = 0.01 * anno_random_symmetric(seed);
   }
   return 1;
 }
@@ -118,7 +111,7 @@ Unet *unet_create(const UnetConfig *c) {
     return NULL;
   u->config = *c;
   u->depth = c->depth;
-  unsigned seed = RANDOM_SEED;
+  uint64_t seed = anno_random_seed();
   int prev = ANNO_INPUT_CHANNELS;
   for (int l = 0; l < c->depth; ++l) {
     if (!add_layer(u, prev, c->channels[l], c->kernel, &seed) ||
@@ -180,24 +173,26 @@ static void upsample(const float *x, float *y, int c, int n, int f) {
 }
 
 typedef struct {
-  float *a[MAX_ARENAS], *d[MAX_ARENAS];
-  int n[MAX_ARENAS], c[MAX_ARENAS], count;
-  float *concat[MAX_ARENAS];
+  float *a[MAX_WORKSPACES], *d[MAX_WORKSPACES];
+  int n[MAX_WORKSPACES], c[MAX_WORKSPACES], count;
+  float *concat[MAX_WORKSPACES];
   struct {
     int type, layer, in, out, aux, skip;
-  } op[MAX_ARENAS];
+  } op[MAX_WORKSPACES];
   int n_op;
-} Arena;
-static void arena_free(Arena *a) {
+} Workspace;
+
+static void workspace_free(Workspace *a) {
   for (int i = 0; i < a->count; ++i) {
     free(a->a[i]);
     free(a->d[i]);
   }
-  for (int i = 0; i < MAX_ARENAS; ++i)
+  for (int i = 0; i < MAX_WORKSPACES; ++i)
     free(a->concat[i]);
   memset(a, 0, sizeof(*a));
 }
-static int arena_add(Arena *a, int c, int n) {
+
+static int workspace_add(Workspace *a, int c, int n) {
   int i = a->count++;
   size_t z = (size_t)c * n;
   a->c[i] = c;
@@ -206,7 +201,7 @@ static int arena_add(Arena *a, int c, int n) {
   a->d[i] = (float *)calloc(z, sizeof(float));
   return a->a[i] && a->d[i];
 }
-static void record(Arena *a, int type, int layer, int in, int out, int aux,
+static void record(Workspace *a, int type, int layer, int in, int out, int aux,
                    int skip) {
   a->op[a->n_op].type = type;
   a->op[a->n_op].layer = layer;
@@ -216,20 +211,20 @@ static void record(Arena *a, int type, int layer, int in, int out, int aux,
   a->op[a->n_op].skip = skip;
   ++a->n_op;
 }
-static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
+static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
                        float *prob) {
   int n = ANNO_UNET_WINDOW, ai = 0, li = 0;
-  if (!arena_add(a, ANNO_INPUT_CHANNELS, n))
+  if (!workspace_add(a, ANNO_INPUT_CHANNELS, n))
     return ENOMEM;
   memcpy(a->a[0], x, (size_t)ANNO_INPUT_CHANNELS * n * sizeof(float));
   int skip[MAX_LAYERS], sn = 0;
   for (int lev = 0; lev < u->depth; ++lev) {
-    if (!arena_add(a, u->config.channels[lev], n))
+    if (!workspace_add(a, u->config.channels[lev], n))
       return ENOMEM;
     conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
     ai = a->count - 1;
     record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-    if (!arena_add(a, u->config.channels[lev], n))
+    if (!workspace_add(a, u->config.channels[lev], n))
       return ENOMEM;
     conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
     ai = a->count - 1;
@@ -237,7 +232,7 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
     skip[sn++] = ai;
     if (lev + 1 < u->depth) {
       int pn = n / u->config.pool;
-      if (!arena_add(a, u->config.channels[lev], pn))
+      if (!workspace_add(a, u->config.channels[lev], pn))
         return ENOMEM;
       pool(a->a[ai], a->a[a->count - 1], u->config.channels[lev], n,
            u->config.pool);
@@ -249,7 +244,7 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
   for (int lev = u->depth - 2; lev >= 0; --lev) {
     int oldn = n, f = u->config.pool;
     n *= f;
-    if (!arena_add(a, u->config.channels[lev + 1], n))
+    if (!workspace_add(a, u->config.channels[lev + 1], n))
       return ENOMEM;
     float *up = a->a[a->count - 1];
     upsample(a->a[ai], up, u->config.channels[lev + 1], oldn, f);
@@ -261,7 +256,7 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
     memcpy(cat, up, (size_t)u->config.channels[lev + 1] * n * sizeof(float));
     memcpy(cat + (size_t)u->config.channels[lev + 1] * n, a->a[skip[lev]],
            (size_t)u->config.channels[lev] * n * sizeof(float));
-    if (!arena_add(a, cc, n)) {
+    if (!workspace_add(a, cc, n)) {
       free(cat);
       return ENOMEM;
     }
@@ -270,18 +265,18 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
     ai = a->count - 1;
     record(a, CONCAT_OPERATION, NO_LAYER, ai - 1, ai,
            u->config.channels[lev + 1], skip[lev]);
-    if (!arena_add(a, u->config.channels[lev], n))
+    if (!workspace_add(a, u->config.channels[lev], n))
       return ENOMEM;
     conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
     ai = a->count - 1;
     record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-    if (!arena_add(a, u->config.channels[lev], n))
+    if (!workspace_add(a, u->config.channels[lev], n))
       return ENOMEM;
     conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
     ai = a->count - 1;
     record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
   }
-  if (!arena_add(a, ANNO_CLASSES, n))
+  if (!workspace_add(a, ANNO_CLASSES, n))
     return ENOMEM;
   conv(&u->layer[li], a->a[ai], a->a[a->count - 1], n, 0);
   record(a, CONV_OPERATION, li, ai, a->count - 1, LINEAR_ACTIVATION, NO_SKIP);
@@ -306,9 +301,9 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Arena *a,
 int unet_predict_channels(const Unet *u, const float *x, int64_t n, float *p) {
   if (!u || !x || !p || n < 1 || n > ANNO_UNET_WINDOW)
     return EINVAL;
-  Arena a = {0};
+  Workspace a = {0};
   int rc = run_forward(u, x, n, &a, p);
-  arena_free(&a);
+  workspace_free(&a);
   return rc;
 }
 
@@ -414,7 +409,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       sgw[l] = (float *)calloc(weights, sizeof(float));
       sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
     }
-    Arena a = {0};
+    Workspace a = {0};
     float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
                                sizeof(float));
     if (!p)
@@ -424,7 +419,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
                     ANNO_UNET_WINDOW, &a, p);
     if (rc) {
       free(p);
-      arena_free(&a);
+      workspace_free(&a);
       continue;
     }
     int out = a.count - 1;
@@ -447,7 +442,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     }
     if (!valid) {
       free(p);
-      arena_free(&a);
+      workspace_free(&a);
       continue;
     }
     double sample_loss = 0;
@@ -460,7 +455,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     float **ag = (float **)calloc((size_t)a.count, sizeof(*ag));
     if (!ag) {
       free(p);
-      arena_free(&a);
+      workspace_free(&a);
       continue;
     }
     for (int z = 0; z < a.count; ++z)
@@ -522,7 +517,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       free(ag[z]);
     free(ag);
     free(p);
-    arena_free(&a);
+    workspace_free(&a);
 #pragma omp critical(ann_gradient_reduce)
     {
       total += sample_loss;
