@@ -1,7 +1,6 @@
 /**
  * @file test.c
- * @brief Unit and pipeline tests for anno. Every expected value below can be
- *        checked by hand; the file includes anno.c to reach static functions.
+ * @brief Unit and pipeline tests for anno. 
  */
 #define ANNO_NO_MAIN
 #include "anno.c"
@@ -207,7 +206,7 @@ static void test_round_trip(const AnnoSequence *s) {
   free(probability);
 }
 
-/** @brief Grammar constraints on a tiny hand-made probability matrix. */
+/** @brief Grammar constraints on a probability matrix. */
 static void test_viterbi(void) {
   enum { N = 60 };
   char bases[N + 1];
@@ -368,7 +367,7 @@ static void test_cwt(void) {
   free(reverse);
 }
 
-/** @brief KANN model round trip and identical predictions. */
+/** @brief model round trip and identical predictions. */
 static void test_model_file(void) {
   UnetConfig config = {
       .depth = 2, .kernel = 9, .pool = 2, .channels = {32, 32}};
