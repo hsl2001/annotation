@@ -52,10 +52,15 @@ typedef struct {
   int k;
   float *w;
   float *b;
+  float *mw;
+  float *vw;
+  float *mb;
+  float *vb;
 } Layer;
 struct Unet {
   UnetConfig config;
   int depth, nlayer;
+  uint64_t optimizer_step;
   Layer layer[MAX_LAYERS];
 };
 
@@ -98,6 +103,10 @@ static void release(Unet *u) {
   for (int i = 0; i < u->nlayer; ++i) {
     free(u->layer[i].w);
     free(u->layer[i].b);
+    free(u->layer[i].mw);
+    free(u->layer[i].vw);
+    free(u->layer[i].mb);
+    free(u->layer[i].vb);
   }
   free(u);
 }
@@ -116,14 +125,56 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   l->in = in;
   l->out = out;
   l->k = k;
-  l->w = (float *)malloc((size_t)in * out * k * sizeof(float));
+  size_t weights = (size_t)in * out * k;
+  l->w = (float *)malloc(weights * sizeof(float));
   l->b = (float *)calloc((size_t)out, sizeof(float));
-  if (!l->w || !l->b)
+  l->mw = (float *)calloc(weights, sizeof(float));
+  l->vw = (float *)calloc(weights, sizeof(float));
+  l->mb = (float *)calloc((size_t)out, sizeof(float));
+  l->vb = (float *)calloc((size_t)out, sizeof(float));
+  if (!l->w || !l->b || !l->mw || !l->vw || !l->mb || !l->vb)
     return 0;
-  for (size_t i = 0; i < (size_t)in * out * k; ++i) {
+  for (size_t i = 0; i < weights; ++i) {
     l->w[i] = 0.01 * anno_random_symmetric(seed);
   }
   return 1;
+}
+
+/**
+ * @brief Apply one Adam update to a parameter vector.
+ * @param parameter Parameters to update.
+ * @param gradient Accumulated gradients.
+ * @param first_moment Adam first-moment state.
+ * @param second_moment Adam second-moment state.
+ * @param count Number of valid samples contributing to gradient.
+ * @param size Number of parameters.
+ * @param step_size Bias-corrected Adam step size.
+ * @return None.
+ */
+static void adam_update(float *parameter, const float *gradient,
+                        float *first_moment, float *second_moment,
+                        size_t count, size_t size, double step_size) {
+  for (size_t i = 0; i < size; ++i) {
+    float g = gradient[i] / (float)count;
+    first_moment[i] =
+        ANNO_ADAM_BETA1 * first_moment[i] + (1.0f - ANNO_ADAM_BETA1) * g;
+    second_moment[i] =
+        ANNO_ADAM_BETA2 * second_moment[i] + (1.0f - ANNO_ADAM_BETA2) * g * g;
+    parameter[i] -= (float)(step_size * first_moment[i] /
+                            (sqrt((double)second_moment[i]) +
+                             ANNO_ADAM_EPSILON));
+  }
+}
+
+static void free_gradients(float **gradient, float **bias, int layers) {
+  if (!gradient || !bias)
+    return;
+  for (int l = 0; l < layers; ++l) {
+    free(gradient[l]);
+    free(bias[l]);
+  }
+  free(gradient);
+  free(bias);
 }
 
 /**
@@ -489,7 +540,7 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
  * @param y Channel-major one-hot target batch.
  * @param m Position mask batch.
  * @param batch Number of batch elements.
- * @param lr Gradient-descent learning rate.
+ * @param lr Adam learning rate.
  * @param loss Receives the mean loss; may be NULL.
  * @return 0 on success, or an errno value otherwise.
  */
@@ -501,14 +552,19 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
   double count = 0;
   float **gw = (float **)calloc((size_t)u->nlayer, sizeof(*gw));
   float **gb = (float **)calloc((size_t)u->nlayer, sizeof(*gb));
-  if (!gw || !gb)
+  if (!gw || !gb) {
+    free(gw);
+    free(gb);
     return ENOMEM;
+  }
   for (int l = 0; l < u->nlayer; ++l) {
     size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
     gw[l] = (float *)calloc(weights, sizeof(float));
     gb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    if (!gw[l] || !gb[l])
+    if (!gw[l] || !gb[l]) {
+      free_gradients(gw, gb, u->nlayer);
       return ENOMEM;
+    }
   }
 #pragma omp parallel for schedule(static)
   for (size_t b = 0; b < batch; ++b) {
@@ -519,17 +575,30 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       sgw[l] = (float *)calloc(weights, sizeof(float));
       sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
     }
+    int gradients_ready = 1;
+    for (int l = 0; l < u->nlayer; ++l)
+      if (!sgw[l] || !sgb[l]) {
+        gradients_ready = 0;
+        break;
+      }
+    if (!gradients_ready) {
+      free_gradients(sgw, sgb, u->nlayer);
+      continue;
+    }
     Workspace a = {0};
     float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
                                sizeof(float));
-    if (!p)
+    if (!p) {
+      free_gradients(sgw, sgb, u->nlayer);
       continue;
+    }
     int rc =
         run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
                     ANNO_UNET_WINDOW, &a, p);
     if (rc) {
       free(p);
       workspace_free(&a);
+      free_gradients(sgw, sgb, u->nlayer);
       continue;
     }
     int out = a.count - 1;
@@ -553,6 +622,7 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     if (!valid) {
       free(p);
       workspace_free(&a);
+      free_gradients(sgw, sgb, u->nlayer);
       continue;
     }
     double sample_loss = 0;
@@ -566,10 +636,26 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     if (!ag) {
       free(p);
       workspace_free(&a);
+      free_gradients(sgw, sgb, u->nlayer);
       continue;
     }
-    for (int z = 0; z < a.count; ++z)
+    int gradients_allocated = 1;
+    for (int z = 0; z < a.count; ++z) {
       ag[z] = (float *)calloc((size_t)a.c[z] * a.n[z], sizeof(float));
+      if (!ag[z]) {
+        gradients_allocated = 0;
+        break;
+      }
+    }
+    if (!gradients_allocated) {
+      for (int z = 0; z < a.count; ++z)
+        free(ag[z]);
+      free(ag);
+      free(p);
+      workspace_free(&a);
+      free_gradients(sgw, sgb, u->nlayer);
+      continue;
+    }
     for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
       if (m[b * ANNO_UNET_WINDOW + i] <= 0)
         continue;
@@ -645,15 +731,22 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     free(sgw);
     free(sgb);
   }
-  if (!count)
+  if (!count) {
+    free_gradients(gw, gb, u->nlayer);
     return EINVAL;
-  float scale = lr / (float)count;
+  }
+  ++u->optimizer_step;
+  double step = (double)u->optimizer_step;
+  double bias_correction1 = 1.0 - pow((double)ANNO_ADAM_BETA1, step);
+  double bias_correction2 = 1.0 - pow((double)ANNO_ADAM_BETA2, step);
+  double step_size = (double)lr * sqrt(bias_correction2) / bias_correction1;
   for (int l = 0; l < u->nlayer; ++l) {
-    for (size_t z = 0;
-         z < (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k; ++z)
-      u->layer[l].w[z] -= scale * gw[l][z];
-    for (int z = 0; z < u->layer[l].out; ++z)
-      u->layer[l].b[z] -= scale * gb[l][z];
+    Layer *layer = &u->layer[l];
+    size_t weights = (size_t)layer->in * layer->out * layer->k;
+    adam_update(layer->w, gw[l], layer->mw, layer->vw, (size_t)count, weights,
+                step_size);
+    adam_update(layer->b, gb[l], layer->mb, layer->vb, (size_t)count,
+                (size_t)layer->out, step_size);
     free(gw[l]);
     free(gb[l]);
   }
@@ -682,8 +775,8 @@ int unet_save(const char *path, const Unet *u) {
          fwrite(u->layer[i].b, (size_t)u->layer[i].out * sizeof(float), 1, f) ==
              1;
   }
-  ok = ok && fclose(f) == 0;
-  return ok ? 0 : EIO;
+  int closed = fclose(f) == 0;
+  return ok && closed ? 0 : EIO;
 }
 
 /**

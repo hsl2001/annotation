@@ -23,7 +23,7 @@
 #define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
 #define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
 #define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
-#define ANNO_UNET_WINDOW 16384    /**< UNet training / inference window      */
+#define ANNO_UNET_WINDOW 4096    /**< UNet training / inference window      */
 #define ANNO_MAX_DEPTH 6          /**< maximum number of UNet levels         */
 #define ANNO_CWT_RADIUS_FACTOR 4  /**< Morlet radius in scale units */
 #define ANNO_MORLET_FREQUENCY 6.0 /**< Morlet carrier frequency */
@@ -35,7 +35,7 @@
 #define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp) */
 #define ANNO_EMISSION_EPSILON 1e-6f
 #define ANNO_TRANSCRIPT_PENALTY                                                \
-  5.0 /**< log penalty for opening a transcript                                \
+  1.0 /**< log penalty for opening a transcript                                \
        */
 /**@}*/
 
@@ -45,7 +45,10 @@
 #define ANNO_BATCH_WINDOWS                                                     \
   128 /**< fixed batch for bounded runtime memory use                           \
       */
-#define ANNO_LEARNING_RATE 1e-2f /**< Default optimizer learning rate. */
+#define ANNO_LEARNING_RATE 1e-2f /**< Default Adam learning rate. */
+#define ANNO_ADAM_BETA1 0.9f
+#define ANNO_ADAM_BETA2 0.999f
+#define ANNO_ADAM_EPSILON 1e-8f
 #define ANNO_EPSILON 1e-5f       /**< Stabilizes the Soft F1 calculation. */
 /**@}*/
 

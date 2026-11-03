@@ -60,7 +60,7 @@ int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
  * @param truth One-hot channel-major target batch.
  * @param mask Position mask batch.
  * @param batch Number of batch elements.
- * @param learning_rate Gradient-descent learning rate.
+ * @param learning_rate Adam learning rate.
  * @param loss Receives the mean objective value; may be NULL.
  * @return 0 on success, or an errno value otherwise.
  */
