@@ -34,9 +34,6 @@
 #define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
 #define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp) */
 #define ANNO_EMISSION_EPSILON 1e-6f
-#define ANNO_TRANSCRIPT_PENALTY                                                \
-  1.0 /**< log penalty for opening a transcript                                \
-       */
 /**@}*/
 
 /** @name Training constants */

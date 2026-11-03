@@ -1019,7 +1019,7 @@ static void grammar_build(Grammar *g) {
     for (int i = 0; i < 3; i++)
       introns[i] = grammar_chain(g, intron, ANNO_MIN_INTRON_LENGTH);
     int tail = ANNO_MIN_INTRON_LENGTH - 1;
-    grammar_edge(g, inter, ex, -ANNO_TRANSCRIPT_PENALTY);
+    grammar_edge(g, inter, ex, 0.0);
     grammar_edge(g, ex_tail, inter, 0.0);
     grammar_edge(g, ex_tail, introns[0], 0.0);
     grammar_edge(g, introns[0] + tail, ex, 0.0);
