@@ -11,7 +11,7 @@ anno: anno.c anno.h unet.c unet.h
 	$(CC) $(CFLAGS) -o $@ anno.c unet.c $(LIBS)
 
 test-anno: test.c anno.h unet.c unet.h
-	$(CC) $(CFLAGS) -o $@ test.c unet.c $(LIBS)
+	$(CC) $(CFLAGS) -o $@ test.c $(LIBS)
 
 test: anno test-anno
 	./test-anno

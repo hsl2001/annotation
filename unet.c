@@ -115,9 +115,11 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   l->vb = (float *)calloc((size_t)out, sizeof(float));
   if (!l->w || !l->b || !l->mw || !l->vw || !l->mb || !l->vb)
     return 0;
-  for (size_t i = 0; i < weights; ++i) {
-    l->w[i] = 0.01 * anno_random_symmetric(seed);
-  }
+  /* He-uniform: Var(w) = 2 / fan_in keeps ReLU activations at unit scale;
+   * the previous fixed 0.01 bound shrank the signal ~20x per layer. */
+  float bound = sqrtf(6.0f / (float)((size_t)in * k));
+  for (size_t i = 0; i < weights; ++i)
+    l->w[i] = bound * anno_random_symmetric(seed);
   return 1;
 }
 
@@ -127,7 +129,7 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
  * @param gradient Accumulated gradients.
  * @param first_moment Adam first-moment state.
  * @param second_moment Adam second-moment state.
- * @param count Number of valid samples contributing to gradient.
+ * @param count Divisor applied to the accumulated gradient.
  * @param size Number of parameters.
  * @param step_size Bias-corrected Adam step size.
  * @return None.
@@ -448,8 +450,9 @@ int unet_predict(const Unet *u, const float *in, int64_t n, float *p) {
  * @param gb Destination bias gradient.
  * @return None.
  */
-static void backward_layer(const Layer *l, const float *x, const float *y,
-                           float *dx, int n, int relu, float *gw, float *gb) {
+static void backward_layer(const Layer *l, const float *x, const float *out,
+                           const float *y, float *dx, int n, int relu,
+                           float *gw, float *gb) {
   int r = l->k / 2;
   memset(dx, 0, (size_t)l->in * n * sizeof(float));
 #pragma omp parallel for
@@ -457,7 +460,7 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
     float db = 0;
     for (int p = 0; p < n; ++p) {
       float g = y[(size_t)o * n + p];
-      if (relu && g < 0)
+      if (relu && out[(size_t)o * n + p] <= 0)
         g = 0;
       db += g;
     }
@@ -467,7 +470,7 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
         float dw = 0;
         for (int p = 0; p < n; ++p) {
           float g = y[(size_t)o * n + p];
-          if (relu && g < 0)
+          if (relu && out[(size_t)o * n + p] <= 0)
             g = 0;
           int z = p + q - r;
           if (z >= 0 && z < n) {
@@ -484,7 +487,8 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
 }
 
 static void backward_concat_layer(const Layer *l, const float *up,
-                                  const float *skip, const float *y,
+                                  const float *skip, const float *out,
+                                  const float *y,
                                   float *dup, float *dskip, int skip_channels,
                                   int n, int relu, float *gw, float *gb) {
   int r = l->k / 2;
@@ -496,7 +500,7 @@ static void backward_concat_layer(const Layer *l, const float *up,
     float db = 0;
     for (int p = 0; p < n; ++p) {
       float g = y[(size_t)o * n + p];
-      if (relu && g < 0)
+      if (relu && out[(size_t)o * n + p] <= 0)
         g = 0;
       db += g;
     }
@@ -506,7 +510,7 @@ static void backward_concat_layer(const Layer *l, const float *up,
         float dw = 0;
         for (int p = 0; p < n; ++p) {
           float g = y[(size_t)o * n + p];
-          if (relu && g < 0)
+          if (relu && out[(size_t)o * n + p] <= 0)
             g = 0;
           int z = p + q - r;
           if (z >= 0 && z < n) {
@@ -523,8 +527,9 @@ static void backward_concat_layer(const Layer *l, const float *up,
   }
 }
 
+/* Accumulates into dx: the pooled tensor is also a skip input, whose
+ * gradient was written there by backward_concat_layer(). */
 static void backward_pool(const float *dy, float *dx, int c, int n, int f) {
-  memset(dx, 0, (size_t)c * n * sizeof(float));
   for (int ch = 0; ch < c; ++ch)
     for (int p = 0; p < n / f; ++p)
       for (int q = 0; q < f; ++q)
@@ -540,191 +545,172 @@ static void backward_upsample(const float *dy, float *dx, int c, int n, int f) {
         dx[(size_t)ch * n + p] += dy[(size_t)ch * n * f + p * f + q];
 }
 /**
- * @brief Train one batch using the masked Soft F1 objective.
+ * @brief Exact gradient of the batch Soft F1 loss.
+ *
+ * Soft F1 is a ratio of sums, so its statistics are pooled over every valid
+ * position of the whole batch before any gradient is formed.  Per-window
+ * statistics would make a class that is absent from a window score
+ * 1 - eps/(sum_p + eps) ~ 1 whatever is predicted, so false positives in
+ * gene-free windows would get (almost) no gradient.  Pass 1 pools the
+ * statistics; pass 2 recomputes the forward activations and backpropagates.
+ * @param u Model to differentiate.
+ * @param x Channel-major input batch.
+ * @param y Channel-major one-hot target batch.
+ * @param m Position mask batch.
+ * @param batch Number of batch elements.
+ * @param gw Zeroed per-layer weight gradients, accumulated in place.
+ * @param gb Zeroed per-layer bias gradients, accumulated in place.
+ * @param loss Receives the batch loss.
+ * @return 0 on success, EINVAL without valid positions, ENOMEM on failure.
+ */
+static int batch_gradient(const Unet *u, const float *x, const float *y,
+                          const float *m, size_t batch, float **gw, float **gb,
+                          double *loss) {
+  Workspace a = {0};
+  float *p =
+      (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES * sizeof(float));
+  if (!p || !workspace_init(u, &a)) {
+    free(p);
+    workspace_free(&a);
+    return ENOMEM;
+  }
+  double sum_p[ANNO_CLASSES] = {0}, sum_y[ANNO_CLASSES] = {0},
+         intersection[ANNO_CLASSES] = {0}, count = 0;
+  for (size_t b = 0; b < batch; ++b) {
+    run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+                ANNO_UNET_WINDOW, &a, p);
+    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
+      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
+        continue;
+      count += 1.0;
+      for (int j = 0; j < ANNO_CLASSES; ++j) {
+        double target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
+                          (size_t)j * ANNO_UNET_WINDOW + i];
+        double probability = p[(size_t)i * ANNO_CLASSES + j];
+        sum_p[j] += probability;
+        sum_y[j] += target;
+        intersection[j] += probability * target;
+      }
+    }
+  }
+  if (!count) {
+    free(p);
+    workspace_free(&a);
+    return EINVAL;
+  }
+  double numerator[ANNO_CLASSES], denominator[ANNO_CLASSES], total = 0;
+  for (int j = 0; j < ANNO_CLASSES; ++j) {
+    numerator[j] = 2.0 * intersection[j] + ANNO_EPSILON;
+    denominator[j] = sum_p[j] + sum_y[j] + ANNO_EPSILON;
+    total += 1.0 - numerator[j] / denominator[j];
+  }
+  *loss = total / ANNO_CLASSES;
+  for (size_t b = 0; b < batch; ++b) {
+    run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+                ANNO_UNET_WINDOW, &a, p);
+    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
+      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
+        continue; /* masked positions keep the zero gradient of reset */
+      double dp[ANNO_CLASSES], softmax_dot = 0;
+      for (int j = 0; j < ANNO_CLASSES; ++j) {
+        double target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
+                          (size_t)j * ANNO_UNET_WINDOW + i];
+        /* d/dp_j of [1 - (2I_j + e)/(P_j + Y_j + e)] / C */
+        dp[j] = -(2.0 * target * denominator[j] - numerator[j]) /
+                (denominator[j] * denominator[j] * ANNO_CLASSES);
+        softmax_dot += dp[j] * p[(size_t)i * ANNO_CLASSES + j];
+      }
+      for (int j = 0; j < ANNO_CLASSES; ++j)
+        a.d[15][(size_t)j * ANNO_UNET_WINDOW + i] =
+            (float)(p[(size_t)i * ANNO_CLASSES + j] * (dp[j] - softmax_dot));
+    }
+    /* each ReLU layer is masked by its own forward output a.a[k] */
+    backward_layer(&u->layer[10], a.a[14], a.a[15], a.d[15], a.d[14], a.n[15],
+                   0, gw[10], gb[10]);
+    backward_layer(&u->layer[9], a.a[13], a.a[14], a.d[14], a.d[13], a.n[14],
+                   RELU_ACTIVATION, gw[9], gb[9]);
+    backward_concat_layer(&u->layer[8], a.a[12], a.a[2], a.a[13], a.d[13],
+                          a.d[12], a.d[2], a.c[2], a.n[13], RELU_ACTIVATION,
+                          gw[8], gb[8]);
+    backward_upsample(a.d[12], a.d[11], a.c[11], a.n[11], u->config.pool);
+    backward_layer(&u->layer[7], a.a[10], a.a[11], a.d[11], a.d[10], a.n[11],
+                   RELU_ACTIVATION, gw[7], gb[7]);
+    backward_concat_layer(&u->layer[6], a.a[9], a.a[5], a.a[10], a.d[10],
+                          a.d[9], a.d[5], a.c[5], a.n[10], RELU_ACTIVATION,
+                          gw[6], gb[6]);
+    backward_upsample(a.d[9], a.d[8], a.c[8], a.n[8], u->config.pool);
+    backward_layer(&u->layer[5], a.a[7], a.a[8], a.d[8], a.d[7], a.n[8],
+                   RELU_ACTIVATION, gw[5], gb[5]);
+    backward_layer(&u->layer[4], a.a[6], a.a[7], a.d[7], a.d[6], a.n[7],
+                   RELU_ACTIVATION, gw[4], gb[4]);
+    backward_pool(a.d[6], a.d[5], a.c[5], a.n[5], u->config.pool);
+    backward_layer(&u->layer[3], a.a[4], a.a[5], a.d[5], a.d[4], a.n[5],
+                   RELU_ACTIVATION, gw[3], gb[3]);
+    backward_layer(&u->layer[2], a.a[3], a.a[4], a.d[4], a.d[3], a.n[4],
+                   RELU_ACTIVATION, gw[2], gb[2]);
+    backward_pool(a.d[3], a.d[2], a.c[2], a.n[2], u->config.pool);
+    backward_layer(&u->layer[1], a.a[1], a.a[2], a.d[2], a.d[1], a.n[2],
+                   RELU_ACTIVATION, gw[1], gb[1]);
+    backward_layer(&u->layer[0], a.a[0], a.a[1], a.d[1], a.d[0], a.n[1],
+                   RELU_ACTIVATION, gw[0], gb[0]);
+  }
+  free(p);
+  workspace_free(&a);
+  return 0;
+}
+
+/**
+ * @brief Train one batch using the masked batch Soft F1 objective.
  * @param u Model to update.
  * @param x Channel-major input batch.
  * @param y Channel-major one-hot target batch.
  * @param m Position mask batch.
  * @param batch Number of batch elements.
  * @param lr Adam learning rate.
- * @param loss Receives the mean loss; may be NULL.
+ * @param loss Receives the batch loss; may be NULL.
  * @return 0 on success, or an errno value otherwise.
  */
 int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
                      size_t batch, float lr, float *loss) {
   if (!u || !x || !y || !m || !batch || !isfinite(lr) || lr <= 0)
     return EINVAL;
-  double total = 0;
-  double count = 0;
   float **gw = (float **)calloc((size_t)u->nlayer, sizeof(*gw));
   float **gb = (float **)calloc((size_t)u->nlayer, sizeof(*gb));
-  if (!gw || !gb) {
-    free(gw);
-    free(gb);
-    return ENOMEM;
-  }
-  for (int l = 0; l < u->nlayer; ++l) {
+  int rc = gw && gb ? 0 : ENOMEM;
+  for (int l = 0; !rc && l < u->nlayer; ++l) {
     size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
     gw[l] = (float *)calloc(weights, sizeof(float));
     gb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    if (!gw[l] || !gb[l]) {
-      free_gradients(gw, gb, u->nlayer);
-      return ENOMEM;
-    }
+    if (!gw[l] || !gb[l])
+      rc = ENOMEM;
   }
-  float **sgw = (float **)calloc((size_t)u->nlayer, sizeof(*sgw));
-  float **sgb = (float **)calloc((size_t)u->nlayer, sizeof(*sgb));
-  Workspace a = {0};
-  float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
-                             sizeof(float));
-  if (!sgw || !sgb || !p || !workspace_init(u, &a)) {
-    free(sgw);
-    free(sgb);
-    free(p);
-    workspace_free(&a);
-    free_gradients(gw, gb, u->nlayer);
-    return ENOMEM;
-  }
-  for (int l = 0; l < u->nlayer; ++l) {
-    size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-    sgw[l] = (float *)calloc(weights, sizeof(float));
-    sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    if (!sgw[l] || !sgb[l]) {
-      free_gradients(sgw, sgb, u->nlayer);
-      workspace_free(&a);
-      free(p);
-      free_gradients(gw, gb, u->nlayer);
-      return ENOMEM;
-    }
-  }
-  for (size_t b = 0; b < batch; ++b) {
+  double total = 0;
+  if (!rc)
+    rc = batch_gradient(u, x, y, m, batch, gw, gb, &total);
+  if (!rc) {
+    ++u->optimizer_step;
+    double step = (double)u->optimizer_step;
+    double bias_correction1 = 1.0 - pow((double)ANNO_ADAM_BETA1, step);
+    double bias_correction2 = 1.0 - pow((double)ANNO_ADAM_BETA2, step);
+    double step_size = (double)lr * sqrt(bias_correction2) / bias_correction1;
     for (int l = 0; l < u->nlayer; ++l) {
-      size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-      memset(sgw[l], 0, weights * sizeof(float));
-      memset(sgb[l], 0, (size_t)u->layer[l].out * sizeof(float));
+      Layer *layer = &u->layer[l];
+      size_t weights = (size_t)layer->in * layer->out * layer->k;
+      adam_update(layer->w, gw[l], layer->mw, layer->vw, 1, weights,
+                  step_size);
+      adam_update(layer->b, gb[l], layer->mb, layer->vb, 1,
+                  (size_t)layer->out, step_size);
     }
-    int rc =
-        run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-                    ANNO_UNET_WINDOW, &a, p);
-    if (rc) {
-      continue;
-    }
-    float sum_p[ANNO_CLASSES] = {0};
-    float sum_y[ANNO_CLASSES] = {0};
-    float intersection[ANNO_CLASSES] = {0};
-    size_t valid = 0;
-    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
-        continue;
-      ++valid;
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
-                         (size_t)j * ANNO_UNET_WINDOW + i];
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        sum_p[j] += probability;
-        sum_y[j] += target;
-        intersection[j] += probability * target;
-      }
-    }
-    if (!valid) {
-      continue;
-    }
-    double sample_loss = 0;
-    for (int j = 0; j < ANNO_CLASSES; ++j) {
-      float numerator = 2.0f * intersection[j] + ANNO_EPSILON;
-      float denominator = sum_p[j] + sum_y[j] + ANNO_EPSILON;
-      sample_loss += 1.0 - numerator / denominator;
-    }
-    sample_loss /= ANNO_CLASSES;
-    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
-        continue;
-      float dp[ANNO_CLASSES];
-      float softmax_dot = 0;
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
-                         (size_t)j * ANNO_UNET_WINDOW + i];
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        float denominator = sum_p[j] + sum_y[j] + ANNO_EPSILON;
-        float numerator = 2.0f * intersection[j] + ANNO_EPSILON;
-        dp[j] = -(2.0f * target * denominator - numerator) /
-                (denominator * denominator * ANNO_CLASSES);
-        softmax_dot += dp[j] * probability;
-      }
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        a.d[15][(size_t)j * ANNO_UNET_WINDOW + i] =
-            probability * (dp[j] - softmax_dot);
-      }
-    }
-    backward_layer(&u->layer[10], a.a[14], a.d[15], a.d[14], a.n[15], 0,
-                   sgw[10], sgb[10]);
-    backward_layer(&u->layer[9], a.a[13], a.d[14], a.d[13], a.n[14],
-                   RELU_ACTIVATION, sgw[9], sgb[9]);
-    backward_concat_layer(&u->layer[8], a.a[12], a.a[2], a.d[13], a.d[12],
-                          a.d[2], a.c[2], a.n[13], RELU_ACTIVATION, sgw[8],
-                          sgb[8]);
-    backward_upsample(a.d[12], a.d[11], a.c[11], a.n[11], u->config.pool);
-    backward_layer(&u->layer[7], a.a[10], a.d[11], a.d[10], a.n[11],
-                   RELU_ACTIVATION, sgw[7], sgb[7]);
-    backward_concat_layer(&u->layer[6], a.a[9], a.a[5], a.d[10], a.d[9],
-                          a.d[5], a.c[5], a.n[10], RELU_ACTIVATION, sgw[6],
-                          sgb[6]);
-    backward_upsample(a.d[9], a.d[8], a.c[8], a.n[8], u->config.pool);
-    backward_layer(&u->layer[5], a.a[7], a.d[8], a.d[7], a.n[8],
-                   RELU_ACTIVATION, sgw[5], sgb[5]);
-    backward_layer(&u->layer[4], a.a[6], a.d[7], a.d[6], a.n[7],
-                   RELU_ACTIVATION, sgw[4], sgb[4]);
-    backward_pool(a.d[6], a.d[5], a.c[5], a.n[5], u->config.pool);
-    backward_layer(&u->layer[3], a.a[4], a.d[5], a.d[4], a.n[5],
-                   RELU_ACTIVATION, sgw[3], sgb[3]);
-    backward_layer(&u->layer[2], a.a[3], a.d[4], a.d[3], a.n[4],
-                   RELU_ACTIVATION, sgw[2], sgb[2]);
-    backward_pool(a.d[3], a.d[2], a.c[2], a.n[2], u->config.pool);
-    backward_layer(&u->layer[1], a.a[1], a.d[2], a.d[1], a.n[2],
-                   RELU_ACTIVATION, sgw[1], sgb[1]);
-    backward_layer(&u->layer[0], a.a[0], a.d[1], a.d[0], a.n[1],
-                   RELU_ACTIVATION, sgw[0], sgb[0]);
-    total += sample_loss;
-    count += 1.0;
-    for (int l = 0; l < u->nlayer; ++l) {
-      size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-      for (size_t z = 0; z < weights; ++z)
-        gw[l][z] += sgw[l][z];
-      for (int z = 0; z < u->layer[l].out; ++z)
-        gb[l][z] += sgb[l][z];
-    }
+    if (loss)
+      *loss = (float)total;
   }
-  if (!count) {
-    free_gradients(sgw, sgb, u->nlayer);
-    workspace_free(&a);
-    free(p);
+  if (gw && gb)
     free_gradients(gw, gb, u->nlayer);
-    return EINVAL;
+  else {
+    free(gw);
+    free(gb);
   }
-  ++u->optimizer_step;
-  double step = (double)u->optimizer_step;
-  double bias_correction1 = 1.0 - pow((double)ANNO_ADAM_BETA1, step);
-  double bias_correction2 = 1.0 - pow((double)ANNO_ADAM_BETA2, step);
-  double step_size = (double)lr * sqrt(bias_correction2) / bias_correction1;
-  for (int l = 0; l < u->nlayer; ++l) {
-    Layer *layer = &u->layer[l];
-    size_t weights = (size_t)layer->in * layer->out * layer->k;
-    adam_update(layer->w, gw[l], layer->mw, layer->vw, (size_t)count, weights,
-                step_size);
-    adam_update(layer->b, gb[l], layer->mb, layer->vb, (size_t)count,
-                (size_t)layer->out, step_size);
-    free(gw[l]);
-    free(gb[l]);
-  }
-  free(gw);
-  free(gb);
-  free_gradients(sgw, sgb, u->nlayer);
-  workspace_free(&a);
-  free(p);
-  if (loss)
-    *loss = (float)(total / count);
-  return 0;
+  return rc;
 }
 /**
  * @brief Write a UNet model to a binary file.

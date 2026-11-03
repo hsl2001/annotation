@@ -1047,6 +1047,7 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
  *   intergenic -> [5'UTR (intron 5'UTR)*] -> exon (intron exon)* ->
  *   [3'UTR (intron 3'UTR)*] -> intergenic; minus strand is the mirror image.
  *   Introns are never entered from intergenic and UTRs never touch directly.
+ *   An intron may also separate a UTR piece from the coding run.
  * @param g Grammar to initialize.
  * @return None.
  */
@@ -1078,6 +1079,11 @@ static void grammar_build(Grammar *g) {
       grammar_edge(g, exits[i], introns[i], 0.0);
       grammar_edge(g, introns[i] + tail, pieces[i], 0.0);
     }
+    /* UTR/CDS boundaries may coincide with splice sites: an exon can start
+     * exactly at the start codon (UTR intron -> CDS) or end exactly at the
+     * stop codon (CDS -> UTR intron). */
+    grammar_edge(g, introns[0] + tail, ex, 0.0);
+    grammar_edge(g, ex_tail, introns[2], 0.0);
   }
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
@@ -1095,6 +1101,7 @@ static void grammar_build(Grammar *g) {
 /** Streaming Viterbi decoder. Owns its buffers. */
 typedef struct {
   Grammar grammar;
+  const char *bases; /**< sequence, read for splice-site motifs */
   int64_t length, position;
   double *previous, *current;
   uint32_t *back;
@@ -1102,12 +1109,14 @@ typedef struct {
 
 /**
  * @brief Create a decoder for a sequence of the given length.
+ * @param bases Sequence bases used for splice-site motifs.
  * @param length Number of sequence positions.
  * @return Newly allocated decoder.
  */
-static Decoder *decoder_create(int64_t length) {
+static Decoder *decoder_create(const char *bases, int64_t length) {
   Decoder *d = xcalloc(1, sizeof(*d));
   grammar_build(&d->grammar);
+  d->bases = bases;
   d->length = length;
   d->previous = xcalloc((size_t)d->grammar.count, sizeof(double));
   d->current = xcalloc((size_t)d->grammar.count, sizeof(double));
@@ -1127,6 +1136,40 @@ static void decoder_destroy(Decoder *d) {
   free(d->current);
   free(d->back);
   free(d);
+}
+
+/** @brief Whether a class is an intron class. */
+static int is_intron(uint8_t cls) {
+  return cls == ANNO_PLUS_INTRON || cls == ANNO_MINUS_INTRON;
+}
+
+/**
+ * @brief Log-score of the splice motif implied by a transition at position i.
+ *
+ * Entering an intron at i means the intron starts at i; leaving it at i
+ * means the intron ends at i-1.  In genomic orientation a plus-strand intron
+ * reads GT...AG and a minus-strand intron reads CT...AC (reverse complement
+ * of GT...AG).  A non-canonical dinucleotide costs
+ * ANNO_NONCANONICAL_SPLICE_PENALTY.
+ * @param bases Sequence bases.
+ * @param length Sequence length.
+ * @param i Position of the destination state.
+ * @param from Class of the predecessor state.
+ * @param to Class of the destination state.
+ * @return 0 or -ANNO_NONCANONICAL_SPLICE_PENALTY.
+ */
+static double splice_score(const char *bases, int64_t length, int64_t i,
+                           uint8_t from, uint8_t to) {
+  int enter = !is_intron(from) && is_intron(to);
+  int leave = is_intron(from) && !is_intron(to);
+  if (!enter && !leave)
+    return 0.0;
+  int plus = (enter ? to : from) == ANNO_PLUS_INTRON;
+  const char *motif = enter ? (plus ? "GT" : "CT") : (plus ? "AG" : "AC");
+  int64_t at = enter ? i : i - 2;
+  int ok = at >= 0 && at + 2 <= length && bases[at] == motif[0] &&
+           bases[at + 1] == motif[1];
+  return ok ? 0.0 : -ANNO_NONCANONICAL_SPLICE_PENALTY;
 }
 
 /**
@@ -1155,7 +1198,9 @@ static void decoder_step(Decoder *d, const float *row) {
     double best = -INFINITY;
     int choice = 0;
     for (int k = 0; k < g->predecessors[s]; k++) {
-      double score = d->previous[g->from[s][k]] + g->score[s][k];
+      double score = d->previous[g->from[s][k]] + g->score[s][k] +
+                     splice_score(d->bases, d->length, i,
+                                  g->cls[g->from[s][k]], g->cls[s]);
       if (score > best) {
         best = score;
         choice = k;
@@ -1199,7 +1244,7 @@ int anno_decode(const char *bases, int64_t length, const float *probability,
                 uint8_t *path) {
   if (!bases || !probability || !path || length < 1)
     return EINVAL;
-  Decoder *d = decoder_create(length);
+  Decoder *d = decoder_create(bases, length);
   for (int64_t i = 0; i < length; i++)
     decoder_step(d, probability + (size_t)i * ANNO_CLASSES);
   int status = decoder_finish(d, path);
@@ -1579,7 +1624,7 @@ static unsigned long predict_genome(const Unet *unet,
   unsigned long genes = 0;
   for (int i = 0; i < count; i++) {
     const AnnoSequence *s = &sequences[i];
-    Decoder *decoder = decoder_create(s->length);
+    Decoder *decoder = decoder_create(s->bases, s->length);
     for (int j = 0; j < ANNO_CLASSES; j++)
       bedgraph.value[j] = -1;
     int64_t window_count =
