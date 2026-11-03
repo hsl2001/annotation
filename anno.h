@@ -42,10 +42,12 @@
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS                                                     \
-  128 /**< fixed batch for bounded runtime memory use                           \
-      */
-#define ANNO_LEARNING_RATE 1e-2f /**< Default Adam learning rate. */
+#ifndef ANNO_BATCH_WINDOWS
+#define ANNO_BATCH_WINDOWS 128 /**< fixed batch for bounded runtime memory use */
+#endif
+#ifndef ANNO_LEARNING_RATE
+#define ANNO_LEARNING_RATE 1e-3f /**< Adam default; 3e-3 and 1e-2 learn slower */
+#endif
 #define ANNO_ADAM_BETA1 0.9f
 #define ANNO_ADAM_BETA2 0.999f
 #define ANNO_ADAM_EPSILON 1e-8f
@@ -174,7 +176,7 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
 
 /**
  * @brief Grammar-constrained Viterbi decoding of a probability matrix.
- * @param bases       sequence (for splice motifs).
+ * @param bases       sequence (unused by the grammar; kept for the API).
  * @param length      Number of sequence positions.
  * @param probability length x ANNO_CLASSES.
  * @param path        length output classes (AnnoClass).

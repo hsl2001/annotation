@@ -1047,6 +1047,7 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
  *   intergenic -> [5'UTR (intron 5'UTR)*] -> exon (intron exon)* ->
  *   [3'UTR (intron 3'UTR)*] -> intergenic; minus strand is the mirror image.
  *   Introns are never entered from intergenic and UTRs never touch directly.
+ *   An intron may also separate a UTR piece from the coding run.
  * @param g Grammar to initialize.
  * @return None.
  */
@@ -1078,6 +1079,11 @@ static void grammar_build(Grammar *g) {
       grammar_edge(g, exits[i], introns[i], 0.0);
       grammar_edge(g, introns[i] + tail, pieces[i], 0.0);
     }
+    /* UTR/CDS boundaries may coincide with splice sites: an exon can start
+     * exactly at the start codon (UTR intron -> CDS) or end exactly at the
+     * stop codon (CDS -> UTR intron). */
+    grammar_edge(g, introns[0] + tail, ex, 0.0);
+    grammar_edge(g, ex_tail, introns[2], 0.0);
   }
   int shift = 0;
   for (int s = 0; s < g->count; s++) {

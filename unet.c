@@ -11,10 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 enum {
   MIN_DIMENSION = 1,
-  RELU_ACTIVATION = 1,
   OUTPUT_KERNEL = 1,
   INITIAL_DEPTH = 3,
   INITIAL_KERNEL = 9,
@@ -27,6 +29,7 @@ enum {
 };
 
 #define MAX_LAYERS UNET_LAYER_COUNT
+#define NORM_EPSILON 1e-5 /**< variance floor of the channel normalization */
 
 typedef struct {
   int in;
@@ -115,9 +118,11 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
   l->vb = (float *)calloc((size_t)out, sizeof(float));
   if (!l->w || !l->b || !l->mw || !l->vw || !l->mb || !l->vb)
     return 0;
-  for (size_t i = 0; i < weights; ++i) {
-    l->w[i] = 0.01 * anno_random_symmetric(seed);
-  }
+  /* He-uniform: Var(w) = 2 / fan_in keeps ReLU activations at unit scale;
+   * the previous fixed 0.01 bound shrank the signal ~20x per layer. */
+  float bound = sqrtf(6.0f / (float)((size_t)in * k));
+  for (size_t i = 0; i < weights; ++i)
+    l->w[i] = bound * anno_random_symmetric(seed);
   return 1;
 }
 
@@ -127,7 +132,7 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
  * @param gradient Accumulated gradients.
  * @param first_moment Adam first-moment state.
  * @param second_moment Adam second-moment state.
- * @param count Number of valid samples contributing to gradient.
+ * @param count Divisor applied to the accumulated gradient.
  * @param size Number of parameters.
  * @param step_size Bias-corrected Adam step size.
  * @return None.
@@ -202,31 +207,61 @@ Unet *unet_create(const UnetConfig *c) {
  * @return None.
  */
 void unet_destroy(Unet *u) { release(u); }
-
 /**
- * @brief Apply one convolution layer.
+ * @brief Apply one convolution to the channel concatenation [a ; b].
+ *
+ * Input channel i < split is read from a, the others from b.  The position
+ * range of every tap is clipped once, so the innermost loop is a plain
+ * contiguous multiply-add that the compiler vectorizes.
  * @param l Layer parameters.
- * @param x Channel-major input activation.
+ * @param a First channel-major input (split channels).
+ * @param b Second channel-major input (l->in - split channels), or NULL.
+ * @param split Number of channels read from a.
  * @param y Channel-major output activation.
  * @param n Number of positions.
- * @param relu Whether to apply ReLU to the output.
+ * @param stat NULL for a linear output; otherwise ReLU followed by
+ *        per-window channel normalization, storing (mean, sd) per channel.
  * @return None.
  */
-static void conv(const Layer *l, const float *x, float *y, int n, int relu) {
+static void convolve(const Layer *l, const float *a, const float *b, int split,
+                     float *y, int n, float *stat) {
   int r = l->k / 2;
-#pragma omp parallel for collapse(2)
-  for (int o = 0; o < l->out; ++o)
-    for (int p = 0; p < n; ++p) {
-      float v = l->b[o];
-      for (int i = 0; i < l->in; ++i)
-        for (int q = 0; q < l->k; ++q) {
-          int z = p + q - r;
-          if (z >= 0 && z < n)
-            v +=
-                l->w[((size_t)o * l->in + i) * l->k + q] * x[(size_t)i * n + z];
-        }
-      y[(size_t)o * n + p] = relu && v < 0 ? 0 : v;
+#pragma omp parallel for schedule(static)
+  for (int o = 0; o < l->out; ++o) {
+    float *yo = y + (size_t)o * n;
+    for (int p = 0; p < n; ++p)
+      yo[p] = l->b[o];
+    for (int i = 0; i < l->in; ++i) {
+      const float *xi =
+          i < split ? a + (size_t)i * n : b + (size_t)(i - split) * n;
+      const float *w = l->w + ((size_t)o * l->in + i) * l->k;
+      for (int q = 0; q < l->k; ++q) {
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
+        float wq = w[q];
+        for (int p = lo; p < hi; ++p)
+          yo[p] += wq * xi[p + s];
+      }
     }
+    if (!stat)
+      continue;
+    double sum = 0, square = 0;
+    for (int p = 0; p < n; ++p) {
+      yo[p] = yo[p] < 0 ? 0 : yo[p];
+      sum += yo[p];
+      square += (double)yo[p] * yo[p];
+    }
+    double mean = sum / n, var = square / n - mean * mean;
+    float mu = (float)mean, sd = (float)sqrt((var > 0 ? var : 0) + NORM_EPSILON);
+    for (int p = 0; p < n; ++p)
+      yo[p] = (yo[p] - mu) / sd;
+    stat[2 * o] = mu;
+    stat[2 * o + 1] = sd;
+  }
+}
+
+/** @brief Plain convolution layer; see convolve(). */
+static void conv(const Layer *l, const float *x, float *y, int n, float *stat) {
+  convolve(l, x, NULL, l->in, y, n, stat);
 }
 
 /**
@@ -268,6 +303,7 @@ static void upsample(const float *x, float *y, int c, int n, int f) {
 
 typedef struct {
   float *a[WORKSPACE_COUNT], *d[WORKSPACE_COUNT];
+  float *s[MAX_LAYERS]; /**< per-layer normalization (mean, sd) pairs */
   int n[WORKSPACE_COUNT], c[WORKSPACE_COUNT];
   int count;
 } Workspace;
@@ -296,6 +332,9 @@ static int workspace_init(const Unet *u, Workspace *a) {
     if (!a->a[i] || !a->d[i])
       return 0;
   }
+  for (int l = 0; l < u->nlayer; ++l)
+    if (!(a->s[l] = (float *)calloc(2 * (size_t)u->layer[l].out, sizeof(float))))
+      return 0;
   return 1;
 }
 
@@ -309,15 +348,11 @@ static void workspace_free(Workspace *a) {
     free(a->a[i]);
     free(a->d[i]);
   }
+  for (int l = 0; l < MAX_LAYERS; ++l)
+    free(a->s[l]);
   memset(a, 0, sizeof(*a));
 }
 
-static void workspace_reset(Workspace *a) {
-  for (int i = 0; i < a->count; ++i) {
-    memset(a->a[i], 0, (size_t)a->c[i] * a->n[i] * sizeof(float));
-    memset(a->d[i], 0, (size_t)a->c[i] * a->n[i] * sizeof(float));
-  }
-}
 
 /**
  * @brief Run the UNet forward pass and softmax output.
@@ -328,50 +363,33 @@ static void workspace_reset(Workspace *a) {
  * @param prob Position-major class probabilities.
  * @return 0 on success, or ENOMEM on allocation failure.
  */
+/** @brief Convolution over the concatenation [up ; skip]; see convolve(). */
 static void conv_concat(const Layer *l, const float *up, const float *skip,
-                        float *y, int skip_channels, int n, int relu) {
-  int r = l->k / 2;
-#pragma omp parallel for collapse(2)
-  for (int o = 0; o < l->out; ++o)
-    for (int p = 0; p < n; ++p) {
-      float v = l->b[o];
-      for (int i = 0; i < l->in; ++i)
-        for (int q = 0; q < l->k; ++q) {
-          int z = p + q - r;
-          if (z >= 0 && z < n) {
-            int split = l->in - skip_channels;
-            const float *input = i < split ? up : skip;
-            int channel = i < split ? i : i - split;
-            v += l->w[((size_t)o * l->in + i) * l->k + q] *
-                 input[(size_t)channel * n + z];
-          }
-        }
-      y[(size_t)o * n + p] = relu && v < 0 ? 0 : v;
-    }
+                        float *y, int skip_channels, int n, float *stat) {
+  convolve(l, up, skip, l->in - skip_channels, y, n, stat);
 }
 
 static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
                        float *prob) {
-  workspace_reset(a);
   memcpy(a->a[0], x, (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW *
                          sizeof(float));
-  conv(&u->layer[0], a->a[0], a->a[1], a->n[1], RELU_ACTIVATION);
-  conv(&u->layer[1], a->a[1], a->a[2], a->n[2], RELU_ACTIVATION);
+  conv(&u->layer[0], a->a[0], a->a[1], a->n[1], a->s[0]);
+  conv(&u->layer[1], a->a[1], a->a[2], a->n[2], a->s[1]);
   pool(a->a[2], a->a[3], a->c[2], a->n[2], u->config.pool);
-  conv(&u->layer[2], a->a[3], a->a[4], a->n[4], RELU_ACTIVATION);
-  conv(&u->layer[3], a->a[4], a->a[5], a->n[5], RELU_ACTIVATION);
+  conv(&u->layer[2], a->a[3], a->a[4], a->n[4], a->s[2]);
+  conv(&u->layer[3], a->a[4], a->a[5], a->n[5], a->s[3]);
   pool(a->a[5], a->a[6], a->c[5], a->n[5], u->config.pool);
-  conv(&u->layer[4], a->a[6], a->a[7], a->n[7], RELU_ACTIVATION);
-  conv(&u->layer[5], a->a[7], a->a[8], a->n[8], RELU_ACTIVATION);
+  conv(&u->layer[4], a->a[6], a->a[7], a->n[7], a->s[4]);
+  conv(&u->layer[5], a->a[7], a->a[8], a->n[8], a->s[5]);
   upsample(a->a[8], a->a[9], a->c[8], a->n[8], u->config.pool);
   conv_concat(&u->layer[6], a->a[9], a->a[5], a->a[10], a->c[5], a->n[10],
-              RELU_ACTIVATION);
-  conv(&u->layer[7], a->a[10], a->a[11], a->n[11], RELU_ACTIVATION);
+              a->s[6]);
+  conv(&u->layer[7], a->a[10], a->a[11], a->n[11], a->s[7]);
   upsample(a->a[11], a->a[12], a->c[11], a->n[11], u->config.pool);
   conv_concat(&u->layer[8], a->a[12], a->a[2], a->a[13], a->c[2], a->n[13],
-              RELU_ACTIVATION);
-  conv(&u->layer[9], a->a[13], a->a[14], a->n[14], RELU_ACTIVATION);
-  conv(&u->layer[10], a->a[14], a->a[15], a->n[15], 0);
+              a->s[8]);
+  conv(&u->layer[9], a->a[13], a->a[14], a->n[14], a->s[9]);
+  conv(&u->layer[10], a->a[14], a->a[15], a->n[15], NULL);
   float *z = a->a[15];
   int64_t usable = len;
 #pragma omp parallel for
@@ -435,96 +453,101 @@ int unet_predict(const Unet *u, const float *in, int64_t n, float *p) {
   free(x);
   return rc;
 }
-
 /**
- * @brief Backpropagate through one convolution layer.
+ * @brief Backpropagate through convolve().
  * @param l Layer parameters.
- * @param x Layer input activation.
- * @param y Layer output gradient.
- * @param dx Destination input gradient.
+ * @param a First forward input (split channels).
+ * @param b Second forward input, or NULL.
+ * @param split Number of channels read from a.
+ * @param out Forward output (normalized when stat is set).
+ * @param dy Output gradient; overwritten with the pre-ReLU gradient.
+ * @param da Receives the gradient of a (overwritten), or NULL to skip.
+ * @param db Receives the gradient of b (overwritten), or NULL.
  * @param n Activation length.
- * @param relu Whether the output used ReLU.
- * @param gw Destination weight gradient.
- * @param gb Destination bias gradient.
+ * @param stat Forward (mean, sd) per channel, or NULL for a linear layer.
+ * @param gw Weight gradient, accumulated.
+ * @param gb Bias gradient, accumulated.
  * @return None.
  */
-static void backward_layer(const Layer *l, const float *x, const float *y,
-                           float *dx, int n, int relu, float *gw, float *gb) {
+static void convolve_backward(const Layer *l, const float *a, const float *b,
+                              int split, const float *out, float *dy,
+                              float *da, float *db, int n, const float *stat,
+                              float *gw, float *gb) {
   int r = l->k / 2;
-  memset(dx, 0, (size_t)l->in * n * sizeof(float));
-#pragma omp parallel for
-  for (int o = 0; o < l->out; ++o) {
-    float db = 0;
+  for (int o = 0; stat && o < l->out; ++o) {
+    /* out = (relu(z) - mu) / sd; relu(z) == 0 exactly where out == floor */
+    float *g = dy + (size_t)o * n;
+    const float *x = out + (size_t)o * n;
+    float mu = stat[2 * o], sd = stat[2 * o + 1], floor = (0.0f - mu) / sd;
+    double m1 = 0, m2 = 0;
     for (int p = 0; p < n; ++p) {
-      float g = y[(size_t)o * n + p];
-      if (relu && g < 0)
-        g = 0;
-      db += g;
+      m1 += g[p];
+      m2 += (double)g[p] * x[p];
     }
-    gb[o] += db;
-    for (int i = 0; i < l->in; ++i)
+    m1 /= n;
+    m2 /= n;
+    for (int p = 0; p < n; ++p)
+      g[p] = x[p] > floor ? (float)((g[p] - m1 - x[p] * m2) / sd) : 0.0f;
+  }
+#pragma omp parallel for schedule(static)
+  for (int o = 0; o < l->out; ++o) {
+    const float *g = dy + (size_t)o * n;
+    float sum = 0;
+    for (int p = 0; p < n; ++p)
+      sum += g[p];
+    gb[o] += sum;
+    for (int i = 0; i < l->in; ++i) {
+      const float *xi =
+          i < split ? a + (size_t)i * n : b + (size_t)(i - split) * n;
+      float *w = gw + ((size_t)o * l->in + i) * l->k;
       for (int q = 0; q < l->k; ++q) {
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
         float dw = 0;
-        for (int p = 0; p < n; ++p) {
-          float g = y[(size_t)o * n + p];
-          if (relu && g < 0)
-            g = 0;
-          int z = p + q - r;
-          if (z >= 0 && z < n) {
-            dw += g * x[(size_t)i * n + z];
-#pragma omp atomic
-            dx[(size_t)i * n + z] +=
-                g * l->w[((size_t)o * l->in + i) * l->k + q];
-          }
-        }
-
-        gw[((size_t)o * l->in + i) * l->k + q] += dw;
+        for (int p = lo; p < hi; ++p)
+          dw += g[p] * xi[p + s];
+        w[q] += dw;
       }
+    }
+  }
+  if (!da)
+    return;
+#pragma omp parallel for schedule(static)
+  for (int i = 0; i < l->in; ++i) {
+    float *dx = i < split ? da + (size_t)i * n : db + (size_t)(i - split) * n;
+    memset(dx, 0, (size_t)n * sizeof(float));
+    for (int o = 0; o < l->out; ++o) {
+      const float *g = dy + (size_t)o * n;
+      const float *w = l->w + ((size_t)o * l->in + i) * l->k;
+      for (int q = 0; q < l->k; ++q) {
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
+        float wq = w[q];
+        for (int p = lo; p < hi; ++p)
+          dx[p + s] += wq * g[p];
+      }
+    }
   }
 }
 
+/** @brief Backpropagate through conv(); dx may be NULL. */
+static void backward_layer(const Layer *l, const float *x, const float *out,
+                           float *y, float *dx, int n, const float *stat, float *gw,
+                           float *gb) {
+  convolve_backward(l, x, NULL, l->in, out, y, dx, NULL, n, stat, gw, gb);
+}
+
+/** @brief Backpropagate through conv_concat(). */
 static void backward_concat_layer(const Layer *l, const float *up,
-                                  const float *skip, const float *y,
-                                  float *dup, float *dskip, int skip_channels,
-                                  int n, int relu, float *gw, float *gb) {
-  int r = l->k / 2;
-  int split = l->in - skip_channels;
-  memset(dup, 0, (size_t)split * n * sizeof(float));
-  memset(dskip, 0, (size_t)skip_channels * n * sizeof(float));
-#pragma omp parallel for
-  for (int o = 0; o < l->out; ++o) {
-    float db = 0;
-    for (int p = 0; p < n; ++p) {
-      float g = y[(size_t)o * n + p];
-      if (relu && g < 0)
-        g = 0;
-      db += g;
-    }
-    gb[o] += db;
-    for (int i = 0; i < l->in; ++i)
-      for (int q = 0; q < l->k; ++q) {
-        float dw = 0;
-        for (int p = 0; p < n; ++p) {
-          float g = y[(size_t)o * n + p];
-          if (relu && g < 0)
-            g = 0;
-          int z = p + q - r;
-          if (z >= 0 && z < n) {
-            const float *input = i < split ? up : skip;
-            int channel = i < split ? i : i - split;
-            dw += g * input[(size_t)channel * n + z];
-#pragma omp atomic
-            (i < split ? dup : dskip)[(size_t)channel * n + z] +=
-                g * l->w[((size_t)o * l->in + i) * l->k + q];
-          }
-        }
-        gw[((size_t)o * l->in + i) * l->k + q] += dw;
-      }
-  }
+                                  const float *skip, const float *out,
+                                  float *y, float *dup, float *dskip,
+                                  int skip_channels, int n, const float *stat,
+                                  float *gw, float *gb) {
+  convolve_backward(l, up, skip, l->in - skip_channels, out, y, dup, dskip, n,
+                    stat, gw, gb);
 }
 
+/* Accumulates into dx: the pooled tensor is also a skip input, whose
+ * gradient was written there by backward_concat_layer(). */
 static void backward_pool(const float *dy, float *dx, int c, int n, int f) {
-  memset(dx, 0, (size_t)c * n * sizeof(float));
   for (int ch = 0; ch < c; ++ch)
     for (int p = 0; p < n / f; ++p)
       for (int q = 0; q < f; ++q)
@@ -539,192 +562,249 @@ static void backward_upsample(const float *dy, float *dx, int c, int n, int f) {
       for (int q = 0; q < f; ++q)
         dx[(size_t)ch * n + p] += dy[(size_t)ch * n * f + p * f + q];
 }
+/* Backpropagate a->d[15] through the whole network of one window. */
+static void window_backward(const Unet *u, Workspace *a, float **gw,
+                            float **gb) {
+  /* each ReLU layer is masked by its own forward output a->a[k] */
+  backward_layer(&u->layer[10], a->a[14], a->a[15], a->d[15], a->d[14],
+                 a->n[15], NULL, gw[10], gb[10]);
+  backward_layer(&u->layer[9], a->a[13], a->a[14], a->d[14], a->d[13],
+                 a->n[14], a->s[9], gw[9], gb[9]);
+  backward_concat_layer(&u->layer[8], a->a[12], a->a[2], a->a[13], a->d[13],
+                        a->d[12], a->d[2], a->c[2], a->n[13], a->s[8],
+                        gw[8], gb[8]);
+  backward_upsample(a->d[12], a->d[11], a->c[11], a->n[11], u->config.pool);
+  backward_layer(&u->layer[7], a->a[10], a->a[11], a->d[11], a->d[10],
+                 a->n[11], a->s[7], gw[7], gb[7]);
+  backward_concat_layer(&u->layer[6], a->a[9], a->a[5], a->a[10], a->d[10],
+                        a->d[9], a->d[5], a->c[5], a->n[10], a->s[6],
+                        gw[6], gb[6]);
+  backward_upsample(a->d[9], a->d[8], a->c[8], a->n[8], u->config.pool);
+  backward_layer(&u->layer[5], a->a[7], a->a[8], a->d[8], a->d[7], a->n[8],
+                 a->s[5], gw[5], gb[5]);
+  backward_layer(&u->layer[4], a->a[6], a->a[7], a->d[7], a->d[6], a->n[7],
+                 a->s[4], gw[4], gb[4]);
+  backward_pool(a->d[6], a->d[5], a->c[5], a->n[5], u->config.pool);
+  backward_layer(&u->layer[3], a->a[4], a->a[5], a->d[5], a->d[4], a->n[5],
+                 a->s[3], gw[3], gb[3]);
+  backward_layer(&u->layer[2], a->a[3], a->a[4], a->d[4], a->d[3], a->n[4],
+                 a->s[2], gw[2], gb[2]);
+  backward_pool(a->d[3], a->d[2], a->c[2], a->n[2], u->config.pool);
+  backward_layer(&u->layer[1], a->a[1], a->a[2], a->d[2], a->d[1], a->n[2],
+                 a->s[1], gw[1], gb[1]);
+  backward_layer(&u->layer[0], a->a[0], a->a[1], a->d[1], NULL, a->n[1],
+                 a->s[0], gw[0], gb[0]);
+}
+
+/* Independent per-thread scratch: activations, probabilities, gradients
+ * and Soft F1 statistics. */
+typedef struct {
+  Workspace a;
+  float *p, *gw[MAX_LAYERS], *gb[MAX_LAYERS];
+  double sum_p[ANNO_CLASSES], sum_y[ANNO_CLASSES], inter[ANNO_CLASSES], count;
+} Worker;
+
+static void worker_free(Worker *w) {
+  workspace_free(&w->a);
+  free(w->p);
+  for (int l = 0; l < MAX_LAYERS; ++l) {
+    free(w->gw[l]);
+    free(w->gb[l]);
+  }
+}
+
+static int worker_init(const Unet *u, Worker *w) {
+  memset(w, 0, sizeof(*w));
+  int ok = workspace_init(u, &w->a);
+  w->p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
+                         sizeof(float));
+  ok = ok && w->p;
+  for (int l = 0; ok && l < u->nlayer; ++l) {
+    const Layer *y = &u->layer[l];
+    w->gw[l] = (float *)calloc((size_t)y->in * y->out * y->k, sizeof(float));
+    w->gb[l] = (float *)calloc((size_t)y->out, sizeof(float));
+    ok = w->gw[l] && w->gb[l];
+  }
+  if (!ok)
+    worker_free(w);
+  return ok;
+}
+
 /**
- * @brief Train one batch using the masked Soft F1 objective.
+ * @brief Exact gradient of the batch Soft F1 loss.
+ *
+ * Soft F1 is a ratio of sums, so its statistics are pooled over every valid
+ * position of the whole batch before any gradient is formed.  Pass 1 pools
+ * the statistics; pass 2 recomputes the forward activations and
+ * backpropagates.  Windows are distributed over threads, each with its own
+ * workspace and gradient buffers, reduced at the end in thread order.
+ * @param u Model to differentiate.
+ * @param x Channel-major input batch.
+ * @param y Channel-major one-hot target batch.
+ * @param m Position mask batch.
+ * @param batch Number of batch elements.
+ * @param gw Zeroed per-layer weight gradients, accumulated in place.
+ * @param gb Zeroed per-layer bias gradients, accumulated in place.
+ * @param loss Receives the batch loss.
+ * @return 0 on success, EINVAL without valid positions, ENOMEM on failure.
+ */
+static int batch_gradient(const Unet *u, const float *x, const float *y,
+                          const float *m, size_t batch, float **gw, float **gb,
+                          double *loss) {
+  int threads = 1;
+#ifdef _OPENMP
+  threads = omp_get_max_threads();
+#endif
+  if ((size_t)threads > batch)
+    threads = (int)batch;
+  Worker *work = (Worker *)calloc((size_t)threads, sizeof(*work));
+  int ready = 0;
+  while (work && ready < threads && worker_init(u, &work[ready]))
+    ++ready;
+  if (ready < threads) {
+    for (int t = 0; t < ready; ++t)
+      worker_free(&work[t]);
+    free(work);
+    return ENOMEM;
+  }
+  const size_t xs = (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+               ys = (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW;
+#pragma omp parallel for num_threads(threads) schedule(static)
+  for (size_t b = 0; b < batch; ++b) {
+    int t = 0;
+#ifdef _OPENMP
+    t = omp_get_thread_num();
+#endif
+    Worker *w = &work[t];
+    run_forward(u, x + b * xs, ANNO_UNET_WINDOW, &w->a, w->p);
+    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
+      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
+        continue;
+      w->count += 1.0;
+      for (int j = 0; j < ANNO_CLASSES; ++j) {
+        double target = y[b * ys + (size_t)j * ANNO_UNET_WINDOW + i];
+        double probability = w->p[(size_t)i * ANNO_CLASSES + j];
+        w->sum_p[j] += probability;
+        w->sum_y[j] += target;
+        w->inter[j] += probability * target;
+      }
+    }
+  }
+  double sum_p[ANNO_CLASSES] = {0}, sum_y[ANNO_CLASSES] = {0},
+         inter[ANNO_CLASSES] = {0}, count = 0;
+  for (int t = 0; t < threads; ++t) {
+    count += work[t].count;
+    for (int j = 0; j < ANNO_CLASSES; ++j) {
+      sum_p[j] += work[t].sum_p[j];
+      sum_y[j] += work[t].sum_y[j];
+      inter[j] += work[t].inter[j];
+    }
+  }
+  int rc = count ? 0 : EINVAL;
+  double numerator[ANNO_CLASSES], denominator[ANNO_CLASSES], total = 0;
+  for (int j = 0; j < ANNO_CLASSES; ++j) {
+    numerator[j] = 2.0 * inter[j] + ANNO_EPSILON;
+    denominator[j] = sum_p[j] + sum_y[j] + ANNO_EPSILON;
+    total += 1.0 - numerator[j] / denominator[j];
+  }
+  *loss = total / ANNO_CLASSES;
+  if (!rc) {
+#pragma omp parallel for num_threads(threads) schedule(static)
+    for (size_t b = 0; b < batch; ++b) {
+      int t = 0;
+#ifdef _OPENMP
+      t = omp_get_thread_num();
+#endif
+      Worker *w = &work[t];
+      run_forward(u, x + b * xs, ANNO_UNET_WINDOW, &w->a, w->p);
+      float *d = w->a.d[15];
+      for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
+        int valid = m[b * ANNO_UNET_WINDOW + i] > 0;
+        double dp[ANNO_CLASSES], softmax_dot = 0;
+        for (int j = 0; j < ANNO_CLASSES; ++j) {
+          double target = y[b * ys + (size_t)j * ANNO_UNET_WINDOW + i];
+          /* d/dp_j of [1 - (2I_j + e)/(P_j + Y_j + e)] / C */
+          dp[j] = -(2.0 * target * denominator[j] - numerator[j]) /
+                  (denominator[j] * denominator[j] * ANNO_CLASSES);
+          softmax_dot += dp[j] * w->p[(size_t)i * ANNO_CLASSES + j];
+        }
+        for (int j = 0; j < ANNO_CLASSES; ++j)
+          d[(size_t)j * ANNO_UNET_WINDOW + i] =
+              valid ? (float)(w->p[(size_t)i * ANNO_CLASSES + j] *
+                              (dp[j] - softmax_dot))
+                    : 0.0f;
+      }
+      window_backward(u, &w->a, w->gw, w->gb);
+    }
+    for (int l = 0; l < u->nlayer; ++l) {
+      const Layer *q = &u->layer[l];
+      size_t weights = (size_t)q->in * q->out * q->k;
+      for (int t = 0; t < threads; ++t) {
+        for (size_t z = 0; z < weights; ++z)
+          gw[l][z] += work[t].gw[l][z];
+        for (int z = 0; z < q->out; ++z)
+          gb[l][z] += work[t].gb[l][z];
+      }
+    }
+  }
+  for (int t = 0; t < threads; ++t)
+    worker_free(&work[t]);
+  free(work);
+  return rc;
+}
+
+/**
+ * @brief Train one batch using the masked batch Soft F1 objective.
  * @param u Model to update.
  * @param x Channel-major input batch.
  * @param y Channel-major one-hot target batch.
  * @param m Position mask batch.
  * @param batch Number of batch elements.
  * @param lr Adam learning rate.
- * @param loss Receives the mean loss; may be NULL.
+ * @param loss Receives the batch loss; may be NULL.
  * @return 0 on success, or an errno value otherwise.
  */
 int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
                      size_t batch, float lr, float *loss) {
   if (!u || !x || !y || !m || !batch || !isfinite(lr) || lr <= 0)
     return EINVAL;
-  double total = 0;
-  double count = 0;
   float **gw = (float **)calloc((size_t)u->nlayer, sizeof(*gw));
   float **gb = (float **)calloc((size_t)u->nlayer, sizeof(*gb));
-  if (!gw || !gb) {
-    free(gw);
-    free(gb);
-    return ENOMEM;
-  }
-  for (int l = 0; l < u->nlayer; ++l) {
+  int rc = gw && gb ? 0 : ENOMEM;
+  for (int l = 0; !rc && l < u->nlayer; ++l) {
     size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
     gw[l] = (float *)calloc(weights, sizeof(float));
     gb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    if (!gw[l] || !gb[l]) {
-      free_gradients(gw, gb, u->nlayer);
-      return ENOMEM;
-    }
+    if (!gw[l] || !gb[l])
+      rc = ENOMEM;
   }
-  float **sgw = (float **)calloc((size_t)u->nlayer, sizeof(*sgw));
-  float **sgb = (float **)calloc((size_t)u->nlayer, sizeof(*sgb));
-  Workspace a = {0};
-  float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
-                             sizeof(float));
-  if (!sgw || !sgb || !p || !workspace_init(u, &a)) {
-    free(sgw);
-    free(sgb);
-    free(p);
-    workspace_free(&a);
-    free_gradients(gw, gb, u->nlayer);
-    return ENOMEM;
-  }
-  for (int l = 0; l < u->nlayer; ++l) {
-    size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-    sgw[l] = (float *)calloc(weights, sizeof(float));
-    sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    if (!sgw[l] || !sgb[l]) {
-      free_gradients(sgw, sgb, u->nlayer);
-      workspace_free(&a);
-      free(p);
-      free_gradients(gw, gb, u->nlayer);
-      return ENOMEM;
-    }
-  }
-  for (size_t b = 0; b < batch; ++b) {
+  double total = 0;
+  if (!rc)
+    rc = batch_gradient(u, x, y, m, batch, gw, gb, &total);
+  if (!rc) {
+    ++u->optimizer_step;
+    double step = (double)u->optimizer_step;
+    double bias_correction1 = 1.0 - pow((double)ANNO_ADAM_BETA1, step);
+    double bias_correction2 = 1.0 - pow((double)ANNO_ADAM_BETA2, step);
+    double step_size = (double)lr * sqrt(bias_correction2) / bias_correction1;
     for (int l = 0; l < u->nlayer; ++l) {
-      size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-      memset(sgw[l], 0, weights * sizeof(float));
-      memset(sgb[l], 0, (size_t)u->layer[l].out * sizeof(float));
+      Layer *layer = &u->layer[l];
+      size_t weights = (size_t)layer->in * layer->out * layer->k;
+      adam_update(layer->w, gw[l], layer->mw, layer->vw, 1, weights,
+                  step_size);
+      adam_update(layer->b, gb[l], layer->mb, layer->vb, 1,
+                  (size_t)layer->out, step_size);
     }
-    int rc =
-        run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-                    ANNO_UNET_WINDOW, &a, p);
-    if (rc) {
-      continue;
-    }
-    float sum_p[ANNO_CLASSES] = {0};
-    float sum_y[ANNO_CLASSES] = {0};
-    float intersection[ANNO_CLASSES] = {0};
-    size_t valid = 0;
-    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
-        continue;
-      ++valid;
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
-                         (size_t)j * ANNO_UNET_WINDOW + i];
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        sum_p[j] += probability;
-        sum_y[j] += target;
-        intersection[j] += probability * target;
-      }
-    }
-    if (!valid) {
-      continue;
-    }
-    double sample_loss = 0;
-    for (int j = 0; j < ANNO_CLASSES; ++j) {
-      float numerator = 2.0f * intersection[j] + ANNO_EPSILON;
-      float denominator = sum_p[j] + sum_y[j] + ANNO_EPSILON;
-      sample_loss += 1.0 - numerator / denominator;
-    }
-    sample_loss /= ANNO_CLASSES;
-    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
-        continue;
-      float dp[ANNO_CLASSES];
-      float softmax_dot = 0;
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float target = y[b * (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW +
-                         (size_t)j * ANNO_UNET_WINDOW + i];
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        float denominator = sum_p[j] + sum_y[j] + ANNO_EPSILON;
-        float numerator = 2.0f * intersection[j] + ANNO_EPSILON;
-        dp[j] = -(2.0f * target * denominator - numerator) /
-                (denominator * denominator * ANNO_CLASSES);
-        softmax_dot += dp[j] * probability;
-      }
-      for (int j = 0; j < ANNO_CLASSES; ++j) {
-        float probability = p[(size_t)i * ANNO_CLASSES + j];
-        a.d[15][(size_t)j * ANNO_UNET_WINDOW + i] =
-            probability * (dp[j] - softmax_dot);
-      }
-    }
-    backward_layer(&u->layer[10], a.a[14], a.d[15], a.d[14], a.n[15], 0,
-                   sgw[10], sgb[10]);
-    backward_layer(&u->layer[9], a.a[13], a.d[14], a.d[13], a.n[14],
-                   RELU_ACTIVATION, sgw[9], sgb[9]);
-    backward_concat_layer(&u->layer[8], a.a[12], a.a[2], a.d[13], a.d[12],
-                          a.d[2], a.c[2], a.n[13], RELU_ACTIVATION, sgw[8],
-                          sgb[8]);
-    backward_upsample(a.d[12], a.d[11], a.c[11], a.n[11], u->config.pool);
-    backward_layer(&u->layer[7], a.a[10], a.d[11], a.d[10], a.n[11],
-                   RELU_ACTIVATION, sgw[7], sgb[7]);
-    backward_concat_layer(&u->layer[6], a.a[9], a.a[5], a.d[10], a.d[9],
-                          a.d[5], a.c[5], a.n[10], RELU_ACTIVATION, sgw[6],
-                          sgb[6]);
-    backward_upsample(a.d[9], a.d[8], a.c[8], a.n[8], u->config.pool);
-    backward_layer(&u->layer[5], a.a[7], a.d[8], a.d[7], a.n[8],
-                   RELU_ACTIVATION, sgw[5], sgb[5]);
-    backward_layer(&u->layer[4], a.a[6], a.d[7], a.d[6], a.n[7],
-                   RELU_ACTIVATION, sgw[4], sgb[4]);
-    backward_pool(a.d[6], a.d[5], a.c[5], a.n[5], u->config.pool);
-    backward_layer(&u->layer[3], a.a[4], a.d[5], a.d[4], a.n[5],
-                   RELU_ACTIVATION, sgw[3], sgb[3]);
-    backward_layer(&u->layer[2], a.a[3], a.d[4], a.d[3], a.n[4],
-                   RELU_ACTIVATION, sgw[2], sgb[2]);
-    backward_pool(a.d[3], a.d[2], a.c[2], a.n[2], u->config.pool);
-    backward_layer(&u->layer[1], a.a[1], a.d[2], a.d[1], a.n[2],
-                   RELU_ACTIVATION, sgw[1], sgb[1]);
-    backward_layer(&u->layer[0], a.a[0], a.d[1], a.d[0], a.n[1],
-                   RELU_ACTIVATION, sgw[0], sgb[0]);
-    total += sample_loss;
-    count += 1.0;
-    for (int l = 0; l < u->nlayer; ++l) {
-      size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-      for (size_t z = 0; z < weights; ++z)
-        gw[l][z] += sgw[l][z];
-      for (int z = 0; z < u->layer[l].out; ++z)
-        gb[l][z] += sgb[l][z];
-    }
+    if (loss)
+      *loss = (float)total;
   }
-  if (!count) {
-    free_gradients(sgw, sgb, u->nlayer);
-    workspace_free(&a);
-    free(p);
+  if (gw && gb)
     free_gradients(gw, gb, u->nlayer);
-    return EINVAL;
+  else {
+    free(gw);
+    free(gb);
   }
-  ++u->optimizer_step;
-  double step = (double)u->optimizer_step;
-  double bias_correction1 = 1.0 - pow((double)ANNO_ADAM_BETA1, step);
-  double bias_correction2 = 1.0 - pow((double)ANNO_ADAM_BETA2, step);
-  double step_size = (double)lr * sqrt(bias_correction2) / bias_correction1;
-  for (int l = 0; l < u->nlayer; ++l) {
-    Layer *layer = &u->layer[l];
-    size_t weights = (size_t)layer->in * layer->out * layer->k;
-    adam_update(layer->w, gw[l], layer->mw, layer->vw, (size_t)count, weights,
-                step_size);
-    adam_update(layer->b, gb[l], layer->mb, layer->vb, (size_t)count,
-                (size_t)layer->out, step_size);
-    free(gw[l]);
-    free(gb[l]);
-  }
-  free(gw);
-  free(gb);
-  free_gradients(sgw, sgb, u->nlayer);
-  workspace_free(&a);
-  free(p);
-  if (loss)
-    *loss = (float)(total / count);
-  return 0;
+  return rc;
 }
 /**
  * @brief Write a UNet model to a binary file.

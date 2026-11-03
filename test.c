@@ -4,6 +4,7 @@
  */
 #define ANNO_NO_MAIN
 #include "anno.c"
+#include "unet.c" /* static internals for the gradient test */
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -260,6 +261,118 @@ static void test_viterbi(void) {
   CHECK(anno_decode(bases, N, p, path) == 0);
 }
 
+/** @brief Fill a probability matrix that favours one class path. */
+static void favour_path(const uint8_t *path, int n, float *p) {
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < ANNO_CLASSES; j++)
+      p[i * ANNO_CLASSES + j] = j == path[i] ? 0.6f : 0.05f;
+}
+
+/** @brief Start/stop codons exactly at exon edges (UTR intron next to CDS). */
+static void test_utr_intron_edges(void) {
+  enum { N = 280 };
+  /* genomic order: inter | A [20,40) | intron [40,100) | CDS [100,160) |
+   * intron [160,220) | B [220,250) | inter.  Plus: A = 5'UTR, B = 3'UTR;
+   * minus: A = 3'UTR, B = 5'UTR. */
+  for (int strand = 0; strand < 2; strand++) {
+    char bases[N + 1];
+    memset(bases, 'C', N);
+    bases[N] = 0;
+    uint8_t truth[N], path[N];
+    int o = strand ? 4 : 0;
+    for (int i = 0; i < N; i++)
+      truth[i] = i < 20    ? ANNO_INTERGENIC
+                 : i < 40  ? (strand ? ANNO_MINUS_3UTR : ANNO_PLUS_5UTR)
+                 : i < 100 ? ANNO_PLUS_INTRON + o
+                 : i < 160 ? ANNO_PLUS_EXON + o
+                 : i < 220 ? ANNO_PLUS_INTRON + o
+                 : i < 250 ? (strand ? ANNO_MINUS_5UTR : ANNO_PLUS_3UTR)
+                           : ANNO_INTERGENIC;
+    float p[N * ANNO_CLASSES];
+    favour_path(truth, N, p);
+    CHECK(anno_decode(bases, N, p, path) == 0);
+    CHECK(!memcmp(path, truth, N));
+  }
+}
+
+/** @brief Backpropagation equals central finite differences of the loss. */
+static void test_gradient(void) {
+  enum { B = 2 };
+  size_t xs = (size_t)B * ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+         ys = (size_t)B * ANNO_CLASSES * ANNO_UNET_WINDOW;
+  float *x = xcalloc(xs, sizeof(float)), *y = xcalloc(ys, sizeof(float)),
+        *m = xcalloc((size_t)B * ANNO_UNET_WINDOW, sizeof(float));
+  uint64_t seed = 11;
+  for (size_t i = 0; i < xs; i++)
+    x[i] = anno_random_symmetric(&seed);
+  /* window 1 has no minus-strand classes: their gradient must still flow */
+  for (int b = 0; b < B; b++)
+    for (int i = 0; i < ANNO_UNET_WINDOW; i++) {
+      int c = (i / 300) % ANNO_CLASSES;
+      if (b == 1 && c > 4)
+        c = ANNO_INTERGENIC;
+      y[(size_t)b * ANNO_CLASSES * ANNO_UNET_WINDOW +
+        (size_t)c * ANNO_UNET_WINDOW + i] = 1.0f;
+      m[b * ANNO_UNET_WINDOW + i] = i < ANNO_UNET_WINDOW - 96;
+    }
+  UnetConfig config = unet_default_config();
+  Unet *u = unet_create(&config);
+  float *gw[UNET_LAYER_COUNT], *gb[UNET_LAYER_COUNT];
+  for (int l = 0; l < u->nlayer; l++) {
+    gw[l] = xcalloc((size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k,
+                    sizeof(float));
+    gb[l] = xcalloc((size_t)u->layer[l].out, sizeof(float));
+  }
+  double loss = 0, plus = 0, minus = 0;
+  CHECK(batch_gradient(u, x, y, m, B, gw, gb, &loss) == 0);
+  /* encoder input, skip source, decoder concat and output layers */
+  static const int layers[] = {0, 3, 6, 8, 10};
+  double worst = 0;
+  int tested = 0;
+  for (int t = 0; t < 5; t++) {
+    Layer *l = &u->layer[layers[t]];
+    size_t count = (size_t)l->in * l->out * l->k, best = 0;
+    for (size_t i = 1; i < count; i++) /* largest gradient: well above noise */
+      if (fabsf(gw[layers[t]][i]) > fabsf(gw[layers[t]][best]))
+        best = i;
+    float w = l->w[best], h = 1e-2f * fmaxf(fabsf(w), 1e-2f);
+    float *scratch[UNET_LAYER_COUNT], *sb[UNET_LAYER_COUNT];
+    for (int k = 0; k < u->nlayer; k++) {
+      scratch[k] = xcalloc((size_t)u->layer[k].in * u->layer[k].out *
+                               u->layer[k].k,
+                           sizeof(float));
+      sb[k] = xcalloc((size_t)u->layer[k].out, sizeof(float));
+    }
+    l->w[best] = w + h;
+    batch_gradient(u, x, y, m, B, scratch, sb, &plus);
+    l->w[best] = w - h;
+    batch_gradient(u, x, y, m, B, scratch, sb, &minus);
+    l->w[best] = w;
+    for (int k = 0; k < u->nlayer; k++) {
+      free(scratch[k]);
+      free(sb[k]);
+    }
+    double numeric = (plus - minus) / (2.0 * (double)h);
+    double analytic = gw[layers[t]][best];
+    if (fabs(numeric) > 1e-7) {
+      tested++;
+      worst = fmax(worst, fabs(numeric - analytic) / fabs(numeric));
+    }
+  }
+  CHECK(tested == 5);
+  CHECK(worst < 5e-2);
+  if (worst >= 5e-2)
+    fprintf(stderr, "gradient relative error %g\n", worst);
+  for (int l = 0; l < u->nlayer; l++) {
+    free(gw[l]);
+    free(gb[l]);
+  }
+  unet_destroy(u);
+  free(x);
+  free(y);
+  free(m);
+}
+
 /** @brief Longest ORF, stop codons and CDS phase. */
 static void test_orf(void) {
   int64_t start = INT64_MAX, end = 0;
@@ -453,10 +566,12 @@ int main(void) {
   test_labels(&sequences[0]);
   test_round_trip(&sequences[0]);
   test_viterbi();
+  test_utr_intron_edges();
   test_orf();
   test_softmax();
   test_cwt();
   test_model_file();
+  test_gradient();
   test_label_errors("test.fasta");
   test_pipeline(sequences);
   anno_sequences_free(sequences, 1);

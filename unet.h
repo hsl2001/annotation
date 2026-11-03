@@ -53,8 +53,8 @@ int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
 /**
  * @brief Train one bounded batch using the masked Soft F1 objective.
  *
- * The objective is the mean per-class Soft F1 loss, evaluated only at
- * positions enabled by mask.
+ * The objective is the mean per-class Soft F1 loss whose sums are pooled
+ * over every position of the batch enabled by mask.
  * @param unet Model to update.
  * @param input Channel-major input batch.
  * @param truth One-hot channel-major target batch.
