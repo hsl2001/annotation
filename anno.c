@@ -55,9 +55,7 @@ float anno_random_symmetric(uint64_t *state) {
 /* ------------------------------------------------------------------------ */
 /** Class names; also used for bedGraph file names. */
 static const char *const class_names[ANNO_CLASSES] = {
-    "intergenic",  "plus_five_prime_UTR",  "plus_exon",
-    "plus_intron", "plus_three_prime_UTR", "minus_five_prime_UTR",
-    "minus_exon",  "minus_intron",         "minus_three_prime_UTR"};
+    "intergenic", "plus_exon", "plus_intron", "minus_exon", "minus_intron"};
 /** Morlet scales of the CWT channels. */
 static const int cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 
@@ -326,7 +324,7 @@ void anno_sequences_free(AnnoSequence *sequences, int count) {
 /* GFF3 -> label vector                                                     */
 /* ------------------------------------------------------------------------ */
 
-enum { KIND_EXON, KIND_CDS, KIND_5UTR, KIND_3UTR, KIND_INTRON };
+enum { KIND_EXON, KIND_INTRON };
 
 /** One GFF feature attached to one transcript. Owns `parent`. */
 typedef struct {
@@ -402,12 +400,6 @@ static int feature_compare(const void *a, const void *b) {
 static int feature_kind(const char *type) {
   if (!strcmp(type, "exon"))
     return KIND_EXON;
-  if (!strcmp(type, "CDS"))
-    return KIND_CDS;
-  if (!strcmp(type, "five_prime_UTR"))
-    return KIND_5UTR;
-  if (!strcmp(type, "three_prime_UTR"))
-    return KIND_3UTR;
   if (!strcmp(type, "intron"))
     return KIND_INTRON;
   if (!strcmp(type, "gene") || !strcmp(type, "mRNA") ||
@@ -437,8 +429,7 @@ typedef struct {
   int sequence;
   char strand;
   int64_t start, end;
-  SegmentList exons, explicit_utr5, explicit_utr3, explicit_introns;
-  int64_t cds_start, cds_end;
+  SegmentList exons, explicit_introns;
 } LabelTranscript;
 
 /**
@@ -571,25 +562,12 @@ static GffFeature *read_gff_features(const char *path,
 static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
   int plus = t->strand == '+';
   uint8_t intron = plus ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
-  uint8_t coding = plus ? ANNO_PLUS_EXON : ANNO_MINUS_EXON;
-  uint8_t utr5 = plus ? ANNO_PLUS_5UTR : ANNO_MINUS_5UTR;
-  uint8_t utr3 = plus ? ANNO_PLUS_3UTR : ANNO_MINUS_3UTR;
+  uint8_t exon = plus ? ANNO_PLUS_EXON : ANNO_MINUS_EXON;
   for (int64_t i = t->start; i < t->end; i++)
     labels[i] = intron;
   for (int e = 0; e < t->exons.count; e++)
     for (int64_t i = t->exons.items[e].start; i < t->exons.items[e].end; i++)
-      labels[i] = i < t->cds_start  ? (plus ? utr5 : utr3)
-                  : i >= t->cds_end ? (plus ? utr3 : utr5)
-                                    : coding;
-  /* explicit UTR/intron features outrank the inferred labels */
-  for (int e = 0; e < t->explicit_utr5.count; e++)
-    for (int64_t i = t->explicit_utr5.items[e].start;
-         i < t->explicit_utr5.items[e].end; i++)
-      labels[i] = utr5;
-  for (int e = 0; e < t->explicit_utr3.count; e++)
-    for (int64_t i = t->explicit_utr3.items[e].start;
-         i < t->explicit_utr3.items[e].end; i++)
-      labels[i] = utr3;
+      labels[i] = exon;
   for (int e = 0; e < t->explicit_introns.count; e++)
     for (int64_t i = t->explicit_introns.items[e].start;
          i < t->explicit_introns.items[e].end; i++)
@@ -616,41 +594,19 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
            !strcmp(features[last].parent, features[first].parent))
       last++;
     LabelTranscript t = {.sequence = features[first].sequence,
-                         .strand = features[first].strand,
-                         .cds_start = INT64_MAX,
-                         .cds_end = -1};
-    SegmentList pieces = {0};
+                         .strand = features[first].strand};
     for (size_t i = first; i < last; i++) {
       const GffFeature *f = &features[i];
       if (f->sequence != t.sequence || f->strand != t.strand)
         fail("transcript %s mixes sequences or strands", f->parent);
       if (f->kind == KIND_EXON)
         segments_push(&t.exons, f->start, f->end);
-      if (f->kind == KIND_5UTR)
-        segments_push(&t.explicit_utr5, f->start, f->end);
-      if (f->kind == KIND_3UTR)
-        segments_push(&t.explicit_utr3, f->start, f->end);
       if (f->kind == KIND_INTRON)
         segments_push(&t.explicit_introns, f->start, f->end);
-      if (f->kind == KIND_CDS) {
-        if (f->start < t.cds_start)
-          t.cds_start = f->start;
-        if (f->end > t.cds_end)
-          t.cds_end = f->end;
-      }
-      if (f->kind == KIND_CDS || f->kind == KIND_5UTR || f->kind == KIND_3UTR)
-        segments_push(&pieces, f->start, f->end);
     }
-    if (!t.exons.count) {
-      t.exons = pieces;
-      pieces = (SegmentList){0};
-    }
-    free(pieces.items);
     segments_merge(&t.exons);
-    if (t.cds_end < 0 || !t.exons.count) { /* non-coding transcript */
+    if (!t.exons.count) {
       free(t.exons.items);
-      free(t.explicit_utr5.items);
-      free(t.explicit_utr3.items);
       free(t.explicit_introns.items);
       first = last;
       continue;
@@ -682,11 +638,9 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
     else
       skipped++;
     free(t->exons.items);
-    free(t->explicit_utr5.items);
-    free(t->explicit_utr3.items);
     free(t->explicit_introns.items);
   }
-  say("labelled %zu coding transcripts (%zu overlapping skipped)",
+  say("labelled %zu transcripts (%zu overlapping skipped)",
       transcript_count - skipped, skipped);
   free(transcripts);
 }
@@ -839,7 +793,12 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
 /* ------------------------------------------------------------------------ */
 
 static uint8_t ann_swap_strand(uint8_t label) {
-  return label == ANNO_INTERGENIC ? label : label <= 4 ? label + 4 : label - 4;
+  if (label == ANNO_INTERGENIC)
+    return label;
+  return label == ANNO_PLUS_EXON   ? ANNO_MINUS_EXON
+         : label == ANNO_PLUS_INTRON ? ANNO_MINUS_INTRON
+         : label == ANNO_MINUS_EXON  ? ANNO_PLUS_EXON
+                                     : ANNO_PLUS_INTRON;
 }
 
 static void features(const AnnoSequence *sequence, const float *power,
@@ -1043,11 +1002,8 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
 }
 
 /**
- * @brief Build the strand-aware gene grammar. Plus strand in genomic order:
- *   intergenic -> [5'UTR (intron 5'UTR)*] -> exon (intron exon)* ->
- *   [3'UTR (intron 3'UTR)*] -> intergenic; minus strand is the mirror image.
- *   Introns are never entered from intergenic and UTRs never touch directly.
- *   An intron may also separate a UTR piece from the coding run.
+ * @brief Build the strand-aware exon/intron grammar:
+ *   intergenic -> exon (intron exon)* -> intergenic.
  * @param g Grammar to initialize.
  * @return None.
  */
@@ -1055,35 +1011,18 @@ static void grammar_build(Grammar *g) {
   memset(g, 0, sizeof(*g));
   int inter = grammar_chain(g, ANNO_INTERGENIC, 1);
   for (int strand = 0; strand < 2; strand++) {
-    int o = strand ? 4 : 0;
-    int u5 = grammar_chain(g, (uint8_t)(ANNO_PLUS_5UTR + o), 1);
-    int ex =
-        grammar_chain(g, (uint8_t)(ANNO_PLUS_EXON + o), ANNO_MIN_EXON_LENGTH);
+    uint8_t exon = strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON;
+    uint8_t intron = strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON;
+    int ex = grammar_chain(g, exon, ANNO_MIN_EXON_LENGTH);
     int ex_tail = ex + ANNO_MIN_EXON_LENGTH - 1;
-    int u3 = grammar_chain(g, (uint8_t)(ANNO_PLUS_3UTR + o), 1);
     int introns[3];
     for (int i = 0; i < 3; i++)
-      introns[i] = grammar_chain(g, (uint8_t)(ANNO_PLUS_INTRON + o),
-                                 ANNO_MIN_INTRON_LENGTH);
+      introns[i] = grammar_chain(g, intron, ANNO_MIN_INTRON_LENGTH);
     int tail = ANNO_MIN_INTRON_LENGTH - 1;
-    /* exonic pieces in genomic order: first, middle (coding), last */
-    int first = strand ? u3 : u5, last = strand ? u5 : u3;
-    grammar_edge(g, inter, first, -ANNO_TRANSCRIPT_PENALTY);
     grammar_edge(g, inter, ex, -ANNO_TRANSCRIPT_PENALTY);
-    grammar_edge(g, first, ex, 0.0);
-    grammar_edge(g, ex_tail, last, 0.0);
     grammar_edge(g, ex_tail, inter, 0.0);
-    grammar_edge(g, last, inter, 0.0);
-    int pieces[3] = {first, ex, last}, exits[3] = {first, ex_tail, last};
-    for (int i = 0; i < 3; i++) {
-      grammar_edge(g, exits[i], introns[i], 0.0);
-      grammar_edge(g, introns[i] + tail, pieces[i], 0.0);
-    }
-    /* UTR/CDS boundaries may coincide with splice sites: an exon can start
-     * exactly at the start codon (UTR intron -> CDS) or end exactly at the
-     * stop codon (CDS -> UTR intron). */
+    grammar_edge(g, ex_tail, introns[0], 0.0);
     grammar_edge(g, introns[0] + tail, ex, 0.0);
-    grammar_edge(g, ex_tail, introns[2], 0.0);
   }
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
@@ -1460,7 +1399,9 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
  * @return '+' or '-', or 0 for intergenic.
  */
 static char class_strand(uint8_t cls) {
-  return cls == ANNO_INTERGENIC ? 0 : cls <= 4 ? '+' : '-';
+  return cls == ANNO_INTERGENIC ? 0
+         : cls == ANNO_PLUS_EXON || cls == ANNO_PLUS_INTRON ? '+'
+                                                            : '-';
 }
 
 /**

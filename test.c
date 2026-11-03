@@ -163,14 +163,14 @@ static AnnoSequence *test_sequences(const char *fasta, const char *gff) {
 /** @brief GFF -> label vector checks at hand-picked positions. */
 static void test_labels(const AnnoSequence *s) {
   const uint8_t *y = s->labels;
-  CHECK(y[39] == ANNO_INTERGENIC && y[40] == ANNO_PLUS_5UTR);
+  CHECK(y[39] == ANNO_INTERGENIC && y[40] == ANNO_PLUS_EXON);
   CHECK(y[70] == ANNO_PLUS_INTRON && y[99] == ANNO_PLUS_INTRON);
-  CHECK(y[120] == ANNO_PLUS_5UTR && y[121] == ANNO_PLUS_EXON);
-  CHECK(y[390] == ANNO_PLUS_EXON && y[391] == ANNO_PLUS_3UTR);
-  CHECK(y[419] == ANNO_PLUS_3UTR && y[420] == ANNO_INTERGENIC);
-  CHECK(y[1579] == ANNO_INTERGENIC && y[1580] == ANNO_MINUS_3UTR);
+  CHECK(y[120] == ANNO_PLUS_EXON && y[121] == ANNO_PLUS_EXON);
+  CHECK(y[390] == ANNO_PLUS_EXON && y[391] == ANNO_PLUS_EXON);
+  CHECK(y[419] == ANNO_PLUS_EXON && y[420] == ANNO_INTERGENIC);
+  CHECK(y[1579] == ANNO_INTERGENIC && y[1580] == ANNO_MINUS_EXON);
   CHECK(y[1609] == ANNO_MINUS_EXON && y[1640] == ANNO_MINUS_INTRON);
-  CHECK(y[1879] == ANNO_MINUS_5UTR && y[1959] == ANNO_MINUS_5UTR);
+  CHECK(y[1879] == ANNO_MINUS_EXON && y[1959] == ANNO_MINUS_EXON);
   CHECK(y[1960] == ANNO_INTERGENIC);
 }
 
@@ -236,17 +236,6 @@ static void test_viterbi(void) {
   for (int i = 0; i < N; i++)
     exon += path[i] == ANNO_PLUS_EXON;
   CHECK(exon == ANNO_MIN_EXON_LENGTH);
-  /* 5'UTR followed directly by 3'UTR is not a valid transcript */
-  for (int i = 0; i < N; i++)
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] = j == (i >= 10 && i < 30   ? ANNO_PLUS_5UTR
-                                      : i >= 30 && i < 50 ? ANNO_PLUS_3UTR
-                                                          : 0)
-                                    ? 0.9f
-                                    : 0.0125f;
-  CHECK(anno_decode(bases, N, p, path) == 0);
-  for (int i = 1; i < N; i++)
-    CHECK(!(path[i - 1] == ANNO_PLUS_5UTR && path[i] == ANNO_PLUS_3UTR));
   /* a strong 30-bp exon is decoded exactly (gain 30*log(0.99/0.00125) >
    * penalty) */
   for (int i = 0; i < N; i++)
@@ -271,22 +260,20 @@ static void favour_path(const uint8_t *path, int n, float *p) {
 /** @brief Start/stop codons exactly at exon edges (UTR intron next to CDS). */
 static void test_utr_intron_edges(void) {
   enum { N = 280 };
-  /* genomic order: inter | A [20,40) | intron [40,100) | CDS [100,160) |
-   * intron [160,220) | B [220,250) | inter.  Plus: A = 5'UTR, B = 3'UTR;
-   * minus: A = 3'UTR, B = 5'UTR. */
+  /* genomic order: inter | exon [20,40) | intron [40,100) |
+   * exon [100,160) | intron [160,220) | exon [220,250) | inter. */
   for (int strand = 0; strand < 2; strand++) {
     char bases[N + 1];
     memset(bases, 'C', N);
     bases[N] = 0;
     uint8_t truth[N], path[N];
-    int o = strand ? 4 : 0;
     for (int i = 0; i < N; i++)
       truth[i] = i < 20    ? ANNO_INTERGENIC
-                 : i < 40  ? (strand ? ANNO_MINUS_3UTR : ANNO_PLUS_5UTR)
-                 : i < 100 ? ANNO_PLUS_INTRON + o
-                 : i < 160 ? ANNO_PLUS_EXON + o
-                 : i < 220 ? ANNO_PLUS_INTRON + o
-                 : i < 250 ? (strand ? ANNO_MINUS_5UTR : ANNO_PLUS_3UTR)
+                 : i < 40  ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
+                 : i < 100 ? (strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON)
+                 : i < 160 ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
+                 : i < 220 ? (strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON)
+                 : i < 250 ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
                            : ANNO_INTERGENIC;
     float p[N * ANNO_CLASSES];
     favour_path(truth, N, p);

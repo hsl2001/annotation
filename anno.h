@@ -19,7 +19,7 @@
 #define ANNO_STRANDS 2            /**< plus and minus strands */
 #define ANNO_COMPLEX_COMPONENTS 2 /**< real and imaginary components */
 #define ANNO_PATH_BUFFER 4096     /**< maximum generated path length */
-#define ANNO_CLASSES 9            /**< UNet classes == decoded grammar states */
+#define ANNO_CLASSES 5            /**< strand-aware intergenic/exon/intron classes */
 #define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
 #define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
 #define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
@@ -57,14 +57,10 @@
 /** UNet output classes; each class is also one decoded grammar state. */
 typedef enum {
   ANNO_INTERGENIC = 0,
-  ANNO_PLUS_5UTR = 1,
-  ANNO_PLUS_EXON = 2, /**< coding part of a plus-strand exon  */
-  ANNO_PLUS_INTRON = 3,
-  ANNO_PLUS_3UTR = 4,
-  ANNO_MINUS_5UTR = 5,
-  ANNO_MINUS_EXON = 6, /**< coding part of a minus-strand exon */
-  ANNO_MINUS_INTRON = 7,
-  ANNO_MINUS_3UTR = 8
+  ANNO_PLUS_EXON = 1,
+  ANNO_PLUS_INTRON = 2,
+  ANNO_MINUS_EXON = 3,
+  ANNO_MINUS_INTRON = 4
 } AnnoClass;
 
 /** Shape of the 1D UNet. */
