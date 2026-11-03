@@ -187,7 +187,7 @@ static char complement(char base) {
 /* Threads                                                                  */
 /* ------------------------------------------------------------------------ */
 
-typedef void (*JobFunction)(void *context, long job);
+typedef void (*JobFunction)(void *context, int64_t job);
 
 /**
  * @brief Run independent jobs through OpenMP.

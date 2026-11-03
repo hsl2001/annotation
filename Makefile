@@ -1,7 +1,7 @@
-CC ?= cc
-CFLAGS ?= -O3
-CFLAGS += -std=c11 -Wall -Wextra -fopenmp -Wunused-result -Wunused-function
-LIBS = -lz -lm
+CC = clang
+CFLAGS = -O3 -std=c11 -Wall -Wextra -Xpreprocessor -fopenmp \
+         -I/opt/homebrew/opt/libomp/include
+LIBS = -lz -lm -L/opt/homebrew/opt/libomp/lib -lomp
 
 .PHONY: all clean test
 
