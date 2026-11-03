@@ -34,9 +34,6 @@
 #define ANNO_MIN_EXON_LENGTH 6    /**< minimum coding-exon run (bp)          */
 #define ANNO_MIN_INTRON_LENGTH 30 /**< minimum intron length (bp) */
 #define ANNO_EMISSION_EPSILON 1e-6f
-#define ANNO_NONCANONICAL_SPLICE_PENALTY                                       \
-  4.6 /**< -ln(0.01): log penalty per non-GT donor / non-AG acceptor          \
-       */
 #define ANNO_TRANSCRIPT_PENALTY                                                \
   1.0 /**< log penalty for opening a transcript                                \
        */
@@ -177,8 +174,7 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
 
 /**
  * @brief Grammar-constrained Viterbi decoding of a probability matrix.
- * @param bases       sequence; non-GT donors and non-AG acceptors (CT/AC on
- *                    the minus strand) cost ANNO_NONCANONICAL_SPLICE_PENALTY.
+ * @param bases       sequence (unused by the grammar; kept for the API).
  * @param length      Number of sequence positions.
  * @param probability length x ANNO_CLASSES.
  * @param path        length output classes (AnnoClass).

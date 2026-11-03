@@ -278,11 +278,6 @@ static void test_utr_intron_edges(void) {
     char bases[N + 1];
     memset(bases, 'C', N);
     bases[N] = 0;
-    const char *left = strand ? "CT" : "GT", *right = strand ? "AC" : "AG";
-    memcpy(bases + 40, left, 2);
-    memcpy(bases + 98, right, 2);
-    memcpy(bases + 160, left, 2);
-    memcpy(bases + 218, right, 2);
     uint8_t truth[N], path[N];
     int o = strand ? 4 : 0;
     for (int i = 0; i < N; i++)
@@ -298,48 +293,6 @@ static void test_utr_intron_edges(void) {
     CHECK(anno_decode(bases, N, p, path) == 0);
     CHECK(!memcmp(path, truth, N));
   }
-}
-
-/** @brief Ambiguous intron edges snap to GT..AG (plus) and CT..AC (minus). */
-static void test_splice_motifs(void) {
-  enum { N = 200 };
-  for (int strand = 0; strand < 2; strand++) {
-    char bases[N + 1];
-    memset(bases, 'C', N);
-    bases[N] = 0;
-    /* true intron [72,128): exon/intron evidence is tied on [66,78) and
-     * [122,134), so only the motif can place the boundaries. */
-    memcpy(bases + 72, strand ? "CT" : "GT", 2);
-    memcpy(bases + 126, strand ? "AC" : "AG", 2);
-    int o = strand ? 4 : 0;
-    float p[N * ANNO_CLASSES];
-    uint8_t path[N];
-    for (int i = 0; i < N; i++) {
-      int exon = i >= 40 && i < 160, intron = i >= 72 && i < 128;
-      int tied = (i >= 66 && i < 78) || (i >= 122 && i < 134);
-      for (int j = 0; j < ANNO_CLASSES; j++) {
-        float v = 0.01f;
-        if (tied && (j == ANNO_PLUS_EXON + o || j == ANNO_PLUS_INTRON + o))
-          v = 0.46f;
-        else if (!tied && j == (!exon     ? ANNO_INTERGENIC
-                                : intron ? ANNO_PLUS_INTRON + o
-                                         : ANNO_PLUS_EXON + o))
-          v = 0.9f;
-        p[i * ANNO_CLASSES + j] = v;
-      }
-    }
-    CHECK(anno_decode(bases, N, p, path) == 0);
-    CHECK(path[71] == ANNO_PLUS_EXON + o && path[72] == ANNO_PLUS_INTRON + o);
-    CHECK(path[127] == ANNO_PLUS_INTRON + o && path[128] == ANNO_PLUS_EXON + o);
-  }
-  /* hand-computed motif scores */
-  CHECK(splice_score("CGTC", 4, 1, ANNO_PLUS_EXON, ANNO_PLUS_INTRON) == 0.0);
-  CHECK(splice_score("CAGC", 4, 3, ANNO_PLUS_INTRON, ANNO_PLUS_EXON) == 0.0);
-  CHECK(splice_score("CCTC", 4, 1, ANNO_MINUS_EXON, ANNO_MINUS_INTRON) == 0.0);
-  CHECK(splice_score("CACC", 4, 3, ANNO_MINUS_INTRON, ANNO_MINUS_EXON) == 0.0);
-  CHECK(splice_score("CGTC", 4, 1, ANNO_MINUS_EXON, ANNO_MINUS_INTRON) ==
-        -ANNO_NONCANONICAL_SPLICE_PENALTY);
-  CHECK(splice_score("CCCC", 4, 2, ANNO_PLUS_EXON, ANNO_PLUS_EXON) == 0.0);
 }
 
 /** @brief Backpropagation equals central finite differences of the loss. */
@@ -614,7 +567,6 @@ int main(void) {
   test_round_trip(&sequences[0]);
   test_viterbi();
   test_utr_intron_edges();
-  test_splice_motifs();
   test_orf();
   test_softmax();
   test_cwt();
