@@ -1,6 +1,6 @@
 /**
- * @file ann.h
- * @brief Small standalone fixed-shape 1D UNet runtime.
+ * @file unet.h
+ * @brief 1D UNet runtime.
  */
 #ifndef ANNO_ANN_H
 #define ANNO_ANN_H

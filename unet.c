@@ -13,38 +13,20 @@
 #include <string.h>
 
 enum {
-  ENCODER_OPERATIONS = 2,
-  DECODER_OPERATIONS = 2,
-  OUTPUT_OPERATIONS = 1,
-  /* Two convolutions, one pool, one skip, one upsample. */
-  WORKSPACES_PER_LEVEL = 5,
-  /* Input, bottleneck, output, and alignment storage. */
-  EXTRA_WORKSPACES = 4,
-  CONV_OPERATION = 1,
-  POOL_OPERATION = 2,
-  CONCAT_OPERATION = 3,
-  UPSAMPLE_OPERATION = 4,
   MIN_DIMENSION = 1,
-  LINEAR_ACTIVATION = 0,
   RELU_ACTIVATION = 1,
   OUTPUT_KERNEL = 1,
-  NO_LAYER = -1,
-  NO_SKIP = -1,
-  INITIAL_DEPTH = 4,
+  INITIAL_DEPTH = 3,
   INITIAL_KERNEL = 9,
   INITIAL_POOL = 2,
   INITIAL_CHANNEL_0 = 16,
   INITIAL_CHANNEL_1 = 32,
   INITIAL_CHANNEL_2 = 64,
-  INITIAL_CHANNEL_3 = 128,
+  UNET_LAYER_COUNT = 11,
+  WORKSPACE_COUNT = 16,
 };
 
-
-#define MAX_LAYERS                                                             \
-  (ANNO_MAX_DEPTH * (ENCODER_OPERATIONS + DECODER_OPERATIONS) +                \
-   OUTPUT_OPERATIONS)
-#define MAX_WORKSPACES                                                         \
-  (ANNO_MAX_DEPTH * WORKSPACES_PER_LEVEL + EXTRA_WORKSPACES)
+#define MAX_LAYERS UNET_LAYER_COUNT
 
 typedef struct {
   int in;
@@ -61,7 +43,7 @@ struct Unet {
   UnetConfig config;
   int depth, nlayer;
   uint64_t optimizer_step;
-  Layer layer[MAX_LAYERS];
+  Layer layer[UNET_LAYER_COUNT];
 };
 
 /**
@@ -70,9 +52,9 @@ struct Unet {
  * @return Nonzero when the configuration is valid, otherwise zero.
  */
 static int good_config(const UnetConfig *c) {
-  if (!c || c->depth < MIN_DIMENSION || c->depth > ANNO_MAX_DEPTH ||
+  if (!c || c->depth != INITIAL_DEPTH ||
       c->kernel < MIN_DIMENSION || !(c->kernel & MIN_DIMENSION) ||
-      c->pool < MIN_DIMENSION)
+      c->pool != INITIAL_POOL)
     return 0;
   for (int i = 0; i < c->depth; ++i)
     if (c->channels[i] < 1)
@@ -88,8 +70,7 @@ UnetConfig unet_default_config(void) {
   return (UnetConfig){INITIAL_DEPTH,
                       INITIAL_KERNEL,
                       INITIAL_POOL,
-                      {INITIAL_CHANNEL_0, INITIAL_CHANNEL_1, INITIAL_CHANNEL_2,
-                       INITIAL_CHANNEL_3}};
+                      {INITIAL_CHANNEL_0, INITIAL_CHANNEL_1, INITIAL_CHANNEL_2}};
 }
 
 /**
@@ -286,14 +267,37 @@ static void upsample(const float *x, float *y, int c, int n, int f) {
 }
 
 typedef struct {
-  float *a[MAX_WORKSPACES], *d[MAX_WORKSPACES];
-  int n[MAX_WORKSPACES], c[MAX_WORKSPACES], count;
-  float *concat[MAX_WORKSPACES];
-  struct {
-    int type, layer, in, out, aux, skip;
-  } op[MAX_WORKSPACES];
-  int n_op;
+  float *a[WORKSPACE_COUNT], *d[WORKSPACE_COUNT];
+  int n[WORKSPACE_COUNT], c[WORKSPACE_COUNT];
+  int count;
 } Workspace;
+
+static const int workspace_lengths[WORKSPACE_COUNT] =
+    {ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW,
+     ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
+     ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4,
+     ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
+     ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW};
+
+static int workspace_init(const Unet *u, Workspace *a) {
+  memset(a, 0, sizeof(*a));
+  a->count = WORKSPACE_COUNT;
+  for (int i = 0; i < a->count; ++i) {
+    static const int channel_level[WORKSPACE_COUNT] =
+        {-1, 0, 0, 0, 1, 1, 1, 2, 2, 2, 1, 1, 1, 0, 0, -2};
+    int level = channel_level[i];
+    a->c[i] = level == -1 ? ANNO_INPUT_CHANNELS
+                           : level == -2 ? ANNO_CLASSES
+                                         : u->config.channels[level];
+    a->n[i] = workspace_lengths[i];
+    size_t size = (size_t)a->c[i] * a->n[i];
+    a->a[i] = (float *)calloc(size, sizeof(float));
+    a->d[i] = (float *)calloc(size, sizeof(float));
+    if (!a->a[i] || !a->d[i])
+      return 0;
+  }
+  return 1;
+}
 
 /**
  * @brief Free all tensors and operation metadata in a workspace.
@@ -305,48 +309,14 @@ static void workspace_free(Workspace *a) {
     free(a->a[i]);
     free(a->d[i]);
   }
-  for (int i = 0; i < MAX_WORKSPACES; ++i)
-    free(a->concat[i]);
   memset(a, 0, sizeof(*a));
 }
 
-/**
- * @brief Allocate one activation and gradient tensor pair.
- * @param a Workspace receiving the tensors.
- * @param c Number of channels.
- * @param n Number of positions.
- * @return Nonzero on success, otherwise zero on allocation failure.
- */
-static int workspace_add(Workspace *a, int c, int n) {
-  int i = a->count++;
-  size_t z = (size_t)c * n;
-  a->c[i] = c;
-  a->n[i] = n;
-  a->a[i] = (float *)calloc(z, sizeof(float));
-  a->d[i] = (float *)calloc(z, sizeof(float));
-  return a->a[i] && a->d[i];
-}
-
-/**
- * @brief Record one forward operation for backpropagation.
- * @param a Workspace receiving the operation.
- * @param type Operation kind.
- * @param layer Associated convolution layer, or NO_LAYER.
- * @param in Input workspace index.
- * @param out Output workspace index.
- * @param aux Operation-specific parameter.
- * @param skip Skip-connection workspace index, or NO_SKIP.
- * @return None.
- */
-static void record(Workspace *a, int type, int layer, int in, int out, int aux,
-                   int skip) {
-  a->op[a->n_op].type = type;
-  a->op[a->n_op].layer = layer;
-  a->op[a->n_op].in = in;
-  a->op[a->n_op].out = out;
-  a->op[a->n_op].aux = aux;
-  a->op[a->n_op].skip = skip;
-  ++a->n_op;
+static void workspace_reset(Workspace *a) {
+  for (int i = 0; i < a->count; ++i) {
+    memset(a->a[i], 0, (size_t)a->c[i] * a->n[i] * sizeof(float));
+    memset(a->d[i], 0, (size_t)a->c[i] * a->n[i] * sizeof(float));
+  }
 }
 
 /**
@@ -358,86 +328,62 @@ static void record(Workspace *a, int type, int layer, int in, int out, int aux,
  * @param prob Position-major class probabilities.
  * @return 0 on success, or ENOMEM on allocation failure.
  */
+static void conv_concat(const Layer *l, const float *up, const float *skip,
+                        float *y, int skip_channels, int n, int relu) {
+  int r = l->k / 2;
+#pragma omp parallel for collapse(2)
+  for (int o = 0; o < l->out; ++o)
+    for (int p = 0; p < n; ++p) {
+      float v = l->b[o];
+      for (int i = 0; i < l->in; ++i)
+        for (int q = 0; q < l->k; ++q) {
+          int z = p + q - r;
+          if (z >= 0 && z < n) {
+            int split = l->in - skip_channels;
+            const float *input = i < split ? up : skip;
+            int channel = i < split ? i : i - split;
+            v += l->w[((size_t)o * l->in + i) * l->k + q] *
+                 input[(size_t)channel * n + z];
+          }
+        }
+      y[(size_t)o * n + p] = relu && v < 0 ? 0 : v;
+    }
+}
+
 static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
                        float *prob) {
-  int n = ANNO_UNET_WINDOW, ai = 0, li = 0;
-  if (!workspace_add(a, ANNO_INPUT_CHANNELS, n))
-    return ENOMEM;
-  memcpy(a->a[0], x, (size_t)ANNO_INPUT_CHANNELS * n * sizeof(float));
-  int skip[MAX_LAYERS], sn = 0;
-  for (int lev = 0; lev < u->depth; ++lev) {
-    if (!workspace_add(a, u->config.channels[lev], n))
-      return ENOMEM;
-    conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
-    ai = a->count - 1;
-    record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-    if (!workspace_add(a, u->config.channels[lev], n))
-      return ENOMEM;
-    conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
-    ai = a->count - 1;
-    record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-    skip[sn++] = ai;
-    if (lev + 1 < u->depth) {
-      int pn = n / u->config.pool;
-      if (!workspace_add(a, u->config.channels[lev], pn))
-        return ENOMEM;
-      pool(a->a[ai], a->a[a->count - 1], u->config.channels[lev], n,
-           u->config.pool);
-      ai = a->count - 1;
-      record(a, POOL_OPERATION, NO_LAYER, ai - 1, ai, u->config.pool, NO_SKIP);
-      n = pn;
-    }
-  }
-  for (int lev = u->depth - 2; lev >= 0; --lev) {
-    int oldn = n, f = u->config.pool;
-    n *= f;
-    if (!workspace_add(a, u->config.channels[lev + 1], n))
-      return ENOMEM;
-    float *up = a->a[a->count - 1];
-    upsample(a->a[ai], up, u->config.channels[lev + 1], oldn, f);
-    record(a, UPSAMPLE_OPERATION, NO_LAYER, ai, a->count - 1, f, NO_SKIP);
-    int cc = u->config.channels[lev + 1] + u->config.channels[lev];
-    float *cat = (float *)malloc((size_t)cc * n * sizeof(float));
-    if (!cat)
-      return ENOMEM;
-    memcpy(cat, up, (size_t)u->config.channels[lev + 1] * n * sizeof(float));
-    memcpy(cat + (size_t)u->config.channels[lev + 1] * n, a->a[skip[lev]],
-           (size_t)u->config.channels[lev] * n * sizeof(float));
-    if (!workspace_add(a, cc, n)) {
-      free(cat);
-      return ENOMEM;
-    }
-    memcpy(a->a[a->count - 1], cat, (size_t)cc * n * sizeof(float));
-    free(cat);
-    ai = a->count - 1;
-    record(a, CONCAT_OPERATION, NO_LAYER, ai - 1, ai,
-           u->config.channels[lev + 1], skip[lev]);
-    if (!workspace_add(a, u->config.channels[lev], n))
-      return ENOMEM;
-    conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
-    ai = a->count - 1;
-    record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-    if (!workspace_add(a, u->config.channels[lev], n))
-      return ENOMEM;
-    conv(&u->layer[li++], a->a[ai], a->a[a->count - 1], n, RELU_ACTIVATION);
-    ai = a->count - 1;
-    record(a, CONV_OPERATION, li - 1, ai - 1, ai, RELU_ACTIVATION, NO_SKIP);
-  }
-  if (!workspace_add(a, ANNO_CLASSES, n))
-    return ENOMEM;
-  conv(&u->layer[li], a->a[ai], a->a[a->count - 1], n, 0);
-  record(a, CONV_OPERATION, li, ai, a->count - 1, LINEAR_ACTIVATION, NO_SKIP);
-  float *z = a->a[a->count - 1];
+  workspace_reset(a);
+  memcpy(a->a[0], x, (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW *
+                         sizeof(float));
+  conv(&u->layer[0], a->a[0], a->a[1], a->n[1], RELU_ACTIVATION);
+  conv(&u->layer[1], a->a[1], a->a[2], a->n[2], RELU_ACTIVATION);
+  pool(a->a[2], a->a[3], a->c[2], a->n[2], u->config.pool);
+  conv(&u->layer[2], a->a[3], a->a[4], a->n[4], RELU_ACTIVATION);
+  conv(&u->layer[3], a->a[4], a->a[5], a->n[5], RELU_ACTIVATION);
+  pool(a->a[5], a->a[6], a->c[5], a->n[5], u->config.pool);
+  conv(&u->layer[4], a->a[6], a->a[7], a->n[7], RELU_ACTIVATION);
+  conv(&u->layer[5], a->a[7], a->a[8], a->n[8], RELU_ACTIVATION);
+  upsample(a->a[8], a->a[9], a->c[8], a->n[8], u->config.pool);
+  conv_concat(&u->layer[6], a->a[9], a->a[5], a->a[10], a->c[5], a->n[10],
+              RELU_ACTIVATION);
+  conv(&u->layer[7], a->a[10], a->a[11], a->n[11], RELU_ACTIVATION);
+  upsample(a->a[11], a->a[12], a->c[11], a->n[11], u->config.pool);
+  conv_concat(&u->layer[8], a->a[12], a->a[2], a->a[13], a->c[2], a->n[13],
+              RELU_ACTIVATION);
+  conv(&u->layer[9], a->a[13], a->a[14], a->n[14], RELU_ACTIVATION);
+  conv(&u->layer[10], a->a[14], a->a[15], a->n[15], 0);
+  float *z = a->a[15];
   int64_t usable = len;
 #pragma omp parallel for
   for (int64_t p = 0; p < usable; ++p) {
     float top = -INFINITY, sum = 0;
     for (int j = 0; j < ANNO_CLASSES; ++j) {
-      if (z[(size_t)j * n + p] > top)
-        top = z[(size_t)j * n + p];
+      if (z[(size_t)j * ANNO_UNET_WINDOW + p] > top)
+        top = z[(size_t)j * ANNO_UNET_WINDOW + p];
     }
     for (int j = 0; j < ANNO_CLASSES; ++j) {
-      prob[(size_t)p * ANNO_CLASSES + j] = expf(z[(size_t)j * n + p] - top);
+      prob[(size_t)p * ANNO_CLASSES + j] =
+          expf(z[(size_t)j * ANNO_UNET_WINDOW + p] - top);
       sum += prob[(size_t)p * ANNO_CLASSES + j];
     }
     for (int j = 0; j < ANNO_CLASSES; ++j)
@@ -458,6 +404,8 @@ int unet_predict_channels(const Unet *u, const float *x, int64_t n, float *p) {
   if (!u || !x || !p || n < 1 || n > ANNO_UNET_WINDOW)
     return EINVAL;
   Workspace a = {0};
+  if (!workspace_init(u, &a))
+    return ENOMEM;
   int rc = run_forward(u, x, n, &a, p);
   workspace_free(&a);
   return rc;
@@ -529,9 +477,67 @@ static void backward_layer(const Layer *l, const float *x, const float *y,
                 g * l->w[((size_t)o * l->in + i) * l->k + q];
           }
         }
+
         gw[((size_t)o * l->in + i) * l->k + q] += dw;
       }
   }
+}
+
+static void backward_concat_layer(const Layer *l, const float *up,
+                                  const float *skip, const float *y,
+                                  float *dup, float *dskip, int skip_channels,
+                                  int n, int relu, float *gw, float *gb) {
+  int r = l->k / 2;
+  int split = l->in - skip_channels;
+  memset(dup, 0, (size_t)split * n * sizeof(float));
+  memset(dskip, 0, (size_t)skip_channels * n * sizeof(float));
+#pragma omp parallel for
+  for (int o = 0; o < l->out; ++o) {
+    float db = 0;
+    for (int p = 0; p < n; ++p) {
+      float g = y[(size_t)o * n + p];
+      if (relu && g < 0)
+        g = 0;
+      db += g;
+    }
+    gb[o] += db;
+    for (int i = 0; i < l->in; ++i)
+      for (int q = 0; q < l->k; ++q) {
+        float dw = 0;
+        for (int p = 0; p < n; ++p) {
+          float g = y[(size_t)o * n + p];
+          if (relu && g < 0)
+            g = 0;
+          int z = p + q - r;
+          if (z >= 0 && z < n) {
+            const float *input = i < split ? up : skip;
+            int channel = i < split ? i : i - split;
+            dw += g * input[(size_t)channel * n + z];
+#pragma omp atomic
+            (i < split ? dup : dskip)[(size_t)channel * n + z] +=
+                g * l->w[((size_t)o * l->in + i) * l->k + q];
+          }
+        }
+        gw[((size_t)o * l->in + i) * l->k + q] += dw;
+      }
+  }
+}
+
+static void backward_pool(const float *dy, float *dx, int c, int n, int f) {
+  memset(dx, 0, (size_t)c * n * sizeof(float));
+  for (int ch = 0; ch < c; ++ch)
+    for (int p = 0; p < n / f; ++p)
+      for (int q = 0; q < f; ++q)
+        dx[(size_t)ch * n + p * f + q] +=
+            dy[(size_t)ch * (n / f) + p] / f;
+}
+
+static void backward_upsample(const float *dy, float *dx, int c, int n, int f) {
+  memset(dx, 0, (size_t)c * n * sizeof(float));
+  for (int ch = 0; ch < c; ++ch)
+    for (int p = 0; p < n; ++p)
+      for (int q = 0; q < f; ++q)
+        dx[(size_t)ch * n + p] += dy[(size_t)ch * n * f + p * f + q];
 }
 /**
  * @brief Train one batch using the masked Soft F1 objective.
@@ -566,42 +572,43 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       return ENOMEM;
     }
   }
-#pragma omp parallel for schedule(static)
+  float **sgw = (float **)calloc((size_t)u->nlayer, sizeof(*sgw));
+  float **sgb = (float **)calloc((size_t)u->nlayer, sizeof(*sgb));
+  Workspace a = {0};
+  float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
+                             sizeof(float));
+  if (!sgw || !sgb || !p || !workspace_init(u, &a)) {
+    free(sgw);
+    free(sgb);
+    free(p);
+    workspace_free(&a);
+    free_gradients(gw, gb, u->nlayer);
+    return ENOMEM;
+  }
+  for (int l = 0; l < u->nlayer; ++l) {
+    size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
+    sgw[l] = (float *)calloc(weights, sizeof(float));
+    sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
+    if (!sgw[l] || !sgb[l]) {
+      free_gradients(sgw, sgb, u->nlayer);
+      workspace_free(&a);
+      free(p);
+      free_gradients(gw, gb, u->nlayer);
+      return ENOMEM;
+    }
+  }
   for (size_t b = 0; b < batch; ++b) {
-    float **sgw = (float **)calloc((size_t)u->nlayer, sizeof(*sgw));
-    float **sgb = (float **)calloc((size_t)u->nlayer, sizeof(*sgb));
     for (int l = 0; l < u->nlayer; ++l) {
       size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
-      sgw[l] = (float *)calloc(weights, sizeof(float));
-      sgb[l] = (float *)calloc((size_t)u->layer[l].out, sizeof(float));
-    }
-    int gradients_ready = 1;
-    for (int l = 0; l < u->nlayer; ++l)
-      if (!sgw[l] || !sgb[l]) {
-        gradients_ready = 0;
-        break;
-      }
-    if (!gradients_ready) {
-      free_gradients(sgw, sgb, u->nlayer);
-      continue;
-    }
-    Workspace a = {0};
-    float *p = (float *)malloc((size_t)ANNO_UNET_WINDOW * ANNO_CLASSES *
-                               sizeof(float));
-    if (!p) {
-      free_gradients(sgw, sgb, u->nlayer);
-      continue;
+      memset(sgw[l], 0, weights * sizeof(float));
+      memset(sgb[l], 0, (size_t)u->layer[l].out * sizeof(float));
     }
     int rc =
         run_forward(u, x + b * (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
                     ANNO_UNET_WINDOW, &a, p);
     if (rc) {
-      free(p);
-      workspace_free(&a);
-      free_gradients(sgw, sgb, u->nlayer);
       continue;
     }
-    int out = a.count - 1;
     float sum_p[ANNO_CLASSES] = {0};
     float sum_y[ANNO_CLASSES] = {0};
     float intersection[ANNO_CLASSES] = {0};
@@ -620,9 +627,6 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       }
     }
     if (!valid) {
-      free(p);
-      workspace_free(&a);
-      free_gradients(sgw, sgb, u->nlayer);
       continue;
     }
     double sample_loss = 0;
@@ -632,30 +636,6 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       sample_loss += 1.0 - numerator / denominator;
     }
     sample_loss /= ANNO_CLASSES;
-    float **ag = (float **)calloc((size_t)a.count, sizeof(*ag));
-    if (!ag) {
-      free(p);
-      workspace_free(&a);
-      free_gradients(sgw, sgb, u->nlayer);
-      continue;
-    }
-    int gradients_allocated = 1;
-    for (int z = 0; z < a.count; ++z) {
-      ag[z] = (float *)calloc((size_t)a.c[z] * a.n[z], sizeof(float));
-      if (!ag[z]) {
-        gradients_allocated = 0;
-        break;
-      }
-    }
-    if (!gradients_allocated) {
-      for (int z = 0; z < a.count; ++z)
-        free(ag[z]);
-      free(ag);
-      free(p);
-      workspace_free(&a);
-      free_gradients(sgw, sgb, u->nlayer);
-      continue;
-    }
     for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
       if (m[b * ANNO_UNET_WINDOW + i] <= 0)
         continue;
@@ -673,65 +653,52 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
       }
       for (int j = 0; j < ANNO_CLASSES; ++j) {
         float probability = p[(size_t)i * ANNO_CLASSES + j];
-        ag[out][(size_t)j * ANNO_UNET_WINDOW + i] =
+        a.d[15][(size_t)j * ANNO_UNET_WINDOW + i] =
             probability * (dp[j] - softmax_dot);
       }
     }
-    for (int oi = a.n_op - 1; oi >= 0; --oi) {
-      int t = a.op[oi].type, in = a.op[oi].in, outi = a.op[oi].out;
-      if (t == 1)
-        backward_layer(&u->layer[a.op[oi].layer], a.a[in], ag[outi], ag[in],
-                       a.n[outi], a.op[oi].aux, sgw[a.op[oi].layer],
-                       sgb[a.op[oi].layer]);
-      else if (t == 2) {
-        int f = a.op[oi].aux;
-        for (int c = 0; c < a.c[in]; ++c)
-          for (int q = 0; q < a.n[outi]; ++q)
-            for (int z = 0; z < f; ++z)
-              ag[in][(size_t)c * a.n[in] + q * f + z] +=
-                  ag[outi][(size_t)c * a.n[outi] + q] / f;
-      } else if (t == 4) {
-        int f = a.op[oi].aux;
-        for (int c = 0; c < a.c[in]; ++c)
-          for (int q = 0; q < a.n[in]; ++q)
-            for (int z = 0; z < f; ++z)
-              ag[in][(size_t)c * a.n[in] + q] +=
-                  ag[outi][(size_t)c * a.n[outi] + q * f + z];
-      } else if (t == 3) {
-        int split = a.op[oi].aux, sc = a.c[a.op[oi].skip];
-        for (int c = 0; c < split; ++c)
-          for (int q = 0; q < a.n[outi]; ++q)
-            ag[in][(size_t)c * a.n[in] + q] +=
-                ag[outi][(size_t)c * a.n[outi] + q];
-        for (int c = 0; c < sc; ++c)
-          for (int q = 0; q < a.n[outi]; ++q)
-            ag[a.op[oi].skip][(size_t)c * a.n[a.op[oi].skip] + q] +=
-                ag[outi][(size_t)(split + c) * a.n[outi] + q];
-      }
+    backward_layer(&u->layer[10], a.a[14], a.d[15], a.d[14], a.n[15], 0,
+                   sgw[10], sgb[10]);
+    backward_layer(&u->layer[9], a.a[13], a.d[14], a.d[13], a.n[14],
+                   RELU_ACTIVATION, sgw[9], sgb[9]);
+    backward_concat_layer(&u->layer[8], a.a[12], a.a[2], a.d[13], a.d[12],
+                          a.d[2], a.c[2], a.n[13], RELU_ACTIVATION, sgw[8],
+                          sgb[8]);
+    backward_upsample(a.d[12], a.d[11], a.c[11], a.n[11], u->config.pool);
+    backward_layer(&u->layer[7], a.a[10], a.d[11], a.d[10], a.n[11],
+                   RELU_ACTIVATION, sgw[7], sgb[7]);
+    backward_concat_layer(&u->layer[6], a.a[9], a.a[5], a.d[10], a.d[9],
+                          a.d[5], a.c[5], a.n[10], RELU_ACTIVATION, sgw[6],
+                          sgb[6]);
+    backward_upsample(a.d[9], a.d[8], a.c[8], a.n[8], u->config.pool);
+    backward_layer(&u->layer[5], a.a[7], a.d[8], a.d[7], a.n[8],
+                   RELU_ACTIVATION, sgw[5], sgb[5]);
+    backward_layer(&u->layer[4], a.a[6], a.d[7], a.d[6], a.n[7],
+                   RELU_ACTIVATION, sgw[4], sgb[4]);
+    backward_pool(a.d[6], a.d[5], a.c[5], a.n[5], u->config.pool);
+    backward_layer(&u->layer[3], a.a[4], a.d[5], a.d[4], a.n[5],
+                   RELU_ACTIVATION, sgw[3], sgb[3]);
+    backward_layer(&u->layer[2], a.a[3], a.d[4], a.d[3], a.n[4],
+                   RELU_ACTIVATION, sgw[2], sgb[2]);
+    backward_pool(a.d[3], a.d[2], a.c[2], a.n[2], u->config.pool);
+    backward_layer(&u->layer[1], a.a[1], a.d[2], a.d[1], a.n[2],
+                   RELU_ACTIVATION, sgw[1], sgb[1]);
+    backward_layer(&u->layer[0], a.a[0], a.d[1], a.d[0], a.n[1],
+                   RELU_ACTIVATION, sgw[0], sgb[0]);
+    total += sample_loss;
+    count += 1.0;
+    for (int l = 0; l < u->nlayer; ++l) {
+      size_t weights = (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k;
+      for (size_t z = 0; z < weights; ++z)
+        gw[l][z] += sgw[l][z];
+      for (int z = 0; z < u->layer[l].out; ++z)
+        gb[l][z] += sgb[l][z];
     }
-    for (int z = 0; z < a.count; ++z)
-      free(ag[z]);
-    free(ag);
-    free(p);
-    workspace_free(&a);
-#pragma omp critical(ann_gradient_reduce)
-    {
-      total += sample_loss;
-      count += 1.0;
-      for (int l = 0; l < u->nlayer; ++l) {
-        for (size_t z = 0;
-             z < (size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k; ++z)
-          gw[l][z] += sgw[l][z];
-        for (int z = 0; z < u->layer[l].out; ++z)
-          gb[l][z] += sgb[l][z];
-        free(sgw[l]);
-        free(sgb[l]);
-      }
-    }
-    free(sgw);
-    free(sgb);
   }
   if (!count) {
+    free_gradients(sgw, sgb, u->nlayer);
+    workspace_free(&a);
+    free(p);
     free_gradients(gw, gb, u->nlayer);
     return EINVAL;
   }
@@ -752,6 +719,9 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
   }
   free(gw);
   free(gb);
+  free_gradients(sgw, sgb, u->nlayer);
+  workspace_free(&a);
+  free(p);
   if (loss)
     *loss = (float)(total / count);
   return 0;

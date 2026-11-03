@@ -370,7 +370,7 @@ static void test_cwt(void) {
 /** @brief model round trip and identical predictions. */
 static void test_model_file(void) {
   UnetConfig config = {
-      .depth = 2, .kernel = 9, .pool = 2, .channels = {32, 32}};
+      .depth = 3, .kernel = 9, .pool = 2, .channels = {16, 32, 64}};
   Unet *unet = unet_create(&config), *loaded = NULL;
   const char *path = "test-model.ann";
   CHECK(unet_save(path, unet) == 0);
