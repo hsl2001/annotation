@@ -42,10 +42,12 @@
 /** @name Training constants */
 /**@{*/
 #define ANNO_DEFAULT_ITERATIONS 1000
-#define ANNO_BATCH_WINDOWS                                                     \
-  128 /**< fixed batch for bounded runtime memory use                           \
-      */
-#define ANNO_LEARNING_RATE 1e-3f /**< Adam default; 1e-2 saturates the softmax on step 1 */
+#ifndef ANNO_BATCH_WINDOWS
+#define ANNO_BATCH_WINDOWS 128 /**< fixed batch for bounded runtime memory use */
+#endif
+#ifndef ANNO_LEARNING_RATE
+#define ANNO_LEARNING_RATE 1e-3f /**< Adam default; 3e-3 and 1e-2 learn slower */
+#endif
 #define ANNO_ADAM_BETA1 0.9f
 #define ANNO_ADAM_BETA2 0.999f
 #define ANNO_ADAM_EPSILON 1e-8f
