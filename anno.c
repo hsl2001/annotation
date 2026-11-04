@@ -26,7 +26,33 @@
 #include <unistd.h>
 #include <zlib.h>
 
-#include "rfft.h"
+static void fft_radix2(double complex *vector, size_t size, int inverse) {
+  for (size_t i = 1, j = 0; i < size; i++) {
+    size_t bit = size >> 1;
+    for (; j & bit; bit >>= 1)
+      j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      double complex temporary = vector[i];
+      vector[i] = vector[j];
+      vector[j] = temporary;
+    }
+  }
+  for (size_t half = 1; half < size; half <<= 1) {
+    double angle = (inverse == 1 ? 1.0 : -1.0) * acos(-1.0) / (double)half;
+    double complex step = cos(angle) + I * sin(angle);
+    for (size_t start = 0; start < size; start += 2 * half) {
+      double complex twiddle = 1.0;
+      for (size_t offset = 0; offset < half; offset++) {
+        double complex even = vector[start + offset];
+        double complex odd = vector[start + offset + half] * twiddle;
+        vector[start + offset] = even + odd;
+        vector[start + offset + half] = even - odd;
+        twiddle *= step;
+      }
+    }
+  }
+}
 
 uint64_t anno_random_next(uint64_t *state) {
   uint64_t value = *state;
@@ -58,7 +84,7 @@ static const char *const class_names[ANNO_CLASSES] = {
     "intergenic", "plus_start_single_exon", "plus_end_exon", "plus_intron",
     "minus_start_single_exon", "minus_end_exon", "minus_intron"};
 /** Morlet scales of the CWT channels. */
-static const int cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
+static const int cwt_scales[ANNO_CWT_CHANNELS] = {3, 4, 5};
 
 /**
  * @brief Print an error to stderr and terminate the process.
@@ -736,7 +762,7 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
     for (int tap = 0; tap < width[s]; tap++)
       kernel_fft[(size_t)s * fft_size + width[s] - 1 - tap] = kernel[s][tap];
-    anno_fft_radix2(kernel_fft + (size_t)s * fft_size, fft_size, false);
+    fft_radix2(kernel_fft + (size_t)s * fft_size, fft_size, 0);
   }
   const int64_t window_count =
       (end - start + ANNO_CWT_WINDOW - 1) / ANNO_CWT_WINDOW;
@@ -761,10 +787,10 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
       }
       memset(transformed + input_count, 0,
              (fft_size - input_count) * sizeof(*transformed));
-      anno_fft_radix2(transformed, fft_size, false);
+      fft_radix2(transformed, fft_size, 0);
       for (size_t i = 0; i < fft_size; i++)
         transformed[i] *= kernel_fft[(size_t)s * fft_size + i];
-      anno_fft_radix2(transformed, fft_size, true);
+      fft_radix2(transformed, fft_size, 1);
       for (int64_t position = window_start; position < window_end; position++) {
         size_t index = (size_t)(position - input_start) +
                        (size_t)(width[s] - 1 - width[s] / 2);

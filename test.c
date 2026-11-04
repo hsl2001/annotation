@@ -246,6 +246,20 @@ static void test_round_trip(const AnnoSequence *s) {
   CHECK(!memcmp(path, expected, (size_t)s->length));
   char *decoded = gff_of_path(s, path);
   CHECK(!strcmp(decoded, test_gff));
+
+  /* Exercise the streaming API directly from anno_read_labels() targets. */
+  Decoder *stream = decoder_create(s->length);
+  uint8_t *stream_path = xcalloc((size_t)s->length, 1);
+  for (int64_t i = 0; i < s->length; i++)
+    decoder_step(stream, probability + (size_t)i * ANNO_CLASSES);
+  CHECK(decoder_finish(stream, stream_path) == 0);
+  CHECK(!memcmp(stream_path, expected, (size_t)s->length));
+  char *stream_gff = gff_of_path(s, stream_path);
+  CHECK(!strcmp(stream_gff, test_gff));
+
+  free(stream_gff);
+  free(stream_path);
+  decoder_destroy(stream);
   free(direct);
   free(decoded);
   free(path);

@@ -7,10 +7,10 @@ LIBS = -lz -lm -L/opt/homebrew/opt/libomp/lib -lomp
 
 all: anno
 
-anno: anno.c anno.h unet.c rfft.h
+anno: anno.c anno.h unet.c
 	$(CC) $(CFLAGS) -o $@ anno.c unet.c $(LIBS)
 
-test-anno: test.c anno.c anno.h unet.c rfft.h
+test-anno: test.c anno.c anno.h unet.c
 	$(CC) $(CFLAGS) -o $@ test.c $(LIBS)
 
 test: anno test-anno

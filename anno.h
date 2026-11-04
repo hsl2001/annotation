@@ -27,7 +27,7 @@
 #define ANNO_UNET_WINDOW 65536    /**< UNet training / inference window      */
 #define ANNO_MAX_DEPTH 4          /**< fixed number of UNet levels           */
 #define ANNO_CWT_RADIUS_FACTOR 4  /**< Morlet radius in scale units */
-#define ANNO_MORLET_FREQUENCY 6.0 /**< Morlet carrier frequency */
+#define ANNO_MORLET_FREQUENCY 6.0 /**< Morlet central frequency */
 /**@}*/
 
 /** @name Grammar constants */
@@ -44,7 +44,7 @@
 #define ANNO_BATCH_WINDOWS 128 /**< fixed batch for bounded runtime memory use */
 #endif
 #ifndef ANNO_LEARNING_RATE
-#define ANNO_LEARNING_RATE 1e-3f /**< Adam default */
+#define ANNO_LEARNING_RATE 1e-2f /**< Adam default */
 #endif
 #define ANNO_ADAM_BETA1 0.9f
 #define ANNO_ADAM_BETA2 0.999f
