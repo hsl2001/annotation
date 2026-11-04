@@ -23,8 +23,8 @@
 #define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
 #define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
 #define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
-#define ANNO_UNET_WINDOW 4096    /**< UNet training / inference window      */
-#define ANNO_MAX_DEPTH 3          /**< fixed number of UNet levels           */
+#define ANNO_UNET_WINDOW 65536    /**< UNet training / inference window      */
+#define ANNO_MAX_DEPTH 4          /**< fixed number of UNet levels           */
 #define ANNO_CWT_RADIUS_FACTOR 4  /**< Morlet radius in scale units */
 #define ANNO_MORLET_FREQUENCY 6.0 /**< Morlet carrier frequency */
 /**@}*/

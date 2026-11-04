@@ -18,14 +18,15 @@
 enum {
   MIN_DIMENSION = 1,
   OUTPUT_KERNEL = 1,
-  INITIAL_DEPTH = 3,
+  INITIAL_DEPTH = 4,
   INITIAL_KERNEL = 9,
   INITIAL_POOL = 2,
   INITIAL_CHANNEL_0 = 16,
   INITIAL_CHANNEL_1 = 32,
   INITIAL_CHANNEL_2 = 64,
-  UNET_LAYER_COUNT = 11,
-  WORKSPACE_COUNT = 16,
+  INITIAL_CHANNEL_3 = 128,
+  UNET_LAYER_COUNT = 15,
+  WORKSPACE_COUNT = 22,
 };
 
 #define MAX_LAYERS UNET_LAYER_COUNT
@@ -73,7 +74,8 @@ UnetConfig unet_default_config(void) {
   return (UnetConfig){INITIAL_DEPTH,
                       INITIAL_KERNEL,
                       INITIAL_POOL,
-                      {INITIAL_CHANNEL_0, INITIAL_CHANNEL_1, INITIAL_CHANNEL_2}};
+                      {INITIAL_CHANNEL_0, INITIAL_CHANNEL_1, INITIAL_CHANNEL_2,
+                       INITIAL_CHANNEL_3}};
 }
 
 /**
@@ -308,19 +310,23 @@ typedef struct {
   int count;
 } Workspace;
 
-static const int workspace_lengths[WORKSPACE_COUNT] =
-    {ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW,
-     ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
-     ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4,
-     ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
-     ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW, ANNO_UNET_WINDOW};
+static const int workspace_lengths[WORKSPACE_COUNT] = {
+    ANNO_UNET_WINDOW,     ANNO_UNET_WINDOW,     ANNO_UNET_WINDOW,
+    ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
+    ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4,
+    ANNO_UNET_WINDOW / 8, ANNO_UNET_WINDOW / 8, ANNO_UNET_WINDOW / 8,
+    ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4, ANNO_UNET_WINDOW / 4,
+    ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2, ANNO_UNET_WINDOW / 2,
+    ANNO_UNET_WINDOW,     ANNO_UNET_WINDOW,     ANNO_UNET_WINDOW,
+    ANNO_UNET_WINDOW};
 
 static int workspace_init(const Unet *u, Workspace *a) {
   memset(a, 0, sizeof(*a));
   a->count = WORKSPACE_COUNT;
   for (int i = 0; i < a->count; ++i) {
-    static const int channel_level[WORKSPACE_COUNT] =
-        {-1, 0, 0, 0, 1, 1, 1, 2, 2, 2, 1, 1, 1, 0, 0, -2};
+    static const int channel_level[WORKSPACE_COUNT] = {
+        -1, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3,
+        3,  2, 2, 2, 1, 1, 1, 0, 0, -2};
     int level = channel_level[i];
     a->c[i] = level == -1 ? ANNO_INPUT_CHANNELS
                            : level == -2 ? ANNO_CLASSES
@@ -381,16 +387,23 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
   pool(a->a[5], a->a[6], a->c[5], a->n[5], u->config.pool);
   conv(&u->layer[4], a->a[6], a->a[7], a->n[7], a->s[4]);
   conv(&u->layer[5], a->a[7], a->a[8], a->n[8], a->s[5]);
-  upsample(a->a[8], a->a[9], a->c[8], a->n[8], u->config.pool);
-  conv_concat(&u->layer[6], a->a[9], a->a[5], a->a[10], a->c[5], a->n[10],
-              a->s[6]);
+  pool(a->a[8], a->a[9], a->c[8], a->n[8], u->config.pool);
+  conv(&u->layer[6], a->a[9], a->a[10], a->n[10], a->s[6]);
   conv(&u->layer[7], a->a[10], a->a[11], a->n[11], a->s[7]);
   upsample(a->a[11], a->a[12], a->c[11], a->n[11], u->config.pool);
-  conv_concat(&u->layer[8], a->a[12], a->a[2], a->a[13], a->c[2], a->n[13],
+  conv_concat(&u->layer[8], a->a[12], a->a[8], a->a[13], a->c[8], a->n[13],
               a->s[8]);
   conv(&u->layer[9], a->a[13], a->a[14], a->n[14], a->s[9]);
-  conv(&u->layer[10], a->a[14], a->a[15], a->n[15], NULL);
-  float *z = a->a[15];
+  upsample(a->a[14], a->a[15], a->c[14], a->n[14], u->config.pool);
+  conv_concat(&u->layer[10], a->a[15], a->a[5], a->a[16], a->c[5], a->n[16],
+              a->s[10]);
+  conv(&u->layer[11], a->a[16], a->a[17], a->n[17], a->s[11]);
+  upsample(a->a[17], a->a[18], a->c[17], a->n[17], u->config.pool);
+  conv_concat(&u->layer[12], a->a[18], a->a[2], a->a[19], a->c[2], a->n[19],
+              a->s[12]);
+  conv(&u->layer[13], a->a[19], a->a[20], a->n[20], a->s[13]);
+  conv(&u->layer[14], a->a[20], a->a[21], a->n[21], NULL);
+  float *z = a->a[21];
   int64_t usable = len;
 #pragma omp parallel for
   for (int64_t p = 0; p < usable; ++p) {
@@ -562,24 +575,35 @@ static void backward_upsample(const float *dy, float *dx, int c, int n, int f) {
       for (int q = 0; q < f; ++q)
         dx[(size_t)ch * n + p] += dy[(size_t)ch * n * f + p * f + q];
 }
-/* Backpropagate a->d[15] through the whole network of one window. */
+/* Backpropagate a->d[21] through the whole network of one window. */
 static void window_backward(const Unet *u, Workspace *a, float **gw,
                             float **gb) {
   /* each ReLU layer is masked by its own forward output a->a[k] */
-  backward_layer(&u->layer[10], a->a[14], a->a[15], a->d[15], a->d[14],
-                 a->n[15], NULL, gw[10], gb[10]);
+  backward_layer(&u->layer[14], a->a[20], a->a[21], a->d[21], a->d[20],
+                 a->n[21], NULL, gw[14], gb[14]);
+  backward_layer(&u->layer[13], a->a[19], a->a[20], a->d[20], a->d[19],
+                 a->n[20], a->s[13], gw[13], gb[13]);
+  backward_concat_layer(&u->layer[12], a->a[18], a->a[2], a->a[19], a->d[19],
+                        a->d[18], a->d[2], a->c[2], a->n[19], a->s[12],
+                        gw[12], gb[12]);
+  backward_upsample(a->d[18], a->d[17], a->c[17], a->n[17], u->config.pool);
+  backward_layer(&u->layer[11], a->a[16], a->a[17], a->d[17], a->d[16],
+                 a->n[17], a->s[11], gw[11], gb[11]);
+  backward_concat_layer(&u->layer[10], a->a[15], a->a[5], a->a[16], a->d[16],
+                        a->d[15], a->d[5], a->c[5], a->n[16], a->s[10],
+                        gw[10], gb[10]);
+  backward_upsample(a->d[15], a->d[14], a->c[14], a->n[14], u->config.pool);
   backward_layer(&u->layer[9], a->a[13], a->a[14], a->d[14], a->d[13],
                  a->n[14], a->s[9], gw[9], gb[9]);
-  backward_concat_layer(&u->layer[8], a->a[12], a->a[2], a->a[13], a->d[13],
-                        a->d[12], a->d[2], a->c[2], a->n[13], a->s[8],
+  backward_concat_layer(&u->layer[8], a->a[12], a->a[8], a->a[13], a->d[13],
+                        a->d[12], a->d[8], a->c[8], a->n[13], a->s[8],
                         gw[8], gb[8]);
   backward_upsample(a->d[12], a->d[11], a->c[11], a->n[11], u->config.pool);
   backward_layer(&u->layer[7], a->a[10], a->a[11], a->d[11], a->d[10],
                  a->n[11], a->s[7], gw[7], gb[7]);
-  backward_concat_layer(&u->layer[6], a->a[9], a->a[5], a->a[10], a->d[10],
-                        a->d[9], a->d[5], a->c[5], a->n[10], a->s[6],
-                        gw[6], gb[6]);
-  backward_upsample(a->d[9], a->d[8], a->c[8], a->n[8], u->config.pool);
+  backward_layer(&u->layer[6], a->a[9], a->a[10], a->d[10], a->d[9], a->n[10],
+                 a->s[6], gw[6], gb[6]);
+  backward_pool(a->d[9], a->d[8], a->c[8], a->n[8], u->config.pool);
   backward_layer(&u->layer[5], a->a[7], a->a[8], a->d[8], a->d[7], a->n[8],
                  a->s[5], gw[5], gb[5]);
   backward_layer(&u->layer[4], a->a[6], a->a[7], a->d[7], a->d[6], a->n[7],
@@ -717,7 +741,7 @@ static int batch_gradient(const Unet *u, const float *x, const float *y,
 #endif
       Worker *w = &work[t];
       run_forward(u, x + b * xs, ANNO_UNET_WINDOW, &w->a, w->p);
-      float *d = w->a.d[15];
+      float *d = w->a.d[21];
       for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
         int valid = m[b * ANNO_UNET_WINDOW + i] > 0;
         double dp[ANNO_CLASSES], softmax_dot = 0;
