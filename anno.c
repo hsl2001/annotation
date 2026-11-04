@@ -1,7 +1,7 @@
 /**
  * @file anno.c
  * @brief anno: FASTA/GFF3 input, CWT, local 1D convolution model,
- *        9-state grammar Viterbi, longest ORF and GFF3 output.
+ *        duration-expanded grammar Viterbi, longest ORF and GFF3 output.
  *
  * Pipeline: bases -> one-hot + CWT power -> UNet -> per-base probability of
  * ANNO_CLASSES classes -> log emissions -> grammar Viterbi -> transcripts ->
@@ -199,18 +199,15 @@ static void run_parallel(int threads, int64_t jobs, JobFunction function,
                          void *context) {
   if (jobs <= 0)
     return;
+#ifdef _OPENMP
   if ((int64_t)threads > jobs)
     threads = (int)jobs;
-#ifdef _OPENMP
 #pragma omp parallel for num_threads(threads) schedule(static)
-#endif
-  for (int64_t job = 0; job < jobs; job++) {
-#ifdef _OPENMP
-    function(context, job);
 #else
-    function(context, job);
+  (void)threads;
 #endif
-  }
+  for (int64_t job = 0; job < jobs; job++)
+    function(context, job);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -673,13 +670,16 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   if (start >= end || start < 0 || end > length)
     return;
   const int width[ANNO_CWT_CHANNELS] = {67, 83, 99};
+  const double support = 2.0 * ANNO_CWT_RADIUS_FACTOR;
   double complex kernel[ANNO_CWT_CHANNELS][99];
   for (int s = 0; s < ANNO_CWT_CHANNELS; s++) {
     double scale = cwt_scales[s];
     int radius = width[s] / 2;
     for (int tap = 0; tap < width[s]; tap++) {
-      double lower = fmax(((double)(tap - radius) - 0.5) / scale, -8.0);
-      double upper = fmin(((double)(tap - radius) + 0.5) / scale, 8.0);
+      double lower =
+          fmax(((double)(tap - radius) - 0.5) / scale, -support);
+      double upper =
+          fmin(((double)(tap - radius) + 0.5) / scale, support);
       int segments = (int)ceil((upper - lower) * 2.0);
       double complex integral = 0.0;
       if (lower < upper) {
@@ -691,15 +691,20 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
             double right = middle + nodes[node] * step / 2.0;
             integral += weights[node] * step / 2.0 *
                         (cexp(-0.5 * left * left) *
-                             (cexp(-I * 6.0 * left) - exp(-18.0)) +
+                             (cexp(-I * ANNO_MORLET_FREQUENCY * left) -
+                              exp(-0.5 * ANNO_MORLET_FREQUENCY *
+                                   ANNO_MORLET_FREQUENCY)) +
                          cexp(-0.5 * right * right) *
-                             (cexp(-I * 6.0 * right) - exp(-18.0)));
+                             (cexp(-I * ANNO_MORLET_FREQUENCY * right) -
+                              exp(-0.5 * ANNO_MORLET_FREQUENCY *
+                                   ANNO_MORLET_FREQUENCY)));
           }
         }
       }
+      double omega2 = ANNO_MORLET_FREQUENCY * ANNO_MORLET_FREQUENCY;
       double normalization =
           1.0 / sqrt(sqrt(acos(-1.0)) *
-                     (1.0 + exp(-36.0) - 2.0 * exp(-27.0)));
+                     (1.0 + exp(-omega2) - 2.0 * exp(-0.75 * omega2)));
       kernel[s][tap] = sqrt(scale) * normalization * integral;
     }
   }
@@ -847,14 +852,12 @@ typedef struct {
 } TrainingWindow;
 typedef struct {
   const TrainingWindow *windows;
-  size_t batch_start;
   float *input, *truth, *mask;
   int flip;
 } TrainingBatchJob;
 static void training_batch_job(void *pointer, int64_t job) {
   TrainingBatchJob *context = pointer;
-  const TrainingWindow *window =
-      &context->windows[context->batch_start + (size_t)job];
+  const TrainingWindow *window = &context->windows[(size_t)job];
   size_t slot = (size_t)job;
   float *power =
       xcalloc((size_t)window->valid * ANNO_CWT_CHANNELS, sizeof(float));
@@ -930,7 +933,6 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
              (size_t)ANNO_BATCH_WINDOWS * ANNO_UNET_WINDOW * sizeof(float));
       memcpy(batch_windows, all + first, size * sizeof(*batch_windows));
       TrainingBatchJob job = {batch_windows,
-                              0,
                               x,
                               y,
                               mask,
@@ -953,8 +955,9 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
   return unet;
 }
 
-#define GRAMMAR_MAX_STATES 256
-#define GRAMMAR_MAX_PREDECESSORS 5
+#define GRAMMAR_MAX_STATES \
+  (1 + ANNO_STRANDS * (ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH))
+#define GRAMMAR_MAX_PREDECESSORS (ANNO_STRANDS + 1)
 
 /** @brief Pending class-wise bedGraph runs. */
 typedef struct {
@@ -962,7 +965,6 @@ typedef struct {
   uint8_t cls[GRAMMAR_MAX_STATES];
   int predecessors[GRAMMAR_MAX_STATES];
   int from[GRAMMAR_MAX_STATES][GRAMMAR_MAX_PREDECESSORS];
-  double score[GRAMMAR_MAX_STATES][GRAMMAR_MAX_PREDECESSORS];
   int shift[GRAMMAR_MAX_STATES], bits[GRAMMAR_MAX_STATES];
 } Grammar;
 
@@ -971,15 +973,13 @@ typedef struct {
  * @param g Grammar to modify.
  * @param from Predecessor state index.
  * @param to Destination state index.
- * @param score Transition score.
  * @return None.
  */
-static void grammar_edge(Grammar *g, int from, int to, double score) {
+static void grammar_edge(Grammar *g, int from, int to) {
   int k = g->predecessors[to]++;
   if (k >= GRAMMAR_MAX_PREDECESSORS)
     fail("grammar has too many predecessors");
   g->from[to][k] = from;
-  g->score[to][k] = score;
 }
 
 /**
@@ -994,10 +994,10 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
   for (int i = 0; i < length; i++) {
     g->cls[g->count] = cls;
     if (i)
-      grammar_edge(g, g->count - 1, g->count, 0.0);
+      grammar_edge(g, g->count - 1, g->count);
     g->count++;
   }
-  grammar_edge(g, g->count - 1, g->count - 1, 0.0);
+  grammar_edge(g, g->count - 1, g->count - 1);
   return head;
 }
 
@@ -1010,19 +1010,17 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
 static void grammar_build(Grammar *g) {
   memset(g, 0, sizeof(*g));
   int inter = grammar_chain(g, ANNO_INTERGENIC, 1);
-  for (int strand = 0; strand < 2; strand++) {
+  for (int strand = 0; strand < ANNO_STRANDS; strand++) {
     uint8_t exon = strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON;
     uint8_t intron = strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON;
     int ex = grammar_chain(g, exon, ANNO_MIN_EXON_LENGTH);
     int ex_tail = ex + ANNO_MIN_EXON_LENGTH - 1;
-    int introns[3];
-    for (int i = 0; i < 3; i++)
-      introns[i] = grammar_chain(g, intron, ANNO_MIN_INTRON_LENGTH);
-    int tail = ANNO_MIN_INTRON_LENGTH - 1;
-    grammar_edge(g, inter, ex, 0.0);
-    grammar_edge(g, ex_tail, inter, 0.0);
-    grammar_edge(g, ex_tail, introns[0], 0.0);
-    grammar_edge(g, introns[0] + tail, ex, 0.0);
+    int intron_chain = grammar_chain(g, intron, ANNO_MIN_INTRON_LENGTH);
+    int intron_tail = intron_chain + ANNO_MIN_INTRON_LENGTH - 1;
+    grammar_edge(g, inter, ex);
+    grammar_edge(g, ex_tail, inter);
+    grammar_edge(g, ex_tail, intron_chain);
+    grammar_edge(g, intron_tail, ex);
   }
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
@@ -1033,7 +1031,7 @@ static void grammar_build(Grammar *g) {
     g->bits[s] = bits;
     shift += bits;
   }
-  if (shift > 32 || g->count > GRAMMAR_MAX_STATES)
+  if (shift > 32)
     fail("grammar too large");
 }
 
@@ -1056,7 +1054,8 @@ static Decoder *decoder_create(int64_t length) {
   d->length = length;
   d->previous = xcalloc((size_t)d->grammar.count, sizeof(double));
   d->current = xcalloc((size_t)d->grammar.count, sizeof(double));
-  d->back = xcalloc((size_t)length, sizeof(uint32_t));
+  d->back = xcalloc(length > 1 ? (size_t)(length - 1) : 1,
+                     sizeof(*d->back));
   return d;
 }
 
@@ -1100,7 +1099,7 @@ static void decoder_step(Decoder *d, const float *row) {
     double best = -INFINITY;
     int choice = 0;
     for (int k = 0; k < g->predecessors[s]; k++) {
-      double score = d->previous[g->from[s][k]] + g->score[s][k];
+      double score = d->previous[g->from[s][k]];
       if (score > best) {
         best = score;
         choice = k;
@@ -1113,7 +1112,7 @@ static void decoder_step(Decoder *d, const float *row) {
   }
   for (int s = 0; s < g->count; s++)
     d->current[s] -= top; /* keep scores small */
-  d->back[i] = back;
+  d->back[i - 1] = back;
   double *swap = d->previous;
   d->previous = d->current;
   d->current = swap;
@@ -1133,7 +1132,8 @@ static int decoder_finish(Decoder *d, uint8_t *path) {
   for (int64_t i = d->length - 1; i > 0; i--) {
     path[i] = g->cls[state];
     int choice =
-        (int)((d->back[i] >> g->shift[state]) & ((1u << g->bits[state]) - 1u));
+        (int)((d->back[i - 1] >> g->shift[state]) &
+              ((1u << g->bits[state]) - 1u));
     state = g->from[state][choice];
   }
   path[0] = g->cls[state];
@@ -1502,16 +1502,13 @@ static void bedgraph_add(Bedgraph *b, const char *name, int64_t position,
  * @param unet Trained model.
  * @param sequences Genome sequences to predict.
  * @param count Number of sequences.
- * @param threads Number of worker threads.
  * @param gff Destination GFF3 stream.
  * @param prefix Optional bedGraph output prefix.
  * @return Number of genes written.
  */
 static unsigned long predict_genome(const Unet *unet,
                                     const AnnoSequence *sequences, int count,
-                                    int threads, FILE *gff,
-                                    const char *prefix) {
-  (void)threads;
+                                    FILE *gff, const char *prefix) {
   Bedgraph bedgraph = {0};
   for (int j = 0; prefix && j < ANNO_CLASSES; j++) {
     char path[ANNO_PATH_BUFFER];
@@ -1679,7 +1676,7 @@ int main(int argc, char **argv) {
     }
     fputs("##gff-version 3\n", gff);
     unsigned long genes =
-        predict_genome(unet, sequences, count, threads, gff, prefix);
+        predict_genome(unet, sequences, count, gff, prefix);
     if (fflush(gff) || ferror(gff) || (gff != stdout && fclose(gff)))
       fail("cannot write GFF3");
     say("predicted %lu genes", genes);

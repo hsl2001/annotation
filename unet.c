@@ -26,10 +26,10 @@ enum {
   INITIAL_CHANNEL_2 = 64,
   INITIAL_CHANNEL_3 = 128,
   UNET_LAYER_COUNT = 15,
+  UNET_NORMALIZED_LAYER_COUNT = UNET_LAYER_COUNT - 1,
   WORKSPACE_COUNT = 22,
 };
 
-#define MAX_LAYERS UNET_LAYER_COUNT
 #define NORM_EPSILON 1e-5 /**< variance floor of the channel normalization */
 
 typedef struct {
@@ -45,7 +45,7 @@ typedef struct {
 } Layer;
 struct Unet {
   UnetConfig config;
-  int depth, nlayer;
+  int nlayer;
   uint64_t optimizer_step;
   Layer layer[UNET_LAYER_COUNT];
 };
@@ -177,7 +177,6 @@ Unet *unet_create(const UnetConfig *c) {
   if (!u)
     return NULL;
   u->config = *c;
-  u->depth = c->depth;
   uint64_t seed = anno_random_seed();
   int prev = ANNO_INPUT_CHANNELS;
   for (int l = 0; l < c->depth; ++l) {
@@ -226,7 +225,7 @@ void unet_destroy(Unet *u) { release(u); }
  * @return None.
  */
 static void convolve(const Layer *l, const float *a, const float *b, int split,
-                     float *y, int n, float *stat) {
+                     float *y, int n, int valid, float *stat) {
   int r = l->k / 2;
 #pragma omp parallel for schedule(static)
   for (int o = 0; o < l->out; ++o) {
@@ -238,32 +237,36 @@ static void convolve(const Layer *l, const float *a, const float *b, int split,
           i < split ? a + (size_t)i * n : b + (size_t)(i - split) * n;
       const float *w = l->w + ((size_t)o * l->in + i) * l->k;
       for (int q = 0; q < l->k; ++q) {
-        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? valid - s : valid;
         float wq = w[q];
         for (int p = lo; p < hi; ++p)
           yo[p] += wq * xi[p + s];
       }
     }
-    if (!stat)
-      continue;
-    double sum = 0, square = 0;
-    for (int p = 0; p < n; ++p) {
-      yo[p] = yo[p] < 0 ? 0 : yo[p];
-      sum += yo[p];
-      square += (double)yo[p] * yo[p];
+    if (stat) {
+      double sum = 0, square = 0;
+      for (int p = 0; p < valid; ++p) {
+        yo[p] = yo[p] < 0 ? 0 : yo[p];
+        sum += yo[p];
+        square += (double)yo[p] * yo[p];
+      }
+      double mean = sum / valid, var = square / valid - mean * mean;
+      float mu = (float)mean,
+            sd = (float)sqrt((var > 0 ? var : 0) + NORM_EPSILON);
+      for (int p = 0; p < valid; ++p)
+        yo[p] = (yo[p] - mu) / sd;
+      stat[2 * o] = mu;
+      stat[2 * o + 1] = sd;
     }
-    double mean = sum / n, var = square / n - mean * mean;
-    float mu = (float)mean, sd = (float)sqrt((var > 0 ? var : 0) + NORM_EPSILON);
-    for (int p = 0; p < n; ++p)
-      yo[p] = (yo[p] - mu) / sd;
-    stat[2 * o] = mu;
-    stat[2 * o + 1] = sd;
+    for (int p = valid; p < n; ++p)
+      yo[p] = 0.0f;
   }
 }
 
 /** @brief Plain convolution layer; see convolve(). */
-static void conv(const Layer *l, const float *x, float *y, int n, float *stat) {
-  convolve(l, x, NULL, l->in, y, n, stat);
+static void conv(const Layer *l, const float *x, float *y, int n, int valid,
+                 float *stat) {
+  convolve(l, x, NULL, l->in, y, n, valid, stat);
 }
 
 /**
@@ -303,11 +306,25 @@ static void upsample(const float *x, float *y, int c, int n, int f) {
         y[(size_t)ch * n * f + p * f + q] = x[(size_t)ch * n + p];
 }
 
+static void zero_tail(float *x, int channels, int n, int valid) {
+  if (valid >= n)
+    return;
+#pragma omp parallel for schedule(static)
+  for (int ch = 0; ch < channels; ++ch)
+    memset(x + (size_t)ch * n + valid, 0,
+           (size_t)(n - valid) * sizeof(*x));
+}
+
+static void valid_levels(int valid, int pool, int level[ANNO_MAX_DEPTH]) {
+  level[0] = valid;
+  for (int i = 1; i < ANNO_MAX_DEPTH; ++i)
+    level[i] = (level[i - 1] + pool - 1) / pool;
+}
+
 typedef struct {
   float *a[WORKSPACE_COUNT], *d[WORKSPACE_COUNT];
-  float *s[MAX_LAYERS]; /**< per-layer normalization (mean, sd) pairs */
+  float *s[UNET_NORMALIZED_LAYER_COUNT]; /**< per-layer normalization (mean, sd) pairs */
   int n[WORKSPACE_COUNT], c[WORKSPACE_COUNT];
-  int count;
 } Workspace;
 
 static const int workspace_lengths[WORKSPACE_COUNT] = {
@@ -322,8 +339,7 @@ static const int workspace_lengths[WORKSPACE_COUNT] = {
 
 static int workspace_init(const Unet *u, Workspace *a) {
   memset(a, 0, sizeof(*a));
-  a->count = WORKSPACE_COUNT;
-  for (int i = 0; i < a->count; ++i) {
+  for (int i = 0; i < WORKSPACE_COUNT; ++i) {
     static const int channel_level[WORKSPACE_COUNT] = {
         -1, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3,
         3,  2, 2, 2, 1, 1, 1, 0, 0, -2};
@@ -334,11 +350,12 @@ static int workspace_init(const Unet *u, Workspace *a) {
     a->n[i] = workspace_lengths[i];
     size_t size = (size_t)a->c[i] * a->n[i];
     a->a[i] = (float *)calloc(size, sizeof(float));
-    a->d[i] = (float *)calloc(size, sizeof(float));
-    if (!a->a[i] || !a->d[i])
+    if (i)
+      a->d[i] = (float *)calloc(size, sizeof(float));
+    if (!a->a[i] || (i && !a->d[i]))
       return 0;
   }
-  for (int l = 0; l < u->nlayer; ++l)
+  for (int l = 0; l < UNET_NORMALIZED_LAYER_COUNT; ++l)
     if (!(a->s[l] = (float *)calloc(2 * (size_t)u->layer[l].out, sizeof(float))))
       return 0;
   return 1;
@@ -350,15 +367,22 @@ static int workspace_init(const Unet *u, Workspace *a) {
  * @return None.
  */
 static void workspace_free(Workspace *a) {
-  for (int i = 0; i < a->count; ++i) {
+  for (int i = 0; i < WORKSPACE_COUNT; ++i) {
     free(a->a[i]);
     free(a->d[i]);
   }
-  for (int l = 0; l < MAX_LAYERS; ++l)
+  for (int l = 0; l < UNET_NORMALIZED_LAYER_COUNT; ++l)
     free(a->s[l]);
   memset(a, 0, sizeof(*a));
 }
 
+
+/** @brief Convolution over the concatenation [up ; skip]; see convolve(). */
+static void conv_concat(const Layer *l, const float *up, const float *skip,
+                        float *y, int skip_channels, int n, int valid,
+                        float *stat) {
+  convolve(l, up, skip, l->in - skip_channels, y, n, valid, stat);
+}
 
 /**
  * @brief Run the UNet forward pass and softmax output.
@@ -367,42 +391,42 @@ static void workspace_free(Workspace *a) {
  * @param len Number of valid input positions.
  * @param a Workspace used by the pass.
  * @param prob Position-major class probabilities.
- * @return 0 on success, or ENOMEM on allocation failure.
+ * @return None.
  */
-/** @brief Convolution over the concatenation [up ; skip]; see convolve(). */
-static void conv_concat(const Layer *l, const float *up, const float *skip,
-                        float *y, int skip_channels, int n, float *stat) {
-  convolve(l, up, skip, l->in - skip_channels, y, n, stat);
-}
-
-static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
-                       float *prob) {
+static void run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
+                        float *prob) {
+  int valid[ANNO_MAX_DEPTH];
+  valid_levels((int)len, u->config.pool, valid);
   memcpy(a->a[0], x, (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW *
                          sizeof(float));
-  conv(&u->layer[0], a->a[0], a->a[1], a->n[1], a->s[0]);
-  conv(&u->layer[1], a->a[1], a->a[2], a->n[2], a->s[1]);
+  zero_tail(a->a[0], ANNO_INPUT_CHANNELS, a->n[0], valid[0]);
+  conv(&u->layer[0], a->a[0], a->a[1], a->n[1], valid[0], a->s[0]);
+  conv(&u->layer[1], a->a[1], a->a[2], a->n[2], valid[0], a->s[1]);
   pool(a->a[2], a->a[3], a->c[2], a->n[2], u->config.pool);
-  conv(&u->layer[2], a->a[3], a->a[4], a->n[4], a->s[2]);
-  conv(&u->layer[3], a->a[4], a->a[5], a->n[5], a->s[3]);
+  conv(&u->layer[2], a->a[3], a->a[4], a->n[4], valid[1], a->s[2]);
+  conv(&u->layer[3], a->a[4], a->a[5], a->n[5], valid[1], a->s[3]);
   pool(a->a[5], a->a[6], a->c[5], a->n[5], u->config.pool);
-  conv(&u->layer[4], a->a[6], a->a[7], a->n[7], a->s[4]);
-  conv(&u->layer[5], a->a[7], a->a[8], a->n[8], a->s[5]);
+  conv(&u->layer[4], a->a[6], a->a[7], a->n[7], valid[2], a->s[4]);
+  conv(&u->layer[5], a->a[7], a->a[8], a->n[8], valid[2], a->s[5]);
   pool(a->a[8], a->a[9], a->c[8], a->n[8], u->config.pool);
-  conv(&u->layer[6], a->a[9], a->a[10], a->n[10], a->s[6]);
-  conv(&u->layer[7], a->a[10], a->a[11], a->n[11], a->s[7]);
+  conv(&u->layer[6], a->a[9], a->a[10], a->n[10], valid[3], a->s[6]);
+  conv(&u->layer[7], a->a[10], a->a[11], a->n[11], valid[3], a->s[7]);
   upsample(a->a[11], a->a[12], a->c[11], a->n[11], u->config.pool);
+  zero_tail(a->a[12], a->c[12], a->n[12], valid[2]);
   conv_concat(&u->layer[8], a->a[12], a->a[8], a->a[13], a->c[8], a->n[13],
-              a->s[8]);
-  conv(&u->layer[9], a->a[13], a->a[14], a->n[14], a->s[9]);
+              valid[2], a->s[8]);
+  conv(&u->layer[9], a->a[13], a->a[14], a->n[14], valid[2], a->s[9]);
   upsample(a->a[14], a->a[15], a->c[14], a->n[14], u->config.pool);
+  zero_tail(a->a[15], a->c[15], a->n[15], valid[1]);
   conv_concat(&u->layer[10], a->a[15], a->a[5], a->a[16], a->c[5], a->n[16],
-              a->s[10]);
-  conv(&u->layer[11], a->a[16], a->a[17], a->n[17], a->s[11]);
+              valid[1], a->s[10]);
+  conv(&u->layer[11], a->a[16], a->a[17], a->n[17], valid[1], a->s[11]);
   upsample(a->a[17], a->a[18], a->c[17], a->n[17], u->config.pool);
+  zero_tail(a->a[18], a->c[18], a->n[18], valid[0]);
   conv_concat(&u->layer[12], a->a[18], a->a[2], a->a[19], a->c[2], a->n[19],
-              a->s[12]);
-  conv(&u->layer[13], a->a[19], a->a[20], a->n[20], a->s[13]);
-  conv(&u->layer[14], a->a[20], a->a[21], a->n[21], NULL);
+              valid[0], a->s[12]);
+  conv(&u->layer[13], a->a[19], a->a[20], a->n[20], valid[0], a->s[13]);
+  conv(&u->layer[14], a->a[20], a->a[21], a->n[21], valid[0], NULL);
   float *z = a->a[21];
   int64_t usable = len;
 #pragma omp parallel for
@@ -420,7 +444,6 @@ static int run_forward(const Unet *u, const float *x, int64_t len, Workspace *a,
     for (int j = 0; j < ANNO_CLASSES; ++j)
       prob[(size_t)p * ANNO_CLASSES + j] /= sum;
   }
-  return 0;
 }
 
 /**
@@ -437,9 +460,9 @@ int unet_predict_channels(const Unet *u, const float *x, int64_t n, float *p) {
   Workspace a = {0};
   if (!workspace_init(u, &a))
     return ENOMEM;
-  int rc = run_forward(u, x, n, &a, p);
+  run_forward(u, x, n, &a, p);
   workspace_free(&a);
-  return rc;
+  return 0;
 }
 
 /**
@@ -484,29 +507,33 @@ int unet_predict(const Unet *u, const float *in, int64_t n, float *p) {
  */
 static void convolve_backward(const Layer *l, const float *a, const float *b,
                               int split, const float *out, float *dy,
-                              float *da, float *db, int n, const float *stat,
-                              float *gw, float *gb) {
+                              float *da, float *db, int n, int valid,
+                              const float *stat, float *gw, float *gb) {
   int r = l->k / 2;
-  for (int o = 0; stat && o < l->out; ++o) {
-    /* out = (relu(z) - mu) / sd; relu(z) == 0 exactly where out == floor */
+  for (int o = 0; o < l->out; ++o) {
     float *g = dy + (size_t)o * n;
+    for (int p = valid; p < n; ++p)
+      g[p] = 0.0f;
+    if (!stat)
+      continue;
+    /* Normalization statistics are over real positions, not zero padding. */
     const float *x = out + (size_t)o * n;
     float mu = stat[2 * o], sd = stat[2 * o + 1], floor = (0.0f - mu) / sd;
     double m1 = 0, m2 = 0;
-    for (int p = 0; p < n; ++p) {
+    for (int p = 0; p < valid; ++p) {
       m1 += g[p];
       m2 += (double)g[p] * x[p];
     }
-    m1 /= n;
-    m2 /= n;
-    for (int p = 0; p < n; ++p)
+    m1 /= valid;
+    m2 /= valid;
+    for (int p = 0; p < valid; ++p)
       g[p] = x[p] > floor ? (float)((g[p] - m1 - x[p] * m2) / sd) : 0.0f;
   }
 #pragma omp parallel for schedule(static)
   for (int o = 0; o < l->out; ++o) {
     const float *g = dy + (size_t)o * n;
     float sum = 0;
-    for (int p = 0; p < n; ++p)
+    for (int p = 0; p < valid; ++p)
       sum += g[p];
     gb[o] += sum;
     for (int i = 0; i < l->in; ++i) {
@@ -514,7 +541,7 @@ static void convolve_backward(const Layer *l, const float *a, const float *b,
           i < split ? a + (size_t)i * n : b + (size_t)(i - split) * n;
       float *w = gw + ((size_t)o * l->in + i) * l->k;
       for (int q = 0; q < l->k; ++q) {
-        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? valid - s : valid;
         float dw = 0;
         for (int p = lo; p < hi; ++p)
           dw += g[p] * xi[p + s];
@@ -532,7 +559,7 @@ static void convolve_backward(const Layer *l, const float *a, const float *b,
       const float *g = dy + (size_t)o * n;
       const float *w = l->w + ((size_t)o * l->in + i) * l->k;
       for (int q = 0; q < l->k; ++q) {
-        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? n - s : n;
+        int s = q - r, lo = s < 0 ? -s : 0, hi = s > 0 ? valid - s : valid;
         float wq = w[q];
         for (int p = lo; p < hi; ++p)
           dx[p + s] += wq * g[p];
@@ -543,95 +570,106 @@ static void convolve_backward(const Layer *l, const float *a, const float *b,
 
 /** @brief Backpropagate through conv(); dx may be NULL. */
 static void backward_layer(const Layer *l, const float *x, const float *out,
-                           float *y, float *dx, int n, const float *stat, float *gw,
-                           float *gb) {
-  convolve_backward(l, x, NULL, l->in, out, y, dx, NULL, n, stat, gw, gb);
+                           float *y, float *dx, int n, int valid,
+                           const float *stat, float *gw, float *gb) {
+  convolve_backward(l, x, NULL, l->in, out, y, dx, NULL, n, valid, stat, gw,
+                    gb);
 }
 
 /** @brief Backpropagate through conv_concat(). */
 static void backward_concat_layer(const Layer *l, const float *up,
                                   const float *skip, const float *out,
                                   float *y, float *dup, float *dskip,
-                                  int skip_channels, int n, const float *stat,
-                                  float *gw, float *gb) {
+                                  int skip_channels, int n, int valid,
+                                  const float *stat, float *gw, float *gb) {
   convolve_backward(l, up, skip, l->in - skip_channels, out, y, dup, dskip, n,
-                    stat, gw, gb);
+                    valid, stat, gw, gb);
 }
 
 /* Accumulates into dx: the pooled tensor is also a skip input, whose
  * gradient was written there by backward_concat_layer(). */
-static void backward_pool(const float *dy, float *dx, int c, int n, int f) {
+static void backward_pool(const float *dy, float *dx, int c, int n, int f,
+                          int valid_in, int valid_out) {
   for (int ch = 0; ch < c; ++ch)
-    for (int p = 0; p < n / f; ++p)
-      for (int q = 0; q < f; ++q)
+    for (int p = 0; p < valid_out; ++p)
+      for (int q = 0; q < f && p * f + q < valid_in; ++q)
         dx[(size_t)ch * n + p * f + q] +=
             dy[(size_t)ch * (n / f) + p] / f;
 }
 
-static void backward_upsample(const float *dy, float *dx, int c, int n, int f) {
+static void backward_upsample(const float *dy, float *dx, int c, int n, int f,
+                              int valid_in, int valid_out) {
   memset(dx, 0, (size_t)c * n * sizeof(float));
   for (int ch = 0; ch < c; ++ch)
-    for (int p = 0; p < n; ++p)
-      for (int q = 0; q < f; ++q)
+    for (int p = 0; p < valid_in; ++p)
+      for (int q = 0; q < f && p * f + q < valid_out; ++q)
         dx[(size_t)ch * n + p] += dy[(size_t)ch * n * f + p * f + q];
 }
+
 /* Backpropagate a->d[21] through the whole network of one window. */
 static void window_backward(const Unet *u, Workspace *a, float **gw,
-                            float **gb) {
-  /* each ReLU layer is masked by its own forward output a->a[k] */
+                            float **gb, int valid_input) {
+  int valid[ANNO_MAX_DEPTH];
+  valid_levels(valid_input, u->config.pool, valid);
   backward_layer(&u->layer[14], a->a[20], a->a[21], a->d[21], a->d[20],
-                 a->n[21], NULL, gw[14], gb[14]);
+                 a->n[21], valid[0], NULL, gw[14], gb[14]);
   backward_layer(&u->layer[13], a->a[19], a->a[20], a->d[20], a->d[19],
-                 a->n[20], a->s[13], gw[13], gb[13]);
+                 a->n[20], valid[0], a->s[13], gw[13], gb[13]);
   backward_concat_layer(&u->layer[12], a->a[18], a->a[2], a->a[19], a->d[19],
-                        a->d[18], a->d[2], a->c[2], a->n[19], a->s[12],
-                        gw[12], gb[12]);
-  backward_upsample(a->d[18], a->d[17], a->c[17], a->n[17], u->config.pool);
+                        a->d[18], a->d[2], a->c[2], a->n[19], valid[0],
+                        a->s[12], gw[12], gb[12]);
+  backward_upsample(a->d[18], a->d[17], a->c[17], a->n[17], u->config.pool,
+                    valid[1], valid[0]);
   backward_layer(&u->layer[11], a->a[16], a->a[17], a->d[17], a->d[16],
-                 a->n[17], a->s[11], gw[11], gb[11]);
+                 a->n[17], valid[1], a->s[11], gw[11], gb[11]);
   backward_concat_layer(&u->layer[10], a->a[15], a->a[5], a->a[16], a->d[16],
-                        a->d[15], a->d[5], a->c[5], a->n[16], a->s[10],
-                        gw[10], gb[10]);
-  backward_upsample(a->d[15], a->d[14], a->c[14], a->n[14], u->config.pool);
+                        a->d[15], a->d[5], a->c[5], a->n[16], valid[1],
+                        a->s[10], gw[10], gb[10]);
+  backward_upsample(a->d[15], a->d[14], a->c[14], a->n[14], u->config.pool,
+                    valid[2], valid[1]);
   backward_layer(&u->layer[9], a->a[13], a->a[14], a->d[14], a->d[13],
-                 a->n[14], a->s[9], gw[9], gb[9]);
+                 a->n[14], valid[2], a->s[9], gw[9], gb[9]);
   backward_concat_layer(&u->layer[8], a->a[12], a->a[8], a->a[13], a->d[13],
-                        a->d[12], a->d[8], a->c[8], a->n[13], a->s[8],
-                        gw[8], gb[8]);
-  backward_upsample(a->d[12], a->d[11], a->c[11], a->n[11], u->config.pool);
+                        a->d[12], a->d[8], a->c[8], a->n[13], valid[2],
+                        a->s[8], gw[8], gb[8]);
+  backward_upsample(a->d[12], a->d[11], a->c[11], a->n[11], u->config.pool,
+                    valid[3], valid[2]);
   backward_layer(&u->layer[7], a->a[10], a->a[11], a->d[11], a->d[10],
-                 a->n[11], a->s[7], gw[7], gb[7]);
+                 a->n[11], valid[3], a->s[7], gw[7], gb[7]);
   backward_layer(&u->layer[6], a->a[9], a->a[10], a->d[10], a->d[9], a->n[10],
-                 a->s[6], gw[6], gb[6]);
-  backward_pool(a->d[9], a->d[8], a->c[8], a->n[8], u->config.pool);
+                 valid[3], a->s[6], gw[6], gb[6]);
+  backward_pool(a->d[9], a->d[8], a->c[8], a->n[8], u->config.pool, valid[2],
+                valid[3]);
   backward_layer(&u->layer[5], a->a[7], a->a[8], a->d[8], a->d[7], a->n[8],
-                 a->s[5], gw[5], gb[5]);
+                 valid[2], a->s[5], gw[5], gb[5]);
   backward_layer(&u->layer[4], a->a[6], a->a[7], a->d[7], a->d[6], a->n[7],
-                 a->s[4], gw[4], gb[4]);
-  backward_pool(a->d[6], a->d[5], a->c[5], a->n[5], u->config.pool);
+                 valid[2], a->s[4], gw[4], gb[4]);
+  backward_pool(a->d[6], a->d[5], a->c[5], a->n[5], u->config.pool, valid[1],
+                valid[2]);
   backward_layer(&u->layer[3], a->a[4], a->a[5], a->d[5], a->d[4], a->n[5],
-                 a->s[3], gw[3], gb[3]);
+                 valid[1], a->s[3], gw[3], gb[3]);
   backward_layer(&u->layer[2], a->a[3], a->a[4], a->d[4], a->d[3], a->n[4],
-                 a->s[2], gw[2], gb[2]);
-  backward_pool(a->d[3], a->d[2], a->c[2], a->n[2], u->config.pool);
+                 valid[1], a->s[2], gw[2], gb[2]);
+  backward_pool(a->d[3], a->d[2], a->c[2], a->n[2], u->config.pool, valid[0],
+                valid[1]);
   backward_layer(&u->layer[1], a->a[1], a->a[2], a->d[2], a->d[1], a->n[2],
-                 a->s[1], gw[1], gb[1]);
+                 valid[0], a->s[1], gw[1], gb[1]);
   backward_layer(&u->layer[0], a->a[0], a->a[1], a->d[1], NULL, a->n[1],
-                 a->s[0], gw[0], gb[0]);
+                 valid[0], a->s[0], gw[0], gb[0]);
 }
 
 /* Independent per-thread scratch: activations, probabilities, gradients
  * and Soft F1 statistics. */
 typedef struct {
   Workspace a;
-  float *p, *gw[MAX_LAYERS], *gb[MAX_LAYERS];
+  float *p, *gw[UNET_LAYER_COUNT], *gb[UNET_LAYER_COUNT];
   double sum_p[ANNO_CLASSES], sum_y[ANNO_CLASSES], inter[ANNO_CLASSES], count;
 } Worker;
 
 static void worker_free(Worker *w) {
   workspace_free(&w->a);
   free(w->p);
-  for (int l = 0; l < MAX_LAYERS; ++l) {
+  for (int l = 0; l < UNET_LAYER_COUNT; ++l) {
     free(w->gw[l]);
     free(w->gb[l]);
   }
@@ -672,6 +710,13 @@ static int worker_init(const Unet *u, Worker *w) {
  * @param loss Receives the batch loss.
  * @return 0 on success, EINVAL without valid positions, ENOMEM on failure.
  */
+static int window_valid_length(const float *mask) {
+  int valid = ANNO_UNET_WINDOW;
+  while (valid && mask[valid - 1] <= 0.0f)
+    --valid;
+  return valid;
+}
+
 static int batch_gradient(const Unet *u, const float *x, const float *y,
                           const float *m, size_t batch, float **gw, float **gb,
                           double *loss) {
@@ -700,9 +745,13 @@ static int batch_gradient(const Unet *u, const float *x, const float *y,
     t = omp_get_thread_num();
 #endif
     Worker *w = &work[t];
-    run_forward(u, x + b * xs, ANNO_UNET_WINDOW, &w->a, w->p);
-    for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-      if (m[b * ANNO_UNET_WINDOW + i] <= 0)
+    const float *mask = m + b * ANNO_UNET_WINDOW;
+    int valid = window_valid_length(mask);
+    if (!valid)
+      continue;
+    run_forward(u, x + b * xs, valid, &w->a, w->p);
+    for (int i = 0; i < valid; ++i) {
+      if (mask[i] <= 0.0f)
         continue;
       w->count += 1.0;
       for (int j = 0; j < ANNO_CLASSES; ++j) {
@@ -740,10 +789,16 @@ static int batch_gradient(const Unet *u, const float *x, const float *y,
       t = omp_get_thread_num();
 #endif
       Worker *w = &work[t];
-      run_forward(u, x + b * xs, ANNO_UNET_WINDOW, &w->a, w->p);
+      const float *mask = m + b * ANNO_UNET_WINDOW;
+      int valid = window_valid_length(mask);
       float *d = w->a.d[21];
-      for (int64_t i = 0; i < ANNO_UNET_WINDOW; ++i) {
-        int valid = m[b * ANNO_UNET_WINDOW + i] > 0;
+      memset(d, 0, (size_t)ANNO_CLASSES * ANNO_UNET_WINDOW * sizeof(float));
+      if (!valid)
+        continue;
+      run_forward(u, x + b * xs, valid, &w->a, w->p);
+      for (int i = 0; i < valid; ++i) {
+        if (mask[i] <= 0.0f)
+          continue;
         double dp[ANNO_CLASSES], softmax_dot = 0;
         for (int j = 0; j < ANNO_CLASSES; ++j) {
           double target = y[b * ys + (size_t)j * ANNO_UNET_WINDOW + i];
@@ -754,11 +809,10 @@ static int batch_gradient(const Unet *u, const float *x, const float *y,
         }
         for (int j = 0; j < ANNO_CLASSES; ++j)
           d[(size_t)j * ANNO_UNET_WINDOW + i] =
-              valid ? (float)(w->p[(size_t)i * ANNO_CLASSES + j] *
-                              (dp[j] - softmax_dot))
-                    : 0.0f;
+              (float)(w->p[(size_t)i * ANNO_CLASSES + j] *
+                      (dp[j] - softmax_dot));
       }
-      window_backward(u, &w->a, w->gw, w->gb);
+      window_backward(u, &w->a, w->gw, w->gb, valid);
     }
     for (int l = 0; l < u->nlayer; ++l) {
       const Layer *q = &u->layer[l];

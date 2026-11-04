@@ -1,7 +1,8 @@
 /**
  * @file anno.h
- * @brief Public API of anno: CWT + local 1D convolution emissions, 9-state
- * grammar Viterbi decoding, longest-ORF resolution and GFF3 output.
+ * @brief Public API of anno: CWT + local 1D convolution emissions,
+ * duration-expanded grammar Viterbi decoding, longest-ORF resolution and GFF3
+ * output.
  *
  * Coordinates are 0-based half-open everywhere inside the program; GFF3
  * input and output use 1-based inclusive coordinates.

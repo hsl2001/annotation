@@ -208,6 +208,24 @@ static void test_round_trip(const AnnoSequence *s) {
 }
 
 /** @brief Grammar constraints on a probability matrix. */
+static void test_grammar(void) {
+  Grammar grammar;
+  grammar_build(&grammar);
+  CHECK(grammar.count ==
+        1 + 2 * (ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH));
+  uint8_t reachable[GRAMMAR_MAX_STATES] = {0};
+  reachable[0] = 1;
+  for (int pass = 0; pass < grammar.count; ++pass)
+    for (int state = 0; state < grammar.count; ++state)
+      for (int k = 0; k < grammar.predecessors[state]; ++k)
+        if (reachable[grammar.from[state][k]])
+          reachable[state] = 1;
+  int count = 0;
+  for (int state = 0; state < grammar.count; ++state)
+    count += reachable[state] != 0;
+  CHECK(count == grammar.count);
+}
+
 static void test_viterbi(void) {
   enum { N = 60 };
   char bases[N + 1];
@@ -296,11 +314,11 @@ static void test_gradient(void) {
   for (int b = 0; b < B; b++)
     for (int i = 0; i < ANNO_UNET_WINDOW; i++) {
       int c = (i / 300) % ANNO_CLASSES;
-      if (b == 1 && c > 4)
+      if (b == 1 && c >= ANNO_MINUS_EXON)
         c = ANNO_INTERGENIC;
       y[(size_t)b * ANNO_CLASSES * ANNO_UNET_WINDOW +
         (size_t)c * ANNO_UNET_WINDOW + i] = 1.0f;
-      m[b * ANNO_UNET_WINDOW + i] = i < ANNO_UNET_WINDOW - 96;
+      m[b * ANNO_UNET_WINDOW + i] = i < ANNO_UNET_WINDOW - 97;
     }
   UnetConfig config = unet_default_config();
   Unet *u = unet_create(&config);
@@ -313,10 +331,10 @@ static void test_gradient(void) {
   double loss = 0, plus = 0, minus = 0;
   CHECK(batch_gradient(u, x, y, m, B, gw, gb, &loss) == 0);
   /* encoder input, skip source, decoder concat and output layers */
-  static const int layers[] = {0, 3, 6, 8, 10};
+  static const int layers[] = {0, 3, 6, 8, 10, 14};
   double worst = 0;
   int tested = 0;
-  for (int t = 0; t < 5; t++) {
+  for (int t = 0; t < 6; t++) {
     Layer *l = &u->layer[layers[t]];
     size_t count = (size_t)l->in * l->out * l->k, best = 0;
     for (size_t i = 1; i < count; i++) /* largest gradient: well above noise */
@@ -346,7 +364,7 @@ static void test_gradient(void) {
       worst = fmax(worst, fabs(numeric - analytic) / fabs(numeric));
     }
   }
-  CHECK(tested == 5);
+  CHECK(tested == 6);
   CHECK(worst < 5e-2);
   if (worst >= 5e-2)
     fprintf(stderr, "gradient relative error %g\n", worst);
@@ -467,6 +485,34 @@ static void test_cwt(void) {
   free(reverse);
 }
 
+/** @brief Short-window predictions ignore values in the padded tail. */
+static void test_padding_mask(void) {
+  enum { N = 137 };
+  size_t input_size = (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW;
+  float *zero_padded = xcalloc(input_size, sizeof(float));
+  float *noisy_padded = xcalloc(input_size, sizeof(float));
+  float a[N * ANNO_CLASSES], b[N * ANNO_CLASSES];
+  uint64_t seed = 19;
+  for (int ch = 0; ch < ANNO_INPUT_CHANNELS; ++ch)
+    for (int p = 0; p < ANNO_UNET_WINDOW; ++p) {
+      size_t index = (size_t)ch * ANNO_UNET_WINDOW + p;
+      if (p < N) {
+        float value = anno_random_symmetric(&seed);
+        zero_padded[index] = noisy_padded[index] = value;
+      } else {
+        noisy_padded[index] = anno_random_symmetric(&seed);
+      }
+    }
+  Unet *unet = unet_create(&(UnetConfig){
+      .depth = 4, .kernel = 9, .pool = 2, .channels = {16, 32, 64, 128}});
+  CHECK(unet_predict_channels(unet, zero_padded, N, a) == 0);
+  CHECK(unet_predict_channels(unet, noisy_padded, N, b) == 0);
+  CHECK(!memcmp(a, b, sizeof(a)));
+  unet_destroy(unet);
+  free(zero_padded);
+  free(noisy_padded);
+}
+
 /** @brief model round trip and identical predictions. */
 static void test_model_file(void) {
   UnetConfig config = {
@@ -530,7 +576,7 @@ static void test_pipeline(AnnoSequence *s) {
   Unet *loaded = NULL;
   CHECK(unet_load("test-pipeline.ann", &loaded) == 0);
   FILE *file = tmpfile();
-  predict_genome(loaded, s, 1, 2, file, NULL);
+  predict_genome(loaded, s, 1, file, NULL);
   char *text = read_text(file);
   /* every line is a 9-column record of a known type */
   int ok = 1;
@@ -552,12 +598,14 @@ int main(void) {
   AnnoSequence *sequences = test_sequences("test.fasta", "test.gff3");
   test_labels(&sequences[0]);
   test_round_trip(&sequences[0]);
+  test_grammar();
   test_viterbi();
   test_utr_intron_edges();
   test_orf();
   test_softmax();
   test_cwt();
   test_model_file();
+  test_padding_mask();
   test_gradient();
   test_label_errors("test.fasta");
   test_pipeline(sequences);
