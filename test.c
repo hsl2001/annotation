@@ -16,10 +16,6 @@ static unsigned random_below(uint64_t *state, unsigned bound) {
   return (unsigned)(anno_random_next(state) % bound);
 }
 
-/** @brief Return a deterministic pseudo-random float in [0, 1). */
-static float test_random_unit(uint64_t *state) {
-  return anno_random_unit(state);
-}
 
 static float *test_sequence_power(const AnnoSequence *sequence) {
   float *power =
@@ -163,15 +159,55 @@ static AnnoSequence *test_sequences(const char *fasta, const char *gff) {
 /** @brief GFF -> label vector checks at hand-picked positions. */
 static void test_labels(const AnnoSequence *s) {
   const uint8_t *y = s->labels;
-  CHECK(y[39] == ANNO_INTERGENIC && y[40] == ANNO_PLUS_EXON);
+  CHECK(ANNO_CLASSES == 7);
+  CHECK(ANNO_INTERGENIC == 0 && ANNO_PLUS_START_SINGLE_EXON == 1 &&
+        ANNO_PLUS_END_EXON == 2 && ANNO_PLUS_INTRON == 3 &&
+        ANNO_MINUS_START_SINGLE_EXON == 4 && ANNO_MINUS_END_EXON == 5 &&
+        ANNO_MINUS_INTRON == 6);
+  CHECK(ANNO_PLUS_INTERNAL_EXON == 7 && ANNO_MINUS_INTERNAL_EXON == 8);
+  CHECK(y[39] == ANNO_INTERGENIC && y[40] == ANNO_PLUS_START_SINGLE_EXON);
+  CHECK(y[69] == ANNO_PLUS_START_SINGLE_EXON);
   CHECK(y[70] == ANNO_PLUS_INTRON && y[99] == ANNO_PLUS_INTRON);
-  CHECK(y[120] == ANNO_PLUS_EXON && y[121] == ANNO_PLUS_EXON);
-  CHECK(y[390] == ANNO_PLUS_EXON && y[391] == ANNO_PLUS_EXON);
-  CHECK(y[419] == ANNO_PLUS_EXON && y[420] == ANNO_INTERGENIC);
-  CHECK(y[1579] == ANNO_INTERGENIC && y[1580] == ANNO_MINUS_EXON);
-  CHECK(y[1609] == ANNO_MINUS_EXON && y[1640] == ANNO_MINUS_INTRON);
-  CHECK(y[1879] == ANNO_MINUS_EXON && y[1959] == ANNO_MINUS_EXON);
+  CHECK(y[120] == ANNO_INTERGENIC && y[121] == ANNO_INTERGENIC);
+  CHECK(y[390] == ANNO_PLUS_END_EXON && y[391] == ANNO_PLUS_END_EXON);
+  CHECK(y[419] == ANNO_PLUS_END_EXON && y[420] == ANNO_INTERGENIC);
+  CHECK(y[1579] == ANNO_INTERGENIC && y[1580] == ANNO_MINUS_END_EXON);
+  CHECK(y[1609] == ANNO_MINUS_END_EXON && y[1640] == ANNO_MINUS_INTRON);
+  CHECK(y[1879] == ANNO_INTERGENIC &&
+        y[1959] == ANNO_MINUS_START_SINGLE_EXON);
   CHECK(y[1960] == ANNO_INTERGENIC);
+  for (int i = 0; i < TEST_LENGTH; i++) {
+    int expected = i < 40     ? ANNO_INTERGENIC
+                   : i < 70   ? ANNO_PLUS_START_SINGLE_EXON
+                   : i < 100  ? ANNO_PLUS_INTRON
+                   : i < 150  ? ANNO_INTERGENIC
+                   : i < 210  ? ANNO_PLUS_INTRON
+                   : i < 300  ? ANNO_INTERGENIC
+                   : i < 360  ? ANNO_PLUS_INTRON
+                   : i < 420  ? ANNO_PLUS_END_EXON
+                   : i < 1580 ? ANNO_INTERGENIC
+                   : i < 1640 ? ANNO_MINUS_END_EXON
+                   : i < 1700 ? ANNO_MINUS_INTRON
+                   : i < 1790 ? ANNO_INTERGENIC
+                   : i < 1850 ? ANNO_MINUS_INTRON
+                   : i < 1900 ? ANNO_INTERGENIC
+                   : i < 1930 ? ANNO_MINUS_INTRON
+                   : i < 1960 ? ANNO_MINUS_START_SINGLE_EXON
+                              : ANNO_INTERGENIC;
+    CHECK(y[i] == expected && y[i] < ANNO_CLASSES);
+  }
+}
+
+/** @brief Reverse-complement augmentation preserves transcriptional roles. */
+static void test_strand_swap(void) {
+  static const uint8_t swapped[] = {
+      ANNO_INTERGENIC, ANNO_MINUS_START_SINGLE_EXON, ANNO_MINUS_END_EXON,
+      ANNO_MINUS_INTRON, ANNO_PLUS_START_SINGLE_EXON, ANNO_PLUS_END_EXON,
+      ANNO_PLUS_INTRON};
+  for (int label = 0; label < ANNO_CLASSES; label++) {
+    CHECK(ann_swap_strand(label) == swapped[label]);
+    CHECK(ann_swap_strand(ann_swap_strand(label)) == label);
+  }
 }
 
 /** @brief Print the GFF records of a path into a string (caller frees). */
@@ -185,26 +221,36 @@ static char *gff_of_path(const AnnoSequence *s, const uint8_t *path) {
   return text;
 }
 
-/** @brief GFF -> labels -> GFF and GFF -> labels -> probabilities -> Viterbi ->
- * GFF. */
+/** @brief Restore known intron-bounded exons before writing decoded GFF. */
 static void test_round_trip(const AnnoSequence *s) {
-  char *direct = gff_of_path(s, s->labels);
+  uint8_t *expected = xcalloc((size_t)s->length, 1);
+  memcpy(expected, s->labels, (size_t)s->length);
+  static const int internal[4][2] = {
+      {100, 150}, {210, 300}, {1700, 1790}, {1850, 1900}};
+  for (int e = 0; e < 4; e++)
+    for (int i = internal[e][0]; i < internal[e][1]; i++) {
+      CHECK(s->labels[i] == ANNO_INTERGENIC);
+      expected[i] = e < 2 ? ANNO_PLUS_INTERNAL_EXON : ANNO_MINUS_INTERNAL_EXON;
+    }
+  char *direct = gff_of_path(s, expected);
   CHECK(!strcmp(direct, test_gff));
   if (strcmp(direct, test_gff))
     fprintf(stderr, "got:\n%s", direct);
   float *probability = xcalloc((size_t)s->length * ANNO_CLASSES, sizeof(float));
   for (int64_t i = 0; i < s->length; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
-      probability[i * ANNO_CLASSES + j] = j == s->labels[i] ? 0.6f : 0.05f;
+      probability[i * ANNO_CLASSES + j] =
+          j == s->labels[i] ? 0.9f : 0.1f / (ANNO_CLASSES - 1);
   uint8_t *path = xcalloc((size_t)s->length, 1);
-  CHECK(anno_decode(s->bases, s->length, probability, path) == 0);
-  CHECK(!memcmp(path, s->labels, (size_t)s->length));
+  CHECK(anno_decode(s->length, probability, path) == 0);
+  CHECK(!memcmp(path, expected, (size_t)s->length));
   char *decoded = gff_of_path(s, path);
   CHECK(!strcmp(decoded, test_gff));
   free(direct);
   free(decoded);
   free(path);
   free(probability);
+  free(expected);
 }
 
 /** @brief Grammar constraints on a probability matrix. */
@@ -212,7 +258,7 @@ static void test_grammar(void) {
   Grammar grammar;
   grammar_build(&grammar);
   CHECK(grammar.count ==
-        1 + 2 * (ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH));
+        1 + 2 * (3 * ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH));
   uint8_t reachable[GRAMMAR_MAX_STATES] = {0};
   reachable[0] = 1;
   for (int pass = 0; pass < grammar.count; ++pass)
@@ -226,53 +272,271 @@ static void test_grammar(void) {
   CHECK(count == grammar.count);
 }
 
+/** @brief Recognize a decoded path using the duration-expanded grammar. */
+static int grammar_accepts(const uint8_t *path, int n) {
+  Grammar g;
+  grammar_build(&g);
+  uint8_t active[GRAMMAR_MAX_STATES] = {0};
+  if (!n || path[0] != ANNO_INTERGENIC)
+    return 0;
+  active[0] = 1;
+  for (int i = 1; i < n; i++) {
+    uint8_t next[GRAMMAR_MAX_STATES] = {0};
+    for (int s = 0; s < g.count; s++)
+      if (g.cls[s] == path[i])
+        for (int k = 0; k < g.predecessors[s]; k++)
+          next[s] |= active[g.from[s][k]];
+    memcpy(active, next, sizeof(active));
+  }
+  return active[0] != 0;
+}
+
+/** @brief Recognize a short list of constant-label runs. */
+static int grammar_accepts_runs(const uint8_t *labels, const int *lengths,
+                                int count) {
+  uint8_t path[512];
+  int n = 0;
+  for (int r = 0; r < count; r++) {
+    if (lengths[r] < 0 || lengths[r] > (int)sizeof(path) - n)
+      return 0;
+    memset(path + n, labels[r], (size_t)lengths[r]);
+    n += lengths[r];
+  }
+  return grammar_accepts(path, n);
+}
+
+/** @brief Terminal roles, strand isolation and all duration boundaries. */
+static void test_grammar_paths(void) {
+  CHECK(ANNO_MIN_EXON_LENGTH == 6 && ANNO_MIN_INTRON_LENGTH == 30);
+  for (int strand = 0; strand < 2; strand++) {
+    uint8_t start = strand ? ANNO_MINUS_START_SINGLE_EXON
+                           : ANNO_PLUS_START_SINGLE_EXON;
+    uint8_t end = strand ? ANNO_MINUS_END_EXON : ANNO_PLUS_END_EXON;
+    uint8_t internal = strand ? ANNO_MINUS_INTERNAL_EXON
+                              : ANNO_PLUS_INTERNAL_EXON;
+    uint8_t intron = strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON;
+    uint8_t single[] = {ANNO_INTERGENIC, start, ANNO_INTERGENIC};
+    int single_lengths[] = {10, 6, 10};
+    CHECK(grammar_accepts_runs(single, single_lengths, 3));
+    single_lengths[1] = 5;
+    CHECK(!grammar_accepts_runs(single, single_lengths, 3));
+    single_lengths[1] = 6;
+    single[1] = end;
+    CHECK(!grammar_accepts_runs(single, single_lengths, 3));
+    single[1] = internal;
+    CHECK(!grammar_accepts_runs(single, single_lengths, 3));
+    single[1] = intron;
+    single_lengths[1] = 30;
+    CHECK(!grammar_accepts_runs(single, single_lengths, 3));
+
+    uint8_t labels[] = {ANNO_INTERGENIC, strand ? end : start, intron,
+                        internal, intron, strand ? start : end,
+                        ANNO_INTERGENIC};
+    int lengths[] = {10, 6, 30, 6, 30, 6, 10};
+    CHECK(grammar_accepts_runs(labels, lengths, 7));
+    for (int r = 1; r <= 5; r++) {
+      lengths[r]--;
+      CHECK(!grammar_accepts_runs(labels, lengths, 7));
+      lengths[r] += 2;
+      CHECK(grammar_accepts_runs(labels, lengths, 7));
+      lengths[r]--;
+    }
+    labels[3] = ANNO_INTERGENIC; /* training targets are not decoded paths */
+    CHECK(!grammar_accepts_runs(labels, lengths, 7));
+    labels[3] = internal;
+    labels[4] = strand ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
+    CHECK(!grammar_accepts_runs(labels, lengths, 7));
+    labels[4] = intron;
+    labels[5] = strand ? ANNO_PLUS_START_SINGLE_EXON : ANNO_MINUS_END_EXON;
+    CHECK(!grammar_accepts_runs(labels, lengths, 7));
+
+    uint8_t pair[] = {ANNO_INTERGENIC, strand ? end : start, intron,
+                      strand ? start : end, ANNO_INTERGENIC};
+    int pair_lengths[] = {10, 6, 30, 6, 10};
+    CHECK(grammar_accepts_runs(pair, pair_lengths, 5));
+    pair[3] = pair[1]; /* no second start on plus, or second end on minus */
+    CHECK(!grammar_accepts_runs(pair, pair_lengths, 5));
+    pair[3] = strand ? start : end;
+    pair[1] = pair[3]; /* reversed terminal order */
+    CHECK(!grammar_accepts_runs(pair, pair_lengths, 5));
+    pair[1] = strand ? end : start;
+    pair_lengths[2] = 0; /* terminal exons cannot touch without an intron */
+    CHECK(!grammar_accepts_runs(pair, pair_lengths, 5));
+    pair_lengths[2] = 30;
+    pair_lengths[3] = 0; /* a transcript cannot finish in an intron */
+    CHECK(!grammar_accepts_runs(pair, pair_lengths, 5));
+
+    uint8_t mixed[] = {ANNO_INTERGENIC, start,
+                       strand ? ANNO_PLUS_START_SINGLE_EXON
+                              : ANNO_MINUS_START_SINGLE_EXON,
+                       ANNO_INTERGENIC};
+    int mixed_lengths[] = {10, 6, 6, 10};
+    CHECK(!grammar_accepts_runs(mixed, mixed_lengths, 4));
+  }
+}
+
 static void test_viterbi(void) {
   enum { N = 60 };
+  float p[N * ANNO_CLASSES];
+  uint8_t path[N];
+  for (int strand = 0; strand < 2; strand++) {
+    int start = strand ? ANNO_MINUS_START_SINGLE_EXON
+                       : ANNO_PLUS_START_SINGLE_EXON;
+    /* A 4-bp single-exon signal is widened to the 6-bp minimum. */
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < ANNO_CLASSES; j++)
+        p[i * ANNO_CLASSES + j] =
+            j == (i >= 20 && i < 24 ? start : ANNO_INTERGENIC)
+                ? 0.99f : 0.01f / (ANNO_CLASSES - 1);
+    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(grammar_accepts(path, N));
+    int exon = 0;
+    for (int i = 0; i < N; i++)
+      exon += path[i] == start;
+    CHECK(exon == ANNO_MIN_EXON_LENGTH);
+    /* A strong 30-bp single exon is decoded exactly on either strand. */
+    for (int i = 0; i < N; i++)
+      for (int j = 0; j < ANNO_CLASSES; j++)
+        p[i * ANNO_CLASSES + j] =
+            j == (i >= 20 && i < 50 ? start : ANNO_INTERGENIC)
+                ? 0.99f : 0.01f / (ANNO_CLASSES - 1);
+    CHECK(anno_decode(N, p, path) == 0);
+    for (int i = 0; i < N; i++)
+      CHECK(path[i] == (i >= 20 && i < 50 ? start : ANNO_INTERGENIC));
+  }
+  /* NaN emissions are treated as zero probability, not propagated. */
+  p[5 * ANNO_CLASSES] = NAN;
+  CHECK(anno_decode(N, p, path) == 0);
+  CHECK(grammar_accepts(path, N));
+}
+
+/** @brief Favour a decoded path using only the seven model targets. */
+static void favour_path(const uint8_t *path, int n, float *p) {
+  for (int i = 0; i < n; i++) {
+    int target = path[i];
+    if (target == ANNO_PLUS_INTERNAL_EXON || target == ANNO_MINUS_INTERNAL_EXON)
+      target = ANNO_INTERGENIC;
+    for (int j = 0; j < ANNO_CLASSES; j++)
+      p[i * ANNO_CLASSES + j] =
+          j == target ? 0.9f : 0.1f / (ANNO_CLASSES - 1);
+  }
+}
+
+/** @brief Single-exon labels and exact GFF output on both strands. */
+static void test_single_exons(void) {
+  enum { N = 70 };
+  static const char gff[] =
+      "##gff-version 3\n"
+      "s\tanno\tgene\t11\t19\t.\t+\t.\tID=gene1\n"
+      "s\tanno\tmRNA\t11\t19\t.\t+\t.\tID=gene1.t1;Parent=gene1\n"
+      "s\tanno\texon\t11\t19\t.\t+\t.\tID=gene1.t1.exon1;Parent=gene1.t1\n"
+      "s\tanno\tCDS\t11\t19\t.\t+\t0\tID=gene1.t1.cds1;Parent=gene1.t1\n"
+      "s\tanno\tgene\t41\t49\t.\t-\t.\tID=gene2\n"
+      "s\tanno\tmRNA\t41\t49\t.\t-\t.\tID=gene2.t1;Parent=gene2\n"
+      "s\tanno\texon\t41\t49\t.\t-\t.\tID=gene2.t1.exon1;Parent=gene2.t1\n"
+      "s\tanno\tCDS\t41\t49\t.\t-\t0\tID=gene2.t1.cds1;Parent=gene2.t1\n";
   char bases[N + 1];
   memset(bases, 'C', N);
   bases[N] = 0;
+  memcpy(bases + 10, "ATGAAATAA", 9);
+  memcpy(bases + 40, "TTATTTCAT", 9);
+  AnnoSequence s = {"s", bases, N, NULL};
+  write_text("test-single.gff3", gff);
+  anno_read_labels("test-single.gff3", &s, 1);
+  uint8_t expected[N] = {0}, path[N];
+  memset(expected + 10, ANNO_PLUS_START_SINGLE_EXON, 9);
+  memset(expected + 40, ANNO_MINUS_START_SINGLE_EXON, 9);
+  CHECK(!memcmp(s.labels, expected, N));
+  char *direct = gff_of_path(&s, expected);
+  CHECK(!strcmp(direct, gff));
   float p[N * ANNO_CLASSES];
-  uint8_t path[N];
-  /* an "intron" signal: it may only be reached through a >= 6 bp exon */
-  for (int i = 0; i < N; i++)
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] =
-          j == (i >= 10 && i < 50 ? ANNO_PLUS_INTRON : 0) ? 0.9f : 0.0125f;
-  CHECK(anno_decode(bases, N, p, path) == 0);
-  CHECK(path[0] == ANNO_INTERGENIC && path[N - 1] == ANNO_INTERGENIC);
-  for (int i = 1; i < N; i++)
-    CHECK(!(path[i - 1] == ANNO_INTERGENIC && path[i] == ANNO_PLUS_INTRON) &&
-          !(path[i - 1] == ANNO_PLUS_INTRON && path[i] == ANNO_INTERGENIC));
-  /* a 4-bp exon signal is widened to the 6-bp minimum (gain 4*6.68 > 8 +
-   * 2*6.68) */
-  for (int i = 0; i < N; i++)
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] =
-          j == (i >= 20 && i < 24 ? ANNO_PLUS_EXON : 0) ? 0.99f : 0.00125f;
-  CHECK(anno_decode(bases, N, p, path) == 0);
-  int exon = 0;
-  for (int i = 0; i < N; i++)
-    exon += path[i] == ANNO_PLUS_EXON;
-  CHECK(exon == ANNO_MIN_EXON_LENGTH);
-  /* a strong 30-bp exon is decoded exactly (gain 30*log(0.99/0.00125) >
-   * penalty) */
-  for (int i = 0; i < N; i++)
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] =
-          j == (i >= 20 && i < 50 ? ANNO_MINUS_EXON : 0) ? 0.99f : 0.00125f;
-  CHECK(anno_decode(bases, N, p, path) == 0);
-  for (int i = 0; i < N; i++)
-    CHECK(path[i] == (i >= 20 && i < 50 ? ANNO_MINUS_EXON : ANNO_INTERGENIC));
-  /* NaN emissions are treated as zero probability, not propagated */
-  p[5 * ANNO_CLASSES] = NAN;
-  CHECK(anno_decode(bases, N, p, path) == 0);
+  favour_path(expected, N, p);
+  CHECK(anno_decode(N, p, path) == 0);
+  CHECK(!memcmp(path, expected, N));
+  char *decoded = gff_of_path(&s, path);
+  CHECK(!strcmp(decoded, gff));
+  free(direct);
+  free(decoded);
+  free(s.labels);
+  remove("test-single.gff3");
 }
 
-/** @brief Fill a probability matrix that favours one class path. */
-static void favour_path(const uint8_t *path, int n, float *p) {
-  for (int i = 0; i < n; i++)
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      p[i * ANNO_CLASSES + j] = j == path[i] ? 0.6f : 0.05f;
+/** @brief Intergenic internal targets still occupy the whole transcript span. */
+static void test_nested_transcripts(const AnnoSequence *original) {
+  size_t size = strlen(test_gff) + 256;
+  char *gff = xcalloc(size, 1);
+  for (int strand = 0; strand < 2; strand++) {
+    snprintf(gff, size,
+             "%st\ta\texon\t111\t130\t.\t%c\t.\tParent=nested1\n"
+             "t\ta\texon\t1861\t1880\t.\t%c\t.\tParent=nested2\n",
+             test_gff, strand ? '-' : '+', strand ? '+' : '-');
+    write_text("test-nested.gff3", gff);
+    AnnoSequence s = {original->name, original->bases, original->length, NULL};
+    anno_read_labels("test-nested.gff3", &s, 1);
+    CHECK(!memcmp(s.labels, original->labels, (size_t)s.length));
+    for (int i = 110; i < 130; i++)
+      CHECK(s.labels[i] == ANNO_INTERGENIC);
+    for (int i = 1860; i < 1880; i++)
+      CHECK(s.labels[i] == ANNO_INTERGENIC);
+    free(s.labels);
+  }
+  free(gff);
+  remove("test-nested.gff3");
+}
+
+/** @brief Invalid signals must decode into complete, single-strand genes. */
+static void test_invalid_signals(void) {
+  enum { N = 180 };
+  for (int strand = 0; strand < 2; strand++) {
+    int end = strand ? ANNO_MINUS_END_EXON : ANNO_PLUS_END_EXON;
+    int first = strand ? ANNO_MINUS_END_EXON : ANNO_PLUS_START_SINGLE_EXON;
+    int intron = strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON;
+    int wrong_last = strand ? ANNO_PLUS_START_SINGLE_EXON : ANNO_MINUS_END_EXON;
+    for (int signal = 0; signal < 4; signal++) {
+      uint8_t truth[N] = {0}, path[N];
+      if (signal == 0)
+        memset(truth + 20, end, 30); /* an end exon cannot stand alone */
+      else if (signal == 1)
+        memset(truth + 50, intron, 60); /* an intron needs both terminal exons */
+      else if (signal == 2) {
+        memset(truth + 20, first, 30);
+        memset(truth + 50, intron, 60);
+        memset(truth + 110, wrong_last, 30);
+      } else {
+        memset(truth + 20, strand ? ANNO_MINUS_START_SINGLE_EXON
+                                 : ANNO_PLUS_START_SINGLE_EXON, 30);
+        memset(truth + 50, strand ? ANNO_PLUS_START_SINGLE_EXON
+                                 : ANNO_MINUS_START_SINGLE_EXON, 30);
+      }
+      CHECK(!grammar_accepts(truth, N));
+      float p[N * ANNO_CLASSES];
+      favour_path(truth, N, p);
+      CHECK(anno_decode(N, p, path) == 0);
+      CHECK(grammar_accepts(path, N));
+      CHECK(memcmp(path, truth, N) != 0);
+    }
+  }
+}
+
+/** @brief Decode all exon types and introns exactly at their minimum lengths. */
+static void test_minimum_decode(void) {
+  enum { N = 98 };
+  for (int strand = 0; strand < 2; strand++) {
+    uint8_t truth[N] = {0}, path[N];
+    memset(truth + 10, strand ? ANNO_MINUS_END_EXON
+                             : ANNO_PLUS_START_SINGLE_EXON, 6);
+    memset(truth + 16, strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON, 30);
+    memset(truth + 46, strand ? ANNO_MINUS_INTERNAL_EXON
+                             : ANNO_PLUS_INTERNAL_EXON, 6);
+    memset(truth + 52, strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON, 30);
+    memset(truth + 82, strand ? ANNO_MINUS_START_SINGLE_EXON
+                             : ANNO_PLUS_END_EXON, 6);
+    float p[N * ANNO_CLASSES];
+    favour_path(truth, N, p);
+    CHECK(grammar_accepts(truth, N));
+    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(!memcmp(path, truth, N));
+  }
 }
 
 /** @brief Start/stop codons exactly at exon edges (UTR intron next to CDS). */
@@ -281,21 +545,21 @@ static void test_utr_intron_edges(void) {
   /* genomic order: inter | exon [20,40) | intron [40,100) |
    * exon [100,160) | intron [160,220) | exon [220,250) | inter. */
   for (int strand = 0; strand < 2; strand++) {
-    char bases[N + 1];
-    memset(bases, 'C', N);
-    bases[N] = 0;
     uint8_t truth[N], path[N];
     for (int i = 0; i < N; i++)
       truth[i] = i < 20    ? ANNO_INTERGENIC
-                 : i < 40  ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
+                 : i < 40  ? (strand ? ANNO_MINUS_END_EXON
+                                     : ANNO_PLUS_START_SINGLE_EXON)
                  : i < 100 ? (strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON)
-                 : i < 160 ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
+                 : i < 160 ? (strand ? ANNO_MINUS_INTERNAL_EXON
+                                     : ANNO_PLUS_INTERNAL_EXON)
                  : i < 220 ? (strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON)
-                 : i < 250 ? (strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON)
+                 : i < 250 ? (strand ? ANNO_MINUS_START_SINGLE_EXON
+                                     : ANNO_PLUS_END_EXON)
                            : ANNO_INTERGENIC;
     float p[N * ANNO_CLASSES];
     favour_path(truth, N, p);
-    CHECK(anno_decode(bases, N, p, path) == 0);
+    CHECK(anno_decode(N, p, path) == 0);
     CHECK(!memcmp(path, truth, N));
   }
 }
@@ -314,7 +578,7 @@ static void test_gradient(void) {
   for (int b = 0; b < B; b++)
     for (int i = 0; i < ANNO_UNET_WINDOW; i++) {
       int c = (i / 300) % ANNO_CLASSES;
-      if (b == 1 && c >= ANNO_MINUS_EXON)
+      if (b == 1 && c >= ANNO_MINUS_START_SINGLE_EXON)
         c = ANNO_INTERGENIC;
       y[(size_t)b * ANNO_CLASSES * ANNO_UNET_WINDOW +
         (size_t)c * ANNO_UNET_WINDOW + i] = 1.0f;
@@ -395,7 +659,7 @@ static void test_orf(void) {
   AnnoSequence s = {"x", "CCCCCCCCCCCCCCCCCCCC", 20, NULL};
   uint8_t path[20] = {0};
   for (int i = 5; i < 15; i++)
-    path[i] = ANNO_PLUS_EXON;
+    path[i] = ANNO_PLUS_START_SINGLE_EXON;
   FILE *file = tmpfile();
   unsigned long genes = 0;
   CHECK(anno_write_gff(file, &s, path, &genes) == 0 && genes == 0);
@@ -403,25 +667,19 @@ static void test_orf(void) {
   fclose(file);
 }
 
-/** @brief Softmax of extreme logits stays finite and normalised. */
-static void softmax_row(const float *logits, float *probability) {
-  float top = logits[0], sum = 0.0f;
-  for (int j = 1; j < ANNO_CLASSES; j++)
-    if (logits[j] > top)
-      top = logits[j];
-  for (int j = 0; j < ANNO_CLASSES; j++) {
-    probability[j] = expf(logits[j] - top);
-    sum += probability[j];
-  }
-  for (int j = 0; j < ANNO_CLASSES; j++)
-    probability[j] /= sum;
-}
-
+/** @brief Production softmax stays finite and normalised for extreme logits. */
 static void test_softmax(void) {
-  float logits[ANNO_CLASSES], p[ANNO_CLASSES];
+  UnetConfig config = unet_default_config();
+  Unet *u = unet_create(&config);
+  Layer *output = &u->layer[u->nlayer - 1];
+  memset(output->w, 0,
+         (size_t)output->in * output->out * output->k * sizeof(float));
+  float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+                         sizeof(float));
+  float p[ANNO_CLASSES];
   for (int j = 0; j < ANNO_CLASSES; j++)
-    logits[j] = 1000.0f - (float)j;
-  softmax_row(logits, p);
+    output->b[j] = 1000.0f - (float)j;
+  CHECK(unet_predict_channels(u, input, 1, p) == 0);
   double sum = 0.0, z = 0.0;
   for (int j = 0; j < ANNO_CLASSES; j++) {
     CHECK(isfinite(p[j]));
@@ -431,9 +689,11 @@ static void test_softmax(void) {
   CHECK(fabs(sum - 1.0) < 1e-6);
   CHECK(fabs(p[0] - 1.0 / z) < 1e-6 && fabs(p[1] - exp(-1.0) / z) < 1e-6);
   for (int j = 0; j < ANNO_CLASSES; j++)
-    logits[j] = -1e30f;
-  softmax_row(logits, p);
+    output->b[j] = -1e30f;
+  CHECK(unet_predict_channels(u, input, 1, p) == 0);
   CHECK(fabs(p[3] - 1.0 / ANNO_CLASSES) < 1e-6);
+  free(input);
+  unet_destroy(u);
 }
 
 /** @brief Morlet CWT: strand conjugate identity and block independence. */
@@ -521,13 +781,15 @@ static void test_model_file(void) {
   const char *path = "test-model.ann";
   CHECK(unet_save(path, unet) == 0);
   CHECK(unet_load(path, &loaded) == 0 && loaded);
-  float input[100 * ANNO_INPUT_CHANNELS], p[100 * ANNO_CLASSES],
-      q[100 * ANNO_CLASSES];
+  float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
+                         sizeof(float));
+  float p[100 * ANNO_CLASSES], q[100 * ANNO_CLASSES];
   uint64_t seed = 3;
-  for (int i = 0; i < 100 * ANNO_INPUT_CHANNELS; i++)
-    input[i] = test_random_unit(&seed);
-  CHECK(unet_predict(unet, input, 100, p) == 0 &&
-        unet_predict(loaded, input, 100, q) == 0);
+  for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
+    for (int i = 0; i < 100; i++)
+      input[(size_t)c * ANNO_UNET_WINDOW + i] = anno_random_unit(&seed);
+  CHECK(unet_predict_channels(unet, input, 100, p) == 0 &&
+        unet_predict_channels(loaded, input, 100, q) == 0);
   CHECK(!memcmp(p, q, sizeof(p)));
   for (int i = 0; i < 100; i++) {
     double sum = 0.0;
@@ -535,6 +797,7 @@ static void test_model_file(void) {
       sum += p[i * ANNO_CLASSES + j];
     CHECK(fabs(sum - 1.0) < 1e-5);
   }
+  free(input);
   remove(path);
   unet_destroy(unet);
   unet_destroy(loaded);
@@ -597,9 +860,15 @@ static void test_pipeline(AnnoSequence *s) {
 int main(void) {
   AnnoSequence *sequences = test_sequences("test.fasta", "test.gff3");
   test_labels(&sequences[0]);
+  test_strand_swap();
   test_round_trip(&sequences[0]);
+  test_single_exons();
+  test_nested_transcripts(&sequences[0]);
   test_grammar();
+  test_grammar_paths();
   test_viterbi();
+  test_invalid_signals();
+  test_minimum_decode();
   test_utr_intron_edges();
   test_orf();
   test_softmax();

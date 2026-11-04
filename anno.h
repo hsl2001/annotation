@@ -20,7 +20,7 @@
 #define ANNO_STRANDS 2            /**< plus and minus strands */
 #define ANNO_COMPLEX_COMPONENTS 2 /**< real and imaginary components */
 #define ANNO_PATH_BUFFER 4096     /**< maximum generated path length */
-#define ANNO_CLASSES 5            /**< strand-aware intergenic/exon/intron classes */
+#define ANNO_CLASSES 7            /**< model output / training-label classes */
 #define ANNO_CWT_CHANNELS 3       /**< Morlet CWT scales (power channels)    */
 #define ANNO_INPUT_CHANNELS 7     /**< A/C/G/T one-hot + CWT power           */
 #define ANNO_CWT_WINDOW 1024      /**< CWT block processed by one job        */
@@ -52,13 +52,18 @@
 #define ANNO_EPSILON 1e-5f       /**< Stabilizes the Soft F1 calculation. */
 /**@}*/
 
-/** UNet output classes; each class is also one decoded grammar state. */
+/** Model labels. Start/end refer to transcription order, not genomic order. */
 typedef enum {
   ANNO_INTERGENIC = 0,
-  ANNO_PLUS_EXON = 1,
-  ANNO_PLUS_INTRON = 2,
-  ANNO_MINUS_EXON = 3,
-  ANNO_MINUS_INTRON = 4
+  ANNO_PLUS_START_SINGLE_EXON = 1,
+  ANNO_PLUS_END_EXON = 2,
+  ANNO_PLUS_INTRON = 3,
+  ANNO_MINUS_START_SINGLE_EXON = 4,
+  ANNO_MINUS_END_EXON = 5,
+  ANNO_MINUS_INTRON = 6,
+  /* Decoded-only states: internal exons use the intergenic emission. */
+  ANNO_PLUS_INTERNAL_EXON = 7,
+  ANNO_MINUS_INTERNAL_EXON = 8
 } AnnoClass;
 
 /** Shape of the 1D UNet. */
@@ -69,7 +74,7 @@ typedef struct {
   int channels[ANNO_MAX_DEPTH]; /**< feature channels per level        */
 } UnetConfig;
 
-/** 1D UNet with its input normalisation; opaque. */
+/** Opaque 1D UNet model. */
 typedef struct Unet Unet;
 
 /** One sequence record. The struct owns every pointer it holds. */
@@ -121,16 +126,7 @@ Unet *unet_create(const UnetConfig *config);
  * @return None.
  */
 void unet_destroy(Unet *unet);
-/**
- * @brief Predict class probabilities.
- * @param unet       Model to evaluate.
- * @param input       length x ANNO_INPUT_CHANNELS normalised features.
- * @param length      Number of input positions.
- * @param probability length x ANNO_CLASSES output (rows sum to one).
- * @return 0 on success, an errno value otherwise.
- */
-int unet_predict(const Unet *unet, const float *input, int64_t length,
-                 float *probability);
+
 /** Evaluate channel-major input ([channel][ANNO_UNET_WINDOW]). */
 int unet_predict_channels(const Unet *unet, const float *input, int64_t length,
                           float *probability);
@@ -170,20 +166,22 @@ void anno_cwt(const char *bases, int64_t length, int64_t start, int64_t end,
 
 /**
  * @brief Grammar-constrained Viterbi decoding of a probability matrix.
- * @param bases       sequence (unused by the grammar; kept for the API).
+
  * @param length      Number of sequence positions.
  * @param probability length x ANNO_CLASSES.
- * @param path        length output classes (AnnoClass).
+ * @param path        length decoded AnnoClass values, including INTERNAL_EXON.
+ *
+ * Internal exons are inferred between introns from intergenic emissions;
+ * their decoded states are not neural-network output classes.
  * @return 0 on success.
  */
-int anno_decode(const char *bases, int64_t length, const float *probability,
-                uint8_t *path);
+int anno_decode(int64_t length, const float *probability, uint8_t *path);
 
 /**
  * @brief Convert a per-base class path into GFF3 transcript records.
  * @param output       Destination GFF3 stream.
  * @param sequence     Sequence and optional name metadata.
- * @param path         Per-base decoded classes.
+ * @param path         Decoded classes, including inferred INTERNAL_EXON states.
  * @param gene_counter running gene number, updated.
  * @return number of transcripts written, or -1 on error.
  */

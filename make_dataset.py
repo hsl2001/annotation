@@ -129,14 +129,14 @@ def pair_score(fasta, gff):
     gff_ids, gff_maximum = gff_sequences(gff)
     shared = gff_ids & fasta_lengths.keys()
     valid = {seqid for seqid in shared if gff_maximum[seqid] <= fasta_lengths[seqid]}
-    return len(valid), len(gff_ids), fasta_lengths, gff_ids
+    return len(valid), len(gff_ids)
 
 
 def pair_inputs(fastas, gffs):
     candidates = []
     for fasta in fastas:
         for gff in gffs:
-            valid, total, _, _ = pair_score(fasta, gff)
+            valid, total = pair_score(fasta, gff)
             if valid == total:
                 candidates.append((valid, fasta, gff))
     if not candidates:

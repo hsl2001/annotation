@@ -10,18 +10,18 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "anno.h"
-#include "unet.h"
+
 
 #include <ctype.h>
 #include <complex.h>
 #include <errno.h>
-#include <float.h>
+
 #include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
+
 #include <time.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -55,7 +55,8 @@ float anno_random_symmetric(uint64_t *state) {
 /* ------------------------------------------------------------------------ */
 /** Class names; also used for bedGraph file names. */
 static const char *const class_names[ANNO_CLASSES] = {
-    "intergenic", "plus_exon", "plus_intron", "minus_exon", "minus_intron"};
+    "intergenic", "plus_start_single_exon", "plus_end_exon", "plus_intron",
+    "minus_start_single_exon", "minus_end_exon", "minus_intron"};
 /** Morlet scales of the CWT channels. */
 static const int cwt_scales[ANNO_CWT_CHANNELS] = {4, 5, 6};
 
@@ -171,16 +172,15 @@ static int base_index(char base) {
   }
 }
 
-static char complement(char base) {
-  int index = base_index(base);
-  return index < 0 ? 'N' : "TGCA"[index];
-}
-
 /**
  * @brief Return the complement of a nucleotide.
  * @param base Nucleotide character.
  * @return Complementary nucleotide, or N for an unknown base.
  */
+static char complement(char base) {
+  int index = base_index(base);
+  return index < 0 ? 'N' : "TGCA"[index];
+}
 /* ------------------------------------------------------------------------ */
 /* Threads                                                                  */
 /* ------------------------------------------------------------------------ */
@@ -559,12 +559,18 @@ static GffFeature *read_gff_features(const char *path,
 static void paint_transcript(const LabelTranscript *t, uint8_t *labels) {
   int plus = t->strand == '+';
   uint8_t intron = plus ? ANNO_PLUS_INTRON : ANNO_MINUS_INTRON;
-  uint8_t exon = plus ? ANNO_PLUS_EXON : ANNO_MINUS_EXON;
   for (int64_t i = t->start; i < t->end; i++)
     labels[i] = intron;
-  for (int e = 0; e < t->exons.count; e++)
+  for (int e = 0; e < t->exons.count; e++) {
+    int first = e == (plus ? 0 : t->exons.count - 1);
+    int last = e == (plus ? t->exons.count - 1 : 0);
+    uint8_t exon = first ? (plus ? ANNO_PLUS_START_SINGLE_EXON
+                                : ANNO_MINUS_START_SINGLE_EXON)
+                   : last ? (plus ? ANNO_PLUS_END_EXON : ANNO_MINUS_END_EXON)
+                          : ANNO_INTERGENIC;
     for (int64_t i = t->exons.items[e].start; i < t->exons.items[e].end; i++)
       labels[i] = exon;
+  }
   for (int e = 0; e < t->explicit_introns.count; e++)
     for (int64_t i = t->explicit_introns.items[e].start;
          i < t->explicit_introns.items[e].end; i++)
@@ -620,19 +626,23 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
   free(features);
   qsort(transcripts, transcript_count, sizeof(*transcripts),
         transcript_compare);
+  /* Internal exons have background labels but still occupy the gene span. */
+  uint8_t **occupied = xcalloc((size_t)count, sizeof(*occupied));
   for (int i = 0; i < count; i++) {
     free(sequences[i].labels);
     sequences[i].labels = xcalloc((size_t)sequences[i].length, 1);
+    occupied[i] = xcalloc((size_t)sequences[i].length, 1);
   }
   for (size_t k = 0; k < transcript_count; k++) {
     LabelTranscript *t = &transcripts[k];
     uint8_t *labels = sequences[t->sequence].labels;
     int free_span = 1;
     for (int64_t i = t->start; i < t->end && free_span; i++)
-      free_span = !labels[i];
-    if (free_span)
+      free_span = !occupied[t->sequence][i];
+    if (free_span) {
       paint_transcript(t, labels);
-    else
+      memset(occupied[t->sequence] + t->start, 1, (size_t)(t->end - t->start));
+    } else
       skipped++;
     free(t->exons.items);
     free(t->explicit_introns.items);
@@ -640,6 +650,9 @@ void anno_read_labels(const char *path, AnnoSequence *sequences, int count) {
   say("labelled %zu transcripts (%zu overlapping skipped)",
       transcript_count - skipped, skipped);
   free(transcripts);
+  for (int i = 0; i < count; i++)
+    free(occupied[i]);
+  free(occupied);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -798,12 +811,15 @@ static void cwt_power(const char *bases, int64_t length, int64_t start,
 /* ------------------------------------------------------------------------ */
 
 static uint8_t ann_swap_strand(uint8_t label) {
-  if (label == ANNO_INTERGENIC)
-    return label;
-  return label == ANNO_PLUS_EXON   ? ANNO_MINUS_EXON
-         : label == ANNO_PLUS_INTRON ? ANNO_MINUS_INTRON
-         : label == ANNO_MINUS_EXON  ? ANNO_PLUS_EXON
-                                     : ANNO_PLUS_INTRON;
+  switch (label) {
+  case ANNO_PLUS_START_SINGLE_EXON: return ANNO_MINUS_START_SINGLE_EXON;
+  case ANNO_PLUS_END_EXON: return ANNO_MINUS_END_EXON;
+  case ANNO_PLUS_INTRON: return ANNO_MINUS_INTRON;
+  case ANNO_MINUS_START_SINGLE_EXON: return ANNO_PLUS_START_SINGLE_EXON;
+  case ANNO_MINUS_END_EXON: return ANNO_PLUS_END_EXON;
+  case ANNO_MINUS_INTRON: return ANNO_PLUS_INTRON;
+  default: return label;
+  }
 }
 
 static void features(const AnnoSequence *sequence, const float *power,
@@ -956,10 +972,10 @@ static Unet *train_unet(const AnnoSequence *sequences, int count,
 }
 
 #define GRAMMAR_MAX_STATES \
-  (1 + ANNO_STRANDS * (ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH))
-#define GRAMMAR_MAX_PREDECESSORS (ANNO_STRANDS + 1)
+  (1 + ANNO_STRANDS * (3 * ANNO_MIN_EXON_LENGTH + ANNO_MIN_INTRON_LENGTH))
+#define GRAMMAR_MAX_PREDECESSORS (2 * ANNO_STRANDS + 1)
 
-/** @brief Pending class-wise bedGraph runs. */
+/** Duration-expanded grammar; decoded classes may share an emission. */
 typedef struct {
   int count;
   uint8_t cls[GRAMMAR_MAX_STATES];
@@ -1002,8 +1018,9 @@ static int grammar_chain(Grammar *g, uint8_t cls, int length) {
 }
 
 /**
- * @brief Build the strand-aware exon/intron grammar:
- *   intergenic -> exon (intron exon)* -> intergenic.
+ * @brief Build a grammar with start/single, internal, and end exons.
+ * Plus: inter -> start_single [intron (internal intron)* end] -> inter.
+ * Minus follows the reverse genomic order; single exons remain start_single.
  * @param g Grammar to initialize.
  * @return None.
  */
@@ -1011,16 +1028,30 @@ static void grammar_build(Grammar *g) {
   memset(g, 0, sizeof(*g));
   int inter = grammar_chain(g, ANNO_INTERGENIC, 1);
   for (int strand = 0; strand < ANNO_STRANDS; strand++) {
-    uint8_t exon = strand ? ANNO_MINUS_EXON : ANNO_PLUS_EXON;
+    uint8_t start_class = strand ? ANNO_MINUS_START_SINGLE_EXON
+                                 : ANNO_PLUS_START_SINGLE_EXON;
+    uint8_t end_class = strand ? ANNO_MINUS_END_EXON : ANNO_PLUS_END_EXON;
+    uint8_t internal_class = strand ? ANNO_MINUS_INTERNAL_EXON
+                                    : ANNO_PLUS_INTERNAL_EXON;
     uint8_t intron = strand ? ANNO_MINUS_INTRON : ANNO_PLUS_INTRON;
-    int ex = grammar_chain(g, exon, ANNO_MIN_EXON_LENGTH);
-    int ex_tail = ex + ANNO_MIN_EXON_LENGTH - 1;
+    int start = grammar_chain(g, start_class, ANNO_MIN_EXON_LENGTH);
+    int end = grammar_chain(g, end_class, ANNO_MIN_EXON_LENGTH);
+    int internal = grammar_chain(g, internal_class, ANNO_MIN_EXON_LENGTH);
     int intron_chain = grammar_chain(g, intron, ANNO_MIN_INTRON_LENGTH);
+    int start_tail = start + ANNO_MIN_EXON_LENGTH - 1;
+    int end_tail = end + ANNO_MIN_EXON_LENGTH - 1;
+    int internal_tail = internal + ANNO_MIN_EXON_LENGTH - 1;
     int intron_tail = intron_chain + ANNO_MIN_INTRON_LENGTH - 1;
-    grammar_edge(g, inter, ex);
-    grammar_edge(g, ex_tail, inter);
-    grammar_edge(g, ex_tail, intron_chain);
-    grammar_edge(g, intron_tail, ex);
+    grammar_edge(g, inter, start);
+    grammar_edge(g, start_tail, inter);
+    if (strand)
+      grammar_edge(g, inter, end);
+    grammar_edge(g, strand ? end_tail : start_tail, intron_chain);
+    grammar_edge(g, intron_tail, internal);
+    grammar_edge(g, internal_tail, intron_chain);
+    grammar_edge(g, intron_tail, strand ? start : end);
+    if (!strand)
+      grammar_edge(g, end_tail, inter);
   }
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
@@ -1105,7 +1136,10 @@ static void decoder_step(Decoder *d, const float *row) {
         choice = k;
       }
     }
-    d->current[s] = best + emission[g->cls[s]];
+    uint8_t cls = g->cls[s];
+    int output = cls == ANNO_PLUS_INTERNAL_EXON || cls == ANNO_MINUS_INTERNAL_EXON
+                     ? ANNO_INTERGENIC : cls;
+    d->current[s] = best + emission[output];
     if (d->current[s] > top)
       top = d->current[s];
     back |= (uint32_t)choice << g->shift[s];
@@ -1140,9 +1174,8 @@ static int decoder_finish(Decoder *d, uint8_t *path) {
   return state == 0 ? 0 : ERANGE;
 }
 
-int anno_decode(const char *bases, int64_t length, const float *probability,
-                uint8_t *path) {
-  if (!bases || !probability || !path || length < 1)
+int anno_decode(int64_t length, const float *probability, uint8_t *path) {
+  if (!probability || !path || length < 1)
     return EINVAL;
   Decoder *d = decoder_create(length);
   for (int64_t i = 0; i < length; i++)
@@ -1399,9 +1432,17 @@ static int write_transcript(FILE *output, const AnnoSequence *sequence,
  * @return '+' or '-', or 0 for intergenic.
  */
 static char class_strand(uint8_t cls) {
-  return cls == ANNO_INTERGENIC ? 0
-         : cls == ANNO_PLUS_EXON || cls == ANNO_PLUS_INTRON ? '+'
-                                                            : '-';
+  switch (cls) {
+  case ANNO_PLUS_START_SINGLE_EXON:
+  case ANNO_PLUS_END_EXON:
+  case ANNO_PLUS_INTRON:
+  case ANNO_PLUS_INTERNAL_EXON: return '+';
+  case ANNO_MINUS_START_SINGLE_EXON:
+  case ANNO_MINUS_END_EXON:
+  case ANNO_MINUS_INTRON:
+  case ANNO_MINUS_INTERNAL_EXON: return '-';
+  default: return 0;
+  }
 }
 
 /**
@@ -1628,6 +1669,10 @@ int main(int argc, char **argv) {
       usage();
       return EXIT_SUCCESS;
     }
+    if (opt == '?') {
+      usage();
+      return EXIT_FAILURE;
+    }
     if (opt == 'p')
       threads = positive(optarg, "thread count");
     if (opt == 'i')
@@ -1636,10 +1681,6 @@ int main(int argc, char **argv) {
       model_path = optarg;
     if (opt == 'o')
       prefix = optarg;
-  }
-  if (opt == '?') {
-    usage();
-    return EXIT_FAILURE;
   }
 #ifdef _OPENMP
   omp_set_num_threads(threads);

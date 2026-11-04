@@ -122,7 +122,6 @@ def main():
     parser = argparse.ArgumentParser(description=f"{__doc__ or ''}".splitlines()[0])
     parser.add_argument("-r", "--reference", required=True, help="reference GFF3(.gz)")
     parser.add_argument("-q", "--query", required=True, help="query GFF3(.gz)")
-    parser.add_argument("-g", "--genome", help="genome FASTA (accepted, unused)")
     args = parser.parse_args()
     try:
         result = metrics(args.reference, args.query)

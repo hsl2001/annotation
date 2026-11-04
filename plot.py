@@ -4,7 +4,6 @@
 # dependencies = [
 #     "matplotlib",
 #     "numpy",
-#     "numba",
 # ]
 # ///
 
@@ -33,7 +32,6 @@ from matplotlib.patches import PathPatch
 import matplotlib.pyplot as plt
 from matplotlib.textpath import TextPath
 from matplotlib.transforms import Affine2D
-from numba import njit
 import numpy as np
 from numpy.typing import DTypeLike, NDArray
 
@@ -56,7 +54,7 @@ PLOT_CHOICES: tuple[str, ...] = ("all", *PLOT_NAMES)
 REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
 BOUNDARIES: tuple[str, str] = ("start", "end")
 CONTROL_REPLICATES, ABS_RADIUS = 2, 600
-KMER_FLANK, KMER_SCALES, KMER_RADIUS = 100, (3, 4, 5, 6), 10
+KMER_FLANK, KMER_RADIUS = 100, 10
 KMER_WIDTH = 2 * KMER_RADIUS + 1
 MEME_TIME, MEME_MOTIFS, MEME_MINW, MEME_MAXW, MEME_ORDER = 14400, 3, 6, 15, 2
 SINGLE_STRAND_DNA_ALPH = (
@@ -141,10 +139,6 @@ def parallel_map(
             pending.append(executor.submit(function, item))
 
 
-def compiled(function):
-    return njit(cache=True, nogil=True)(function)
-
-
 def info(message):
     logging.getLogger(__name__).info(message)
 
@@ -157,10 +151,8 @@ def new_map(path, shape, dtype: DTypeLike = np.float32) -> np.memmap:
 @dataclass(frozen=True)
 class Record:
     sid: str
-    key: str
     codes: NDArray[np.uint8]
     energy: NDArray[np.float32]
-    mask: NDArray[np.bool_]
 
 
 def op_text(path):
@@ -171,7 +163,7 @@ def op_text(path):
     )
 
 
-def read_fasta(path, max_len=0):
+def read_fasta(path):
     out, name, lines = {}, None, []
 
     def put():
@@ -181,8 +173,6 @@ def read_fasta(path, max_len=0):
             raise ValueError(f"FASTA duplicated ID: {name}")
         b = "".join(lines).encode("ascii", errors="replace")
         a = LUT[np.frombuffer(b, np.uint8)]
-        if max_len:
-            a = a[:max_len]
         if not len(a):
             raise ValueError
         out[name] = a
@@ -211,10 +201,6 @@ class CWTSpec:
             raise ValueError("CWT period > 2bp")
         if not math.isfinite(self.w0) or self.w0 <= 0:
             raise ValueError("w0 should be finite positive value")
-
-    @property
-    def halo(self):
-        return math.ceil(MORLET_LIMIT * max(self.periods) + 0.5)
 
 
 def cwt_morlet_integral(lower: float, upper: float, w0: float = W0) -> complex:
@@ -266,51 +252,6 @@ def build_kernel(dilation: float, w0: float = 6.0) -> np.ndarray:
     return kernel
 
 
-def compute_cwt_channels(
-    codes: np.ndarray,
-    spec: CWTSpec,
-    chunk: int = 65536,
-) -> np.ndarray:
-    """Return real and imaginary CWT channels for every configured period."""
-    if codes.ndim != 1 or not np.issubdtype(codes.dtype, np.integer):
-        raise ValueError("codes must be a one-dimensional integer vector")
-    if np.any((codes < 0) | (codes >= len(BASE))):
-        raise ValueError("codes must contain only values from 0 to 4")
-    if chunk < 1:
-        raise ValueError("chunk must be positive")
-
-    n = len(codes)
-    if n == 0:
-        raise ValueError("codes must not be empty")
-    kernels = [build_kernel(period, spec.w0) for period in spec.periods]
-    output = np.empty((2 * len(kernels), n), dtype=np.float32)
-
-    for start in range(0, n, chunk):
-        end = min(n, start + chunk)
-        for scale_index, kernel in enumerate(kernels):
-            width = len(kernel)
-            radius = width // 2
-            input_start = max(0, start - radius)
-            input_end = min(n, end + radius)
-            input_length = input_end - input_start
-            required = input_length + width - 1
-            fft_size = 1 << (required - 1).bit_length()
-
-            signal = np.zeros(fft_size, dtype=np.complex128)
-            signal[:input_length] = BASE[codes[input_start:input_end]]
-            kernel_buffer = np.zeros(fft_size, dtype=np.complex128)
-            kernel_buffer[:width] = kernel[::-1]
-            convolution = np.fft.ifft(np.fft.fft(signal) * np.fft.fft(kernel_buffer))
-
-            offset = radius - input_start
-            indices = np.arange(start, end) + offset
-            coefficients = convolution[indices]
-            output[2 * scale_index, start:end] = coefficients.real
-            output[2 * scale_index + 1, start:end] = coefficients.imag
-
-    return output
-
-
 def compute_energy(codes, path, spec: CWTSpec, chunk, threads):
     n = len(codes)
     kernels = [build_kernel(p, spec.w0) for p in spec.periods]
@@ -360,25 +301,18 @@ def compute_energy(codes, path, spec: CWTSpec, chunk, threads):
     result.flush()
     return result
 
-def digest(metadata, *arrays):
-    result = hashlib.sha256(json.dumps(metadata, sort_keys=True).encode())
-    for array in arrays:
-        result.update(np.ascontiguousarray(array).tobytes())
-    return result.hexdigest()
+def digest(metadata):
+    return hashlib.sha256(json.dumps(metadata, sort_keys=True).encode()).hexdigest()
 
-def prepare_records(fasta, spec: CWTSpec, folder, chunk, threads, max_len=0):
+def prepare_records(fasta, spec: CWTSpec, folder, chunk, threads):
     records = []
-    for sid, codes in read_fasta(fasta, max_len=max_len).items():
+    for sid, codes in read_fasta(fasta).items():
         key = digest(sid)[:16]
         info(f"CWT: {sid} ({len(codes):,} bp)")
         energy = compute_energy(
             codes, Path(folder) / f"{key}.npy", spec, chunk, threads
         )
-        mask = codes < 4
-        edge = spec.halo
-        mask[:edge] = False
-        mask[max(0, len(codes) - edge) :] = False
-        records.append(Record(sid, key, codes, energy, mask))
+        records.append(Record(sid, codes, energy))
     return records
 
 
@@ -440,11 +374,9 @@ def merge_spans(spans: list[tuple[int, int]]) -> tuple[Arr, Arr]:
 
 @dataclass(frozen=True)
 class Contig:
-    name: str
     length: int
     plus: int
     minus: int
-    parameter: str = "Scale"
 
     def offset(self, strand: str) -> int:
         return self.plus if strand == "+" else self.minus
@@ -459,7 +391,6 @@ class Contig:
 class CwtMatrix:
     def __init__(self, matrix: np.memmap, contigs: dict[str, Contig], widths: list[int]) -> None:
         self.matrix, self.contigs, self.widths = matrix, contigs, widths
-        self.parameter = "Energy"
 
     def close(self) -> None:
         if (mm := getattr(self.matrix, "_mmap", None)) is not None:
@@ -484,7 +415,7 @@ class CwtMatrix:
         expected = 0
         for record in records:
             length = len(record.codes)
-            contigs[record.sid] = Contig(record.sid, length, expected, expected + length)
+            contigs[record.sid] = Contig(length, expected, expected + length)
             expected += 2 * length
 
         matrix = np.lib.format.open_memmap(
@@ -534,11 +465,7 @@ class CwtMatrix:
         self, intervals: Sequence[Interval], sequences: dict[str, str], mean_profile: Arr,
         bounds: dict[Interval, tuple[int, int]] | None = None,
     ) -> tuple[dict[str, list[KmerHit]], dict[str, int], int]:
-        scale_idx = (
-            [self.widths.index(s) for s in KMER_SCALES if s in self.widths]
-            if self.parameter == "Scale"
-            else list(range(min(len(self.widths), len(KMER_SCALES))))
-        )
+        scale_idx = list(range(len(self.widths)))
         if not scale_idx:
             raise ValueError("CWT matrix has no scales available for exon k-mer maxima")
         peaks: dict[str, int] = {}
@@ -808,21 +735,20 @@ class GenomeData:
         return output
 
 
-def _render_abs_task(task: tuple[str, Arr, Arr, list[int], str, int, Path]) -> None:
-    boundary, img_vals, profile, widths, param, n_iv, out = task
+def _render_abs_task(task: tuple[str, Arr, Arr, list[int], int, Path]) -> None:
+    boundary, img_vals, profile, widths, n_iv, out = task
     pos, ext = np.arange(-ABS_RADIUS, ABS_RADIUS + 1), (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, n_iv)
     fig, axes = plt.subplots(
         2, len(widths), figsize=(4.1 * len(widths), 6),
         gridspec_kw={"height_ratios": (4, 1.2)},
         layout="constrained", squeeze=False,
     )
-    for s, w in enumerate(widths):
+    for s in range(len(widths)):
         ax, energy_ax = axes[:, s]
         panel = img_vals[:, s]
         vmax = max(float(np.quantile(panel[np.isfinite(panel)], 0.995)), 1e-6)
         fig.colorbar(ax.imshow(panel, aspect="auto", origin="lower", interpolation="nearest", extent=ext, cmap="viridis", vmin=0, vmax=vmax), ax=ax, pad=0.01)
-        title = f"{param} {w} bp" if param != "Energy" else "Surf CWT energy"
-        ax.set(title=title, ylabel="Interval rank" if s == 0 else "", ylim=ext[2:])
+        ax.set(title="Surf CWT energy", ylabel="Interval rank" if s == 0 else "", ylim=ext[2:])
         energy = profile[s]
         energy_ax.plot(pos, energy, color="#256c87", linewidth=1.1)
         energy_ax.set_ylabel("Mean energy" if s == 0 else "")
@@ -1008,7 +934,7 @@ class CwtPlotter:
         ) -> None:
             img = np.log1p(agg[0])
             abs_tasks.extend(
-                (b, np.ascontiguousarray(img[:, i]), np.ascontiguousarray(agg[1][i]), cwt.widths, cwt.parameter, n_iv, out)
+                (b, np.ascontiguousarray(img[:, i]), np.ascontiguousarray(agg[1][i]), cwt.widths, n_iv, out)
                 for i, b in enumerate(BOUNDARIES) if i in boundary_indices
             )
 
@@ -1098,7 +1024,7 @@ class CwtPlotter:
                     seqs = {name: seq.upper() for name, seq in fasta_records(args.fasta)}
                     if not seqs:
                         raise ValueError("No sequences found in assembly FASTA")
-                    genome = GenomeData(args.gff, {n: Contig(n, len(s), 0, len(s)) for n, s in seqs.items()}, seqs)
+                    genome = GenomeData(args.gff, {n: Contig(len(s), 0, len(s)) for n, s in seqs.items()}, seqs)
                 mut_fa = genome.write_mutated_fasta(args.fasta, args.seed, work / "mutated.fa")
                 print(f"Plotting {', '.join(mut)}", file=sys.stderr, flush=True)
                 cwt_mut = CwtMatrix.load(mut_fa, work / "mutated", args.threads, args.chunk)

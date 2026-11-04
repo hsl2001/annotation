@@ -1,11 +1,11 @@
 /**
- * @file ann.c
+ * @file unet.c
  * @brief Standalone fixed-shape 1D UNet runtime.
  *
  * Tensors are channel-major.  Every forward pass uses the same fixed window
  * size
  */
-#include "unet.h"
+#include "anno.h"
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -134,16 +134,16 @@ static int add_layer(Unet *u, int in, int out, int k, uint64_t *seed) {
  * @param gradient Accumulated gradients.
  * @param first_moment Adam first-moment state.
  * @param second_moment Adam second-moment state.
- * @param count Divisor applied to the accumulated gradient.
+
  * @param size Number of parameters.
  * @param step_size Bias-corrected Adam step size.
  * @return None.
  */
 static void adam_update(float *parameter, const float *gradient,
                         float *first_moment, float *second_moment,
-                        size_t count, size_t size, double step_size) {
+                        size_t size, double step_size) {
   for (size_t i = 0; i < size; ++i) {
-    float g = gradient[i] / (float)count;
+    float g = gradient[i];
     first_moment[i] =
         ANNO_ADAM_BETA1 * first_moment[i] + (1.0f - ANNO_ADAM_BETA1) * g;
     second_moment[i] =
@@ -465,30 +465,7 @@ int unet_predict_channels(const Unet *u, const float *x, int64_t n, float *p) {
   return 0;
 }
 
-/**
- * @brief Evaluate interleaved input features.
- *
- * @param u Model to evaluate.
- * @param in Interleaved input [position][channel].
- * @param n Number of input positions.
- * @param p Output probabilities [position][class].
- * @return 0 on success, or an errno value otherwise.
- */
-int unet_predict(const Unet *u, const float *in, int64_t n, float *p) {
-  if (!u || !in || !p || n < 1 || n > ANNO_UNET_WINDOW)
-    return EINVAL;
-  float *x = (float *)calloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-                             sizeof(float));
-  if (!x)
-    return ENOMEM;
-  for (int64_t i = 0; i < n; ++i)
-    for (int c = 0; c < ANNO_INPUT_CHANNELS; ++c)
-      x[(size_t)c * ANNO_UNET_WINDOW + i] =
-          in[(size_t)i * ANNO_INPUT_CHANNELS + c];
-  int rc = unet_predict_channels(u, x, n, p);
-  free(x);
-  return rc;
-}
+
 /**
  * @brief Backpropagate through convolve().
  * @param l Layer parameters.
@@ -868,9 +845,8 @@ int unet_train_batch(Unet *u, const float *x, const float *y, const float *m,
     for (int l = 0; l < u->nlayer; ++l) {
       Layer *layer = &u->layer[l];
       size_t weights = (size_t)layer->in * layer->out * layer->k;
-      adam_update(layer->w, gw[l], layer->mw, layer->vw, 1, weights,
-                  step_size);
-      adam_update(layer->b, gb[l], layer->mb, layer->vb, 1,
+      adam_update(layer->w, gw[l], layer->mw, layer->vw, weights, step_size);
+      adam_update(layer->b, gb[l], layer->mb, layer->vb,
                   (size_t)layer->out, step_size);
     }
     if (loss)
