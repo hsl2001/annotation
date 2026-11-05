@@ -27,7 +27,7 @@
 #define COMPLEX_COMPONENTS 2 // Real & imaginary components
 #define PATH_BUFFER 4096 // Maximum handled path length
 #define CLASSES 7 // Number of train labels (classes)
-#define INPUT_CHANNELS NUCLEOTIDES + CWT_CHANNELS // Number of input channels
+#define INPUT_CHANNELS (NUCLEOTIDES + CWT_CHANNELS) // Number of input channels
 #define FEATURE_WINDOW 65536 // Length of parallely processed features window
 
 /** Constraints for gene grammar */
@@ -67,6 +67,14 @@ typedef struct {
 void read_fasta(const char *path, int *count, Sequence *output);
 
 /**
+ * @brief Free records returned by read_fasta().
+ * @param[in,out] sequences Records to free; NULL is accepted.
+ * @param[in] count Number of records.
+ * @return None.
+ */
+void free_sequences(Sequence *sequences, int count);
+
+/**
  * @brief Fill sequence labels from a GFF3(.gz) annotation.
  * @param[in] path: GFF3 path.
  * @param[in,out] sequences: FASTA records whose per-base labels are filled.
@@ -85,13 +93,5 @@ void read_gff3(const char *path, Sequence *sequences, int count);
  */
 long write_gff(FILE *output, const Sequence *sequence,
                     const uint8_t *path, unsigned long *gene_counter);
-
-/**
- * @brief Free records returned by read_fasta().
- * @param[in,out] sequences Records to free; NULL is accepted.
- * @param[in] count Number of records.
- * @return None.
- */
-void sequences_free(Sequence *sequences, int count);
 
 #endif /* SURF_H */

@@ -15,16 +15,16 @@
 /* ------------------------------------------------------------------------ */
 
 /**
- * @brief Add a scored predecessor edge to a grammar state.
+ * @brief Add a scored backpointer edge to a grammar state.
  * @param[in,out] g Grammar to modify.
- * @param[in] from Predecessor state index.
+ * @param[in] from Backpointer state index.
  * @param[in] to Destination state index.
  * @return None.
  */
 static void grammar_edge(Grammar *g, int from, int to) {
-  int k = g->predecessors[to]++;
-  if (k >= GRAMMAR_MAX_PREDECESSORS)
-    anno_fail("grammar has too many predecessors");
+  int k = g->backpointers[to]++;
+  if (k >= GRAMMAR_MAX_BACKPOINTERS)
+    anno_fail("grammar has too many backpointers");
   g->from[to][k] = from;
 }
 
@@ -86,7 +86,7 @@ void grammar_build(Grammar *g) {
   int shift = 0;
   for (int s = 0; s < g->count; s++) {
     int bits = 0;
-    while ((1 << bits) < g->predecessors[s])
+    while ((1 << bits) < g->backpointers[s])
       bits++;
     g->shift[s] = shift;
     g->bits[s] = bits;
@@ -157,7 +157,7 @@ void decoder_step(Decoder *d, const double *emission,
     double best = -INFINITY;
     int choice = 0;
     uint8_t to_class = g->cls[s];
-    for (int k = 0; k < g->predecessors[s]; k++) {
+    for (int k = 0; k < g->backpointers[s]; k++) {
       int previous = g->from[s][k];
       uint8_t from_class = g->cls[previous];
       double score = d->previous[previous];

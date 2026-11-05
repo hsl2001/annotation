@@ -98,10 +98,10 @@ CrfGrammar crf_grammar_view(const Grammar *grammar, uint8_t *classes,
     classes[s] = grammar->cls[s];
     counts[s] = (uint8_t)grammar->predecessors[s];
     for (int k = 0; k < grammar->predecessors[s]; ++k)
-      predecessors[(size_t)s * GRAMMAR_MAX_PREDECESSORS + (size_t)k] =
+      predecessors[(size_t)s * GRAMMAR_MAX_BACKPOINTERS + (size_t)k] =
           grammar->from[s][k];
   }
-  return (CrfGrammar){grammar->count, classes, GRAMMAR_MAX_PREDECESSORS,
+  return (CrfGrammar){grammar->count, classes, GRAMMAR_MAX_BACKPOINTERS,
                       counts, predecessors};
 }
 
@@ -118,7 +118,7 @@ CrfModel *train_crf(const AnnoSequence *sequences, int count,
   Grammar grammar;
   grammar_build(&grammar);
   uint8_t classes[GRAMMAR_MAX_STATES], predecessor_count[GRAMMAR_MAX_STATES];
-  int predecessors[GRAMMAR_MAX_STATES * GRAMMAR_MAX_PREDECESSORS];
+  int predecessors[GRAMMAR_MAX_STATES * GRAMMAR_MAX_BACKPOINTERS];
   CrfGrammar view = crf_grammar_view(&grammar, classes, predecessor_count,
                                     predecessors);
   size_t example_count = 0;
