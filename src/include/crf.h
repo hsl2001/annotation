@@ -6,6 +6,7 @@
 #define CRF_H
 
 #include "surf.h"
+#include "cwt.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -78,6 +79,17 @@ int train(Model *model, const LongGrammar *grammar,
               int threads);
 
 /**
+ * @brief Train a CRF from labeled sequences using L-BFGS.
+ * @param[in] sequences: Sequences with per-base training labels.
+ * @param[in] count: Number of sequences.
+ * @param[in] iterations: Maximum optimizer iterations.
+ * @param[in] threads: Number of parallel objective workers.
+ * @return Newly allocated trained CRF model.
+ */
+Model *train_pipeline(const Sequence *sequences, int count,
+                           int iterations, int threads);
+
+/**
  * @brief Check that every CRF parameter is finite.
  * @param[in] model: Model to inspect.
  * @return Nonzero when all parameters are finite.
@@ -103,26 +115,21 @@ typedef struct {
  */
 double model_objective(const double *x, double *gradient, void *opaque);
 
+#define CHECKPOINT_BLOCK 64
+#define MAX_WORK_BYTES (64 * 1024 * 1024)
+
+typedef struct {
+    size_t block_length;
+    size_t blocks;
+    size_t bytes;
+} WorkspacePlan;
+
 /**
 * @brief Build the duration-expanded grammar.
 * @param[out] grammar: Receives the initialized grammar.
 * @return None.
 */
 void build_grammar(ShortGrammar *grammar);
-
-/**
- * @brief Fill channel-major one-hot and normalized CWT features.
- * @param[in] sequence: Sequence bases and length.
- * @param[in] power: Position-major CWT power values.
- * @param[in] power_start: Genomic coordinate of the first power row.
- * @param[in] start: First feature position.
- * @param[in] valid: Number of valid positions.
- * @param[out] features: Receives the channel-major feature matrix.
- * @return None.
- */
-void compute_features(const Sequence *sequence, const float *power,
-                   int64_t power_start, int64_t start, int64_t valid,
-                   float *features);
 
 /**
  * @brief Predict sequences, writing GFF3 and optional class bedGraphs.
@@ -136,5 +143,21 @@ void compute_features(const Sequence *sequence, const float *power,
 unsigned long predict(const Model *model,
                              const Sequence *sequences, int count,
                              FILE *gff, const char *prefix);
+
+/**
+ * @brief Write a versioned CRF model file.
+ * @param[in] path: Destination model path.
+ * @param[in] model: Finite model parameters to serialize.
+ * @return Zero on success, or an errno-style error code.
+ */
+int save_model(const char *path, const Model *model);
+
+/**
+ * @brief Load a nine-class CRF model; seven-class models must be retrained.
+ * @param[in] path: Source model path.
+ * @param[out] model: Receives the loaded model on success.
+ * @return Zero on success, or an errno-style error code.
+ */
+int load_model(const char *path, Model *model);
 
 #endif /* CRF_H */

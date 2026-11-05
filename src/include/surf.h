@@ -1,21 +1,12 @@
 /**
  * @file surf.h
- * @brief Public API of surf:
- * 1. CWT features
- * 2. L-BFGS optimization
- * 3. CRF training
- * 4. Gene grammar
- * 5. Viterbi decoding
- * 6. IO
- *
+ * @brief IO of surf:
  * REMEMBER: Coordinates are 0-based, half-opened, in contrast to GFF3
  * inputs and outputs have 1-based inclusive coordinates.
  *
  */
 #ifndef SURF_H
 #define SURF_H
-
-#include "cwt.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -27,7 +18,6 @@
 #define COMPLEX_COMPONENTS 2 // Real & imaginary components
 #define PATH_BUFFER 4096 // Maximum handled path length
 #define CLASSES 7 // Number of train labels (classes)
-#define INPUT_CHANNELS (NUCLEOTIDES + CWT_CHANNELS) // Number of input channels
 #define FEATURE_WINDOW 65536 // Length of parallely processed features window
 
 /** Constraints for gene grammar */
@@ -35,7 +25,7 @@
 #define MIN_INTRON_LENGTH 30 // Minimum intron length
 
 /** Related to trainings */
-#define DEFUALT_INTERATIONS 1000 // Maximum L-BFGS iterations
+#define DEFAULT_ITERATIONS 1000 // Maximum L-BFGS iterations
 typedef enum {
   INTERGENIC = 0,
   PLUS_START_SINGLE_EXON = 1,

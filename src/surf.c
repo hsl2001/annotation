@@ -1,10 +1,10 @@
 /**
  * @file anno.c
- * @brief Command-line entry point for CRF training and genome prediction.
+ * @brief CLI entry-point for CRF training and genome prediction.
  */
-#define _POSIX_C_SOURCE 200809L
-
-#include "include/anno_internal.h"
+#include "include/surf.h"
+#include "include/crf.h"
+#include "utils.c"
 
 #include <errno.h>
 #include <limits.h>
@@ -26,42 +26,42 @@
  */
 static void usage(void) {
   fprintf(stderr,
-          "Usage: anno [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
+          "Usage: surf [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
           "  with an annotation: train a CRF with L-BFGS and write it to -m\n"
           "  without:            predict genes (GFF3 on stdout unless -o)\n"
           "Options:\n"
           "  -p N       threads [1]\n"
           "  -i N       training iterations [%d]\n"
-          "  -m FILE    CRF model file [anno.crf]\n"
+          "  -m FILE    CRF model file [surf.crf]\n"
           "  -o PREFIX  write PREFIX.gff3 and PREFIX.{class}.bedgraph\n"
           "  -h         this help\n",
-          ANNO_DEFAULT_ITERATIONS);
+          DEFAULT_ITERATIONS);
 }
 
 /**
  * @brief Parse a positive integer option value.
- * @param[in] text Numeric option text.
- * @param[in] name Option name used in diagnostics.
+ * @param[in] text: Numeric option text.
+ * @param[in] name: Option name used in diagnostics.
  * @return Parsed positive integer.
  */
-static int positive(const char *text, const char *name) {
+static int parse_positive(const char *text, const char *name) {
   char *end = NULL;
   errno = 0;
   long value = strtol(text, &end, 10);
   if (errno || end == text || *end || value < 1 || value > INT_MAX)
-    anno_fail("invalid %s: %s", name, text);
+    bye("invalid %s: %s", name, text);
   return (int)value;
 }
 
 /**
- * @brief Run the anno command-line application.
+ * @brief Run the surf command-line application.
  * @param[in] argc Number of command-line arguments.
  * @param[in] argv Command-line argument vector.
  * @return EXIT_SUCCESS on success, otherwise EXIT_FAILURE.
  */
 int main(int argc, char **argv) {
-  int threads = 1, iterations = ANNO_DEFAULT_ITERATIONS;
-  const char *model_path = "anno.crf", *prefix = NULL;
+  int threads = 1, iterations = DEFAULT_ITERATIONS;
+  const char *model_path = "surf.crf", *prefix = NULL;
   int opt;
   opterr = 0;
   while ((opt = getopt(argc, argv, "hp:i:m:o:")) != -1) {
@@ -74,9 +74,9 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     if (opt == 'p')
-      threads = positive(optarg, "thread count");
+      threads = parse_positive(optarg, "thread count");
     if (opt == 'i')
-      iterations = positive(optarg, "iteration count");
+      iterations = parse_positive(optarg, "iteration count");
     if (opt == 'm')
       model_path = optarg;
     if (opt == 'o')
@@ -91,41 +91,42 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
   int count = 0;
-  AnnoSequence *sequences = anno_read_fasta(argv[a], &count);
+  Sequence *sequences = 0;
+  read_fasta(argv[a], &count, sequences);
   if (argc - a == 2) {
-    double started = anno_now_seconds();
-    anno_read_labels(argv[a + 1], sequences, count);
-    CrfModel *model = train_crf(sequences, count, iterations, threads);
-    int status = crf_save_model(model_path, model);
+    double started = whattime();
+    read_gff3(argv[a + 1], sequences, count);
+    Model *model = train_pipeline(sequences, count, iterations, threads);
+    int status = save_model(model_path, model);
     if (status)
-      anno_fail("cannot write CRF model %s: %s", model_path, strerror(status));
-    anno_log("trained in %.1fs; CRF model written to %s", anno_now_seconds() - started,
+      bye("cannot write CRF model %s: %s", model_path, strerror(status));
+    cry("trained in %.1fs; CRF model written to %s", whattime() - started,
         model_path);
     free(model);
   } else {
-    CrfModel *model = anno_xcalloc(1, sizeof(*model));
-    int status = crf_load_model(model_path, model);
+    Model *model = scalloc(1, sizeof(*model));
+    int status = load_model(model_path, model);
     if (status == EINVAL)
-      anno_fail("invalid or incompatible CRF model %s; retrain with this version of anno",
+      bye("invalid or incompatible CRF model %s; retrain with this version of anno",
                 model_path);
     if (status)
-      anno_fail("cannot read CRF model %s: %s", model_path, strerror(status));
+      bye("cannot read CRF model %s: %s", model_path, strerror(status));
     FILE *gff = stdout;
     if (prefix) {
-      char path[ANNO_PATH_BUFFER];
+      char path[PATH_BUFFER];
       if (snprintf(path, sizeof(path), "%s.gff3", prefix) >= (int)sizeof(path))
-        anno_fail("output prefix too long");
+        bye("output prefix too long");
       if (!(gff = fopen(path, "w")))
-        anno_fail("cannot create %s", path);
+        bye("cannot create %s", path);
     }
     fputs("##gff-version 3\n", gff);
     unsigned long genes =
-        predict_genome(model, sequences, count, gff, prefix);
+        predict(model, sequences, count, gff, prefix);
     if (fflush(gff) || ferror(gff) || (gff != stdout && fclose(gff)))
-      anno_fail("cannot write GFF3");
-    anno_log("predicted %lu genes", genes);
+      bye("cannot write GFF3");
+    cry("predicted %lu genes", genes);
     free(model);
   }
-  anno_sequences_free(sequences, count);
+  free_sequences(sequences, count);
   return EXIT_SUCCESS;
 }
