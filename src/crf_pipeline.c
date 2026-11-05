@@ -1,0 +1,191 @@
+/**
+ * @file crf_pipeline.c
+ * @brief Labeled-sequence preparation, CRF orchestration, and model I/O.
+ */
+#include "include/anno_internal.h"
+#include "include/crf_internal.h"
+
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/**
+ * @brief Prepare whole-sequence examples with block-local feature normalization.
+ * @param[in] sequences Input sequences with per-base labels.
+ * @param[in] sequence_count Number of input sequences.
+ * @param[out] example_count Receives the number of prepared sequences.
+ * @return Allocated examples and their owned feature arrays.
+ */
+static CrfExample *crf_training_examples(const AnnoSequence *sequences,
+                                         int sequence_count,
+                                         size_t *example_count) {
+  if (sequence_count < 1)
+    anno_fail("no CRF training sequences");
+  size_t count = (size_t)sequence_count;
+  CrfExample *examples = anno_xcalloc(count, sizeof(*examples));
+  float *input = anno_xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_FEATURE_WINDOW,
+                              sizeof(*input));
+  float *power = anno_xcalloc((size_t)ANNO_FEATURE_WINDOW * ANNO_CWT_CHANNELS,
+                              sizeof(*power));
+  for (int s = 0; s < sequence_count; ++s) {
+    const AnnoSequence *sequence = &sequences[s];
+    if (!sequence->labels || sequence->length < 1)
+      anno_fail("sequence %s has no training labels", sequence->name);
+    if ((uint64_t)sequence->length > SIZE_MAX)
+      anno_fail("sequence %s is too long", sequence->name);
+    size_t positions = (size_t)sequence->length;
+    size_t cwt_count = anno_mul_size(positions, ANNO_CWT_CHANNELS);
+    uint8_t *bases = anno_xcalloc(positions, sizeof(*bases));
+    float *cwt = anno_xcalloc(cwt_count, sizeof(*cwt));
+    uint8_t *labels = anno_xcalloc(positions, sizeof(*labels));
+    memcpy(labels, sequence->labels, positions * sizeof(*labels));
+    examples[s] = (CrfExample){sequence->length, bases, cwt, labels,
+                               CRF_BOUNDARY_INTERGENIC};
+    for (int64_t start = 0; start < sequence->length;) {
+      int64_t length = sequence->length - start;
+      if (length > CRF_TRAIN_WINDOW)
+        length = CRF_TRAIN_WINDOW;
+      anno_cwt_power(sequence->bases, sequence->length, start, start + length, power);
+      memset(input, 0, (size_t)ANNO_INPUT_CHANNELS * ANNO_FEATURE_WINDOW *
+                          sizeof(*input));
+      anno_features(sequence, power, start, start, length, input);
+      for (size_t p = 0; p < (size_t)length; ++p) {
+        size_t position = (size_t)start + p;
+        int base = anno_base_index(sequence->bases[position]);
+        bases[position] = (uint8_t)(base < 0 ? ANNO_NUCLEOTIDES : base);
+        for (int c = 0; c < ANNO_CWT_CHANNELS; ++c)
+          cwt[position * ANNO_CWT_CHANNELS + (size_t)c] =
+              input[(size_t)(ANNO_NUCLEOTIDES + c) * ANNO_FEATURE_WINDOW + p];
+      }
+      start += length;
+    }
+  }
+  free(power);
+  free(input);
+  *example_count = count;
+  return examples;
+}
+
+/**
+ * @brief Release a set of training examples and all owned feature buffers.
+ * @param[in,out] examples Examples to destroy; NULL is accepted.
+ * @param[in] count Number of examples.
+ * @return None.
+ */
+static void crf_training_examples_destroy(CrfExample *examples, size_t count) {
+  if (!examples)
+    return;
+  for (size_t i = 0; i < count; ++i) {
+    free((void *)examples[i].bases);
+    free((void *)examples[i].cwt);
+    free((void *)examples[i].labels);
+  }
+  free(examples);
+}
+
+/**
+ * @brief Expose the decoder grammar in the CRF training representation.
+ * @param[in] grammar Duration-expanded decoder grammar.
+ * @param[out] classes Receives the observed class for each grammar state.
+ * @param[out] counts Receives each state's predecessor count.
+ * @param[out] predecessors Receives flattened predecessor indices.
+ * @return Grammar view referencing the caller-owned output arrays.
+ */
+CrfGrammar crf_grammar_view(const Grammar *grammar, uint8_t *classes,
+                                   uint8_t *counts, int *predecessors) {
+  for (int s = 0; s < grammar->count; ++s) {
+    classes[s] = grammar->cls[s];
+    counts[s] = (uint8_t)grammar->predecessors[s];
+    for (int k = 0; k < grammar->predecessors[s]; ++k)
+      predecessors[(size_t)s * GRAMMAR_MAX_PREDECESSORS + (size_t)k] =
+          grammar->from[s][k];
+  }
+  return (CrfGrammar){grammar->count, classes, GRAMMAR_MAX_PREDECESSORS,
+                      counts, predecessors};
+}
+
+/**
+ * @brief Train a CRF from labeled sequences using L-BFGS.
+ * @param[in] sequences Sequences with per-base training labels.
+ * @param[in] count Number of sequences.
+ * @param[in] iterations Maximum optimizer iterations.
+ * @param[in] threads Number of parallel objective workers.
+ * @return Newly allocated trained CRF model.
+ */
+CrfModel *train_crf(const AnnoSequence *sequences, int count,
+                           int iterations, int threads) {
+  Grammar grammar;
+  grammar_build(&grammar);
+  uint8_t classes[GRAMMAR_MAX_STATES], predecessor_count[GRAMMAR_MAX_STATES];
+  int predecessors[GRAMMAR_MAX_STATES * GRAMMAR_MAX_PREDECESSORS];
+  CrfGrammar view = crf_grammar_view(&grammar, classes, predecessor_count,
+                                    predecessors);
+  size_t example_count = 0;
+  CrfExample *examples = crf_training_examples(sequences, count, &example_count);
+  CrfModel *model = anno_xcalloc(1, sizeof(*model));
+  double started = anno_now_seconds();
+  anno_log("training CRF with L-BFGS: %zu sequences, %d iterations", example_count,
+      iterations);
+  int status = crf_train(model, &view, examples, example_count, iterations,
+                         threads);
+  crf_training_examples_destroy(examples, example_count);
+  if (status != LBFGS_MAX_ITERATIONS && status != LBFGS_CONVERGED &&
+      status != LBFGS_STOPPING_CRITERION)
+    anno_fail("CRF L-BFGS training failed (status %d)", status);
+  anno_log("CRF L-BFGS status %d after %.1fs", status, anno_now_seconds() - started);
+  return model;
+}
+
+/**
+ * @brief Write a versioned CRF model file.
+ * @param[in] path Destination model path.
+ * @param[in] model Finite model parameters to serialize.
+ * @return Zero on success, or an errno-style error code.
+ */
+int crf_save_model(const char *path, const CrfModel *model) {
+  static const char magic[8] = {'A', 'N', 'N', 'O', 'C', 'R', 'F', '2'};
+  if (!path || !model || !crf_model_is_finite(model))
+    return EINVAL;
+  FILE *output = fopen(path, "wb");
+  if (!output)
+    return errno;
+  uint32_t count = CRF_PARAMETER_COUNT;
+  int ok = fwrite(magic, sizeof(magic), 1, output) == 1 &&
+           fwrite(&count, sizeof(count), 1, output) == 1 &&
+           fwrite(model, sizeof(*model), 1, output) == 1;
+  int closed = fclose(output) == 0;
+  return ok && closed ? 0 : EIO;
+}
+
+/**
+ * @brief Load a nine-class CRF model; seven-class models must be retrained.
+ * @param[in] path Source model path.
+ * @param[out] model Receives the loaded model on success.
+ * @return Zero on success, or an errno-style error code.
+ */
+int crf_load_model(const char *path, CrfModel *model) {
+  static const char magic[8] = {'A', 'N', 'N', 'O', 'C', 'R', 'F', '2'};
+  if (!path || !model)
+    return EINVAL;
+  FILE *input = fopen(path, "rb");
+  if (!input)
+    return errno;
+  char found[sizeof(magic)];
+  uint32_t count = 0;
+  CrfModel candidate;
+  int ok = fread(found, sizeof(found), 1, input) == 1 &&
+           fread(&count, sizeof(count), 1, input) == 1 &&
+           !memcmp(found, magic, sizeof(magic)) && count == CRF_PARAMETER_COUNT &&
+           fread(&candidate, sizeof(candidate), 1, input) == 1;
+  if (ok) {
+    int extra = fgetc(input);
+    if (extra != EOF || ferror(input) || !crf_model_is_finite(&candidate))
+      ok = 0;
+  }
+  int closed = fclose(input) == 0;
+  if (!ok || !closed)
+    return EINVAL;
+  *model = candidate;
+  return 0;
+}

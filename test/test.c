@@ -1,25 +1,45 @@
 /**
  * @file test.c
- * @brief Unit and pipeline tests for anno. 
+ * @brief Unit and pipeline tests for anno.
  */
-#define ANNO_NO_MAIN
-#include "anno.c"
-#include "unet.c" /* static internals for the gradient test */
+#include "../src/include/anno_internal.h"
+#include "../src/include/crf_internal.h"
+
+#include <errno.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <sys/wait.h>
 #include <unistd.h>
 
 static int failures = 0, checks = 0;
 
-/** @brief Return a deterministic random integer below the given bound. */
+/**
+ * @brief Return a deterministic random integer below the given bound.
+ * @param[in,out] state Mutable pseudo-random generator state.
+ * @param[in] bound Exclusive upper bound; must be nonzero.
+ * @return A deterministic value in [0, bound).
+ */
 static unsigned random_below(uint64_t *state, unsigned bound) {
-  return (unsigned)(anno_random_next(state) % bound);
+  uint64_t value = *state;
+  value ^= value >> 12;
+  value ^= value << 25;
+  value ^= value >> 27;
+  *state = value;
+  return (unsigned)(value * UINT64_C(2685821657736338717) % bound);
 }
 
-
+/**
+ * @brief Compute test CWT power in independent blocks.
+ * @param[in] sequence Sequence whose bases are transformed.
+ * @return Allocated position-major power array; caller frees it.
+ */
 static float *test_sequence_power(const AnnoSequence *sequence) {
   float *power =
-      xcalloc((size_t)sequence->length * ANNO_CWT_CHANNELS, sizeof(float));
+      anno_xcalloc((size_t)sequence->length * ANNO_CWT_CHANNELS, sizeof(float));
   for (int64_t start = 0; start < sequence->length; start += ANNO_CWT_WINDOW) {
     int64_t end = start + ANNO_CWT_WINDOW;
     if (end > sequence->length)
@@ -47,7 +67,12 @@ static float *test_sequence_power(const AnnoSequence *sequence) {
     }                                                                          \
   } while (0)
 
-/** @brief Write text to a file. */
+/**
+ * @brief Write a NUL-terminated string to a file.
+ * @param[in] path Destination file path.
+ * @param[in] text Text to write.
+ * @return None; terminates the test process on I/O failure.
+ */
 static void write_text(const char *path, const char *text) {
   FILE *file = fopen(path, "w");
   if (!file || fputs(text, file) < 0 || fclose(file)) {
@@ -56,10 +81,14 @@ static void write_text(const char *path, const char *text) {
   }
 }
 
-/** @brief Read a whole file into a NUL-terminated buffer (caller frees). */
+/**
+ * @brief Read a whole stream into a NUL-terminated buffer.
+ * @param[in,out] file Stream to rewind and read.
+ * @return Allocated text buffer; caller frees it.
+ */
 static char *read_text(FILE *file) {
   long size = ftell(file);
-  char *text = xcalloc((size_t)size + 1, 1);
+  char *text = anno_xcalloc((size_t)size + 1, 1);
   rewind(file);
   if (fread(text, 1, (size_t)size, file) != (size_t)size)
     text[0] = 0;
@@ -110,10 +139,13 @@ static const char *const test_gff =
     "t\tanno\tthree_prime_UTR\t1581\t1609\t.\t-\t.\tID=gene2.t1.utr3p1;Parent="
     "gene2.t1\n";
 
-/** @brief Build the 2000-bp test genome described above (caller frees). */
+/**
+ * @brief Build the synthetic 2000-bp test genome described above.
+ * @return Allocated NUL-terminated genome; caller frees it.
+ */
 static char *test_genome(void) {
   static const int exons[4][2] = {{40, 70}, {100, 150}, {210, 300}, {360, 420}};
-  char block[501], *genome = xcalloc(TEST_LENGTH + 1, 1);
+  char block[501], *genome = anno_xcalloc(TEST_LENGTH + 1, 1);
   memset(block, 'C', 500);
   block[500] = 0;
   char cds[151];
@@ -135,15 +167,20 @@ static char *test_genome(void) {
   memset(genome, 'C', TEST_LENGTH);
   memcpy(genome, block, 500);
   for (int p = 0; p < 500; p++)
-    genome[TEST_LENGTH - 1 - p] = complement(block[p]);
+    genome[TEST_LENGTH - 1 - p] = anno_complement(block[p]);
   return genome;
 }
 
-/** @brief FASTA + GFF of the test genome on disk; returns the sequence. */
+/**
+ * @brief Write synthetic FASTA/GFF files and read their labeled sequence.
+ * @param[in] fasta FASTA fixture path.
+ * @param[in] gff GFF3 fixture path.
+ * @return Allocated one-element sequence array; caller frees it.
+ */
 static AnnoSequence *test_sequences(const char *fasta, const char *gff) {
   char *genome = test_genome();
   size_t size = strlen(genome) + 16;
-  char *text = xcalloc(size, 1);
+  char *text = anno_xcalloc(size, 1);
   snprintf(text, size, ">t\n%s\n", genome);
   write_text(fasta, text);
   write_text(gff, test_gff);
@@ -156,7 +193,11 @@ static AnnoSequence *test_sequences(const char *fasta, const char *gff) {
   return sequences;
 }
 
-/** @brief GFF -> label vector checks at hand-picked positions. */
+/**
+ * @brief Verify GFF-to-label mapping at selected and exhaustive positions.
+ * @param[in] s Labeled synthetic sequence.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_labels(const AnnoSequence *s) {
   const uint8_t *y = s->labels;
   CHECK(ANNO_CLASSES == 7);
@@ -198,19 +239,13 @@ static void test_labels(const AnnoSequence *s) {
   }
 }
 
-/** @brief Reverse-complement augmentation preserves transcriptional roles. */
-static void test_strand_swap(void) {
-  static const uint8_t swapped[] = {
-      ANNO_INTERGENIC, ANNO_MINUS_START_SINGLE_EXON, ANNO_MINUS_END_EXON,
-      ANNO_MINUS_INTRON, ANNO_PLUS_START_SINGLE_EXON, ANNO_PLUS_END_EXON,
-      ANNO_PLUS_INTRON};
-  for (int label = 0; label < ANNO_CLASSES; label++) {
-    CHECK(ann_swap_strand(label) == swapped[label]);
-    CHECK(ann_swap_strand(ann_swap_strand(label)) == label);
-  }
-}
 
-/** @brief Print the GFF records of a path into a string (caller frees). */
+/**
+ * @brief Serialize a decoded path to a caller-owned GFF3 string.
+ * @param[in] s Sequence metadata and bases.
+ * @param[in] path Per-base decoded labels.
+ * @return Allocated GFF3 text; caller frees it.
+ */
 static char *gff_of_path(const AnnoSequence *s, const uint8_t *path) {
   FILE *file = tmpfile();
   unsigned long genes = 0;
@@ -221,9 +256,38 @@ static char *gff_of_path(const AnnoSequence *s, const uint8_t *path) {
   return text;
 }
 
-/** @brief Restore known intron-bounded exons before writing decoded GFF. */
+/**
+ * @brief Decode synthetic class probabilities for grammar fixtures.
+ * @param[in] length Number of sequence positions.
+ * @param[in] probability Position-major probability matrix.
+ * @param[out] path Receives the grammar-constrained class path.
+ * @return Zero on success, or an errno-style error.
+ */
+static int decode_probabilities(int64_t length, const float *probability,
+                                uint8_t *path) {
+  if (length < 1 || !probability || !path)
+    return EINVAL;
+  Decoder *decoder = decoder_create(length);
+  for (int64_t i = 0; i < length; ++i) {
+    double scores[ANNO_CLASSES];
+    for (int c = 0; c < ANNO_CLASSES; ++c) {
+      float p = probability[(size_t)i * ANNO_CLASSES + (size_t)c];
+      scores[c] = log((isfinite(p) && p > 0.0f ? p : 0.0f) + 1e-6);
+    }
+    decoder_step(decoder, scores, NULL);
+  }
+  int status = decoder_finish(decoder, path);
+  decoder_destroy(decoder);
+  return status;
+}
+
+/**
+ * @brief Verify GFF-to-label-to-decoder-to-GFF round-trip identity.
+ * @param[in] s Synthetic sequence with labels loaded from GFF3.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_round_trip(const AnnoSequence *s) {
-  uint8_t *expected = xcalloc((size_t)s->length, 1);
+  uint8_t *expected = anno_xcalloc((size_t)s->length, 1);
   memcpy(expected, s->labels, (size_t)s->length);
   static const int internal[4][2] = {
       {100, 150}, {210, 300}, {1700, 1790}, {1850, 1900}};
@@ -236,22 +300,28 @@ static void test_round_trip(const AnnoSequence *s) {
   CHECK(!strcmp(direct, test_gff));
   if (strcmp(direct, test_gff))
     fprintf(stderr, "got:\n%s", direct);
-  float *probability = xcalloc((size_t)s->length * ANNO_CLASSES, sizeof(float));
+  float *probability = anno_xcalloc((size_t)s->length * ANNO_CLASSES, sizeof(float));
   for (int64_t i = 0; i < s->length; i++)
     for (int j = 0; j < ANNO_CLASSES; j++)
       probability[i * ANNO_CLASSES + j] =
           j == s->labels[i] ? 0.9f : 0.1f / (ANNO_CLASSES - 1);
-  uint8_t *path = xcalloc((size_t)s->length, 1);
-  CHECK(anno_decode(s->length, probability, path) == 0);
+  uint8_t *path = anno_xcalloc((size_t)s->length, 1);
+  CHECK(decode_probabilities(s->length, probability, path) == 0);
   CHECK(!memcmp(path, expected, (size_t)s->length));
   char *decoded = gff_of_path(s, path);
   CHECK(!strcmp(decoded, test_gff));
 
   /* Exercise the streaming API directly from anno_read_labels() targets. */
   Decoder *stream = decoder_create(s->length);
-  uint8_t *stream_path = xcalloc((size_t)s->length, 1);
-  for (int64_t i = 0; i < s->length; i++)
-    decoder_step(stream, probability + (size_t)i * ANNO_CLASSES);
+  uint8_t *stream_path = anno_xcalloc((size_t)s->length, 1);
+  for (int64_t i = 0; i < s->length; i++) {
+    double scores[ANNO_CLASSES];
+    for (int j = 0; j < ANNO_CLASSES; ++j) {
+      float p = probability[(size_t)i * ANNO_CLASSES + (size_t)j];
+      scores[j] = log((double)p + 1e-6);
+    }
+    decoder_step(stream, scores, NULL);
+  }
   CHECK(decoder_finish(stream, stream_path) == 0);
   CHECK(!memcmp(stream_path, expected, (size_t)s->length));
   char *stream_gff = gff_of_path(s, stream_path);
@@ -267,7 +337,10 @@ static void test_round_trip(const AnnoSequence *s) {
   free(expected);
 }
 
-/** @brief Grammar constraints on a probability matrix. */
+/**
+ * @brief Verify reachability and consistency of the duration grammar.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_grammar(void) {
   Grammar grammar;
   grammar_build(&grammar);
@@ -286,7 +359,12 @@ static void test_grammar(void) {
   CHECK(count == grammar.count);
 }
 
-/** @brief Recognize a decoded path using the duration-expanded grammar. */
+/**
+ * @brief Recognize a decoded path using the duration-expanded grammar.
+ * @param[in] path Per-position decoded classes.
+ * @param[in] n Number of positions.
+ * @return Nonzero when the path is accepted by the grammar.
+ */
 static int grammar_accepts(const uint8_t *path, int n) {
   Grammar g;
   grammar_build(&g);
@@ -305,7 +383,13 @@ static int grammar_accepts(const uint8_t *path, int n) {
   return active[0] != 0;
 }
 
-/** @brief Recognize a short list of constant-label runs. */
+/**
+ * @brief Expand and recognize a short list of constant-label runs.
+ * @param[in] labels Class assigned to each run.
+ * @param[in] lengths Length in bases of each run.
+ * @param[in] count Number of runs.
+ * @return Nonzero when the expanded path is grammar-valid.
+ */
 static int grammar_accepts_runs(const uint8_t *labels, const int *lengths,
                                 int count) {
   uint8_t path[512];
@@ -319,7 +403,10 @@ static int grammar_accepts_runs(const uint8_t *labels, const int *lengths,
   return grammar_accepts(path, n);
 }
 
-/** @brief Terminal roles, strand isolation and all duration boundaries. */
+/**
+ * @brief Verify terminal roles, strand isolation, and duration boundaries.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_grammar_paths(void) {
   CHECK(ANNO_MIN_EXON_LENGTH == 6 && ANNO_MIN_INTRON_LENGTH == 30);
   for (int strand = 0; strand < 2; strand++) {
@@ -389,6 +476,10 @@ static void test_grammar_paths(void) {
   }
 }
 
+/**
+ * @brief Verify grammar-constrained Viterbi decoding on both strands.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_viterbi(void) {
   enum { N = 60 };
   float p[N * ANNO_CLASSES];
@@ -402,7 +493,7 @@ static void test_viterbi(void) {
         p[i * ANNO_CLASSES + j] =
             j == (i >= 20 && i < 24 ? start : ANNO_INTERGENIC)
                 ? 0.99f : 0.01f / (ANNO_CLASSES - 1);
-    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(decode_probabilities(N, p, path) == 0);
     CHECK(grammar_accepts(path, N));
     int exon = 0;
     for (int i = 0; i < N; i++)
@@ -414,17 +505,23 @@ static void test_viterbi(void) {
         p[i * ANNO_CLASSES + j] =
             j == (i >= 20 && i < 50 ? start : ANNO_INTERGENIC)
                 ? 0.99f : 0.01f / (ANNO_CLASSES - 1);
-    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(decode_probabilities(N, p, path) == 0);
     for (int i = 0; i < N; i++)
       CHECK(path[i] == (i >= 20 && i < 50 ? start : ANNO_INTERGENIC));
   }
   /* NaN emissions are treated as zero probability, not propagated. */
   p[5 * ANNO_CLASSES] = NAN;
-  CHECK(anno_decode(N, p, path) == 0);
+  CHECK(decode_probabilities(N, p, path) == 0);
   CHECK(grammar_accepts(path, N));
 }
 
-/** @brief Favour a decoded path using only the seven model targets. */
+/**
+ * @brief Assign high probabilities to a path using seven observed classes.
+ * @param[in] path Decoded path; internal exons map to intergenic.
+ * @param[in] n Number of positions.
+ * @param[out] p Receives the position-major class probability matrix.
+ * @return None.
+ */
 static void favour_path(const uint8_t *path, int n, float *p) {
   for (int i = 0; i < n; i++) {
     int target = path[i];
@@ -436,7 +533,10 @@ static void favour_path(const uint8_t *path, int n, float *p) {
   }
 }
 
-/** @brief Single-exon labels and exact GFF output on both strands. */
+/**
+ * @brief Verify single-exon labels and exact GFF output on both strands.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_single_exons(void) {
   enum { N = 70 };
   static const char gff[] =
@@ -465,7 +565,7 @@ static void test_single_exons(void) {
   CHECK(!strcmp(direct, gff));
   float p[N * ANNO_CLASSES];
   favour_path(expected, N, p);
-  CHECK(anno_decode(N, p, path) == 0);
+  CHECK(decode_probabilities(N, p, path) == 0);
   CHECK(!memcmp(path, expected, N));
   char *decoded = gff_of_path(&s, path);
   CHECK(!strcmp(decoded, gff));
@@ -475,10 +575,14 @@ static void test_single_exons(void) {
   remove("test-single.gff3");
 }
 
-/** @brief Intergenic internal targets still occupy the whole transcript span. */
+/**
+ * @brief Verify nested opposite-strand transcript targets are skipped safely.
+ * @param[in] original Original labeled synthetic sequence.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_nested_transcripts(const AnnoSequence *original) {
   size_t size = strlen(test_gff) + 256;
-  char *gff = xcalloc(size, 1);
+  char *gff = anno_xcalloc(size, 1);
   for (int strand = 0; strand < 2; strand++) {
     snprintf(gff, size,
              "%st\ta\texon\t111\t130\t.\t%c\t.\tParent=nested1\n"
@@ -498,7 +602,10 @@ static void test_nested_transcripts(const AnnoSequence *original) {
   remove("test-nested.gff3");
 }
 
-/** @brief Invalid signals must decode into complete, single-strand genes. */
+/**
+ * @brief Verify invalid signals decode only to complete single-strand genes.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_invalid_signals(void) {
   enum { N = 180 };
   for (int strand = 0; strand < 2; strand++) {
@@ -525,14 +632,17 @@ static void test_invalid_signals(void) {
       CHECK(!grammar_accepts(truth, N));
       float p[N * ANNO_CLASSES];
       favour_path(truth, N, p);
-      CHECK(anno_decode(N, p, path) == 0);
+      CHECK(decode_probabilities(N, p, path) == 0);
       CHECK(grammar_accepts(path, N));
       CHECK(memcmp(path, truth, N) != 0);
     }
   }
 }
 
-/** @brief Decode all exon types and introns exactly at their minimum lengths. */
+/**
+ * @brief Decode all exon types and introns at their minimum lengths.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_minimum_decode(void) {
   enum { N = 98 };
   for (int strand = 0; strand < 2; strand++) {
@@ -548,12 +658,15 @@ static void test_minimum_decode(void) {
     float p[N * ANNO_CLASSES];
     favour_path(truth, N, p);
     CHECK(grammar_accepts(truth, N));
-    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(decode_probabilities(N, p, path) == 0);
     CHECK(!memcmp(path, truth, N));
   }
 }
 
-/** @brief Start/stop codons exactly at exon edges (UTR intron next to CDS). */
+/**
+ * @brief Verify codons at exon edges beside UTR introns and CDS segments.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_utr_intron_edges(void) {
   enum { N = 280 };
   /* genomic order: inter | exon [20,40) | intron [40,100) |
@@ -573,90 +686,98 @@ static void test_utr_intron_edges(void) {
                            : ANNO_INTERGENIC;
     float p[N * ANNO_CLASSES];
     favour_path(truth, N, p);
-    CHECK(anno_decode(N, p, path) == 0);
+    CHECK(decode_probabilities(N, p, path) == 0);
     CHECK(!memcmp(path, truth, N));
   }
 }
 
-/** @brief Backpropagation equals central finite differences of the loss. */
+/**
+ * @brief Compare CRF gradients with finite differences and fit a tiny model.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_gradient(void) {
-  enum { B = 2 };
-  size_t xs = (size_t)B * ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-         ys = (size_t)B * ANNO_CLASSES * ANNO_UNET_WINDOW;
-  float *x = xcalloc(xs, sizeof(float)), *y = xcalloc(ys, sizeof(float)),
-        *m = xcalloc((size_t)B * ANNO_UNET_WINDOW, sizeof(float));
-  uint64_t seed = 11;
-  for (size_t i = 0; i < xs; i++)
-    x[i] = anno_random_symmetric(&seed);
-  /* window 1 has no minus-strand classes: their gradient must still flow */
-  for (int b = 0; b < B; b++)
-    for (int i = 0; i < ANNO_UNET_WINDOW; i++) {
-      int c = (i / 300) % ANNO_CLASSES;
-      if (b == 1 && c >= ANNO_MINUS_START_SINGLE_EXON)
-        c = ANNO_INTERGENIC;
-      y[(size_t)b * ANNO_CLASSES * ANNO_UNET_WINDOW +
-        (size_t)c * ANNO_UNET_WINDOW + i] = 1.0f;
-      m[b * ANNO_UNET_WINDOW + i] = i < ANNO_UNET_WINDOW - 97;
-    }
-  UnetConfig config = unet_default_config();
-  Unet *u = unet_create(&config);
-  float *gw[UNET_LAYER_COUNT], *gb[UNET_LAYER_COUNT];
-  for (int l = 0; l < u->nlayer; l++) {
-    gw[l] = xcalloc((size_t)u->layer[l].in * u->layer[l].out * u->layer[l].k,
-                    sizeof(float));
-    gb[l] = xcalloc((size_t)u->layer[l].out, sizeof(float));
+  enum { N = 120 };
+  uint8_t bases[N], labels[N];
+  float cwt[N * ANNO_CWT_CHANNELS];
+  for (int i = 0; i < N; ++i) {
+    labels[i] = i < 10 || i >= 100 ? ANNO_INTERGENIC
+                : i < 20 ? ANNO_PLUS_START_SINGLE_EXON
+                : i < 50 ? ANNO_PLUS_INTRON
+                : i < 60 ? ANNO_INTERGENIC
+                : i < 90 ? ANNO_PLUS_INTRON
+                          : ANNO_PLUS_END_EXON;
+    bases[i] = (uint8_t)(i % (ANNO_NUCLEOTIDES + 1));
+    for (int c = 0; c < ANNO_CWT_CHANNELS; ++c)
+      cwt[i * ANNO_CWT_CHANNELS + c] =
+          (float)(((i * 13 + c * 7) % 19) - 9) / 10.0f;
   }
-  double loss = 0, plus = 0, minus = 0;
-  CHECK(batch_gradient(u, x, y, m, B, gw, gb, &loss) == 0);
-  /* encoder input, skip source, decoder concat and output layers */
-  static const int layers[] = {0, 3, 6, 8, 10, 14};
-  double worst = 0;
-  int tested = 0;
-  for (int t = 0; t < 6; t++) {
-    Layer *l = &u->layer[layers[t]];
-    size_t count = (size_t)l->in * l->out * l->k, best = 0;
-    for (size_t i = 1; i < count; i++) /* largest gradient: well above noise */
-      if (fabsf(gw[layers[t]][i]) > fabsf(gw[layers[t]][best]))
-        best = i;
-    float w = l->w[best], h = 1e-2f * fmaxf(fabsf(w), 1e-2f);
-    float *scratch[UNET_LAYER_COUNT], *sb[UNET_LAYER_COUNT];
-    for (int k = 0; k < u->nlayer; k++) {
-      scratch[k] = xcalloc((size_t)u->layer[k].in * u->layer[k].out *
-                               u->layer[k].k,
-                           sizeof(float));
-      sb[k] = xcalloc((size_t)u->layer[k].out, sizeof(float));
-    }
-    l->w[best] = w + h;
-    batch_gradient(u, x, y, m, B, scratch, sb, &plus);
-    l->w[best] = w - h;
-    batch_gradient(u, x, y, m, B, scratch, sb, &minus);
-    l->w[best] = w;
-    for (int k = 0; k < u->nlayer; k++) {
-      free(scratch[k]);
-      free(sb[k]);
-    }
-    double numeric = (plus - minus) / (2.0 * (double)h);
-    double analytic = gw[layers[t]][best];
-    if (fabs(numeric) > 1e-7) {
-      tested++;
-      worst = fmax(worst, fabs(numeric - analytic) / fabs(numeric));
-    }
+  CrfExample example = {N, bases, cwt, labels};
+  Grammar grammar;
+  grammar_build(&grammar);
+  uint8_t classes[GRAMMAR_MAX_STATES], counts[GRAMMAR_MAX_STATES];
+  int predecessors[GRAMMAR_MAX_STATES * GRAMMAR_MAX_PREDECESSORS];
+  CrfGrammar view = crf_grammar_view(&grammar, classes, counts, predecessors);
+  Crf__ObjectiveContext context = {&view, &example, 1, N, 1, 0};
+  double parameters[CRF_PARAMETER_COUNT] = {0};
+  double gradient[CRF_PARAMETER_COUNT], baseline[CRF_PARAMETER_COUNT], plus,
+      minus;
+  for (size_t i = 0; i < CRF_PARAMETER_COUNT; ++i)
+    parameters[i] = 0.003 * sin((double)(i + 1));
+  double objective = crf__objective(parameters, gradient, &context);
+  memcpy(baseline, gradient, sizeof(baseline));
+  CHECK(isfinite(objective));
+  Crf__ObjectiveContext parallel_context = {&view, &example, 1, N, 2, 0};
+  double parallel_gradient[CRF_PARAMETER_COUNT];
+  double parallel_objective =
+      crf__objective(parameters, parallel_gradient, &parallel_context);
+  CHECK(fabs(parallel_objective - objective) < 1e-10);
+  for (size_t i = 0; i < CRF_PARAMETER_COUNT; ++i)
+    CHECK(fabs(parallel_gradient[i] - baseline[i]) < 1e-10);
+  const size_t indices[] = {
+      0, ANNO_INPUT_CHANNELS, 2 * (ANNO_INPUT_CHANNELS + 1) + 4,
+      CRF_EMISSION_WEIGHT_COUNT + ANNO_PLUS_START_SINGLE_EXON,
+      CRF_EMISSION_WEIGHT_COUNT + ANNO_PLUS_START_SINGLE_EXON * ANNO_CLASSES +
+          ANNO_PLUS_INTRON,
+      CRF_EMISSION_WEIGHT_COUNT + ANNO_PLUS_INTRON * ANNO_CLASSES};
+  double worst = 0.0;
+  for (size_t i = 0; i < sizeof(indices) / sizeof(indices[0]); ++i) {
+    size_t index = indices[i];
+    double original = parameters[index], step = 1e-5;
+    parameters[index] = original + step;
+    plus = crf__objective(parameters, gradient, &context);
+    parameters[index] = original - step;
+    minus = crf__objective(parameters, gradient, &context);
+    parameters[index] = original;
+    double numeric = (plus - minus) / (2.0 * step);
+    double analytic = baseline[index];
+    worst = fmax(worst, fabs(numeric - analytic));
+    CHECK(fabs(numeric - analytic) < 2e-5);
   }
-  CHECK(tested == 6);
-  CHECK(worst < 5e-2);
-  if (worst >= 5e-2)
-    fprintf(stderr, "gradient relative error %g\n", worst);
-  for (int l = 0; l < u->nlayer; l++) {
-    free(gw[l]);
-    free(gb[l]);
-  }
-  unet_destroy(u);
-  free(x);
-  free(y);
-  free(m);
+  CHECK(worst < 2e-5);
+
+  CrfModel fitted = {0};
+  double initial_parameters[CRF_PARAMETER_COUNT] = {0};
+  double initial_gradient[CRF_PARAMETER_COUNT];
+  double initial_loss = crf__objective(initial_parameters, initial_gradient,
+                                       &context);
+  int status = crf_train(&fitted, &view, &example, 1, 12, 1);
+  CHECK(status == LBFGS_MAX_ITERATIONS || status == LBFGS_CONVERGED ||
+        status == LBFGS_STOPPING_CRITERION);
+  double fitted_parameters[CRF_PARAMETER_COUNT], fitted_gradient[CRF_PARAMETER_COUNT];
+  memcpy(fitted_parameters, fitted.emission_weights,
+         sizeof(fitted.emission_weights));
+  memcpy(fitted_parameters + CRF_EMISSION_WEIGHT_COUNT,
+         fitted.transition_weights, sizeof(fitted.transition_weights));
+  Crf__ObjectiveContext fitted_context = {&view, &example, 1, N, 1, 0};
+  double fitted_loss = crf__objective(fitted_parameters, fitted_gradient,
+                                      &fitted_context);
+  CHECK(isfinite(fitted_loss) && fitted_loss < initial_loss);
 }
 
-/** @brief Longest ORF, stop codons and CDS phase. */
+/**
+ * @brief Verify longest-ORF selection and output behavior without an ORF.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_orf(void) {
   int64_t start = INT64_MAX, end = 0;
   /* frame 2: ATG AAA TAG -> [2,11) */
@@ -681,47 +802,39 @@ static void test_orf(void) {
   fclose(file);
 }
 
-/** @brief Production softmax stays finite and normalised for extreme logits. */
-static void test_softmax(void) {
-  UnetConfig config = unet_default_config();
-  Unet *u = unet_create(&config);
-  Layer *output = &u->layer[u->nlayer - 1];
-  memset(output->w, 0,
-         (size_t)output->in * output->out * output->k * sizeof(float));
-  float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-                         sizeof(float));
-  float p[ANNO_CLASSES];
-  for (int j = 0; j < ANNO_CLASSES; j++)
-    output->b[j] = 1000.0f - (float)j;
-  CHECK(unet_predict_channels(u, input, 1, p) == 0);
-  double sum = 0.0, z = 0.0;
-  for (int j = 0; j < ANNO_CLASSES; j++) {
-    CHECK(isfinite(p[j]));
-    sum += p[j];
-    z += exp(-(double)j);
-  }
-  CHECK(fabs(sum - 1.0) < 1e-6);
-  CHECK(fabs(p[0] - 1.0 / z) < 1e-6 && fabs(p[1] - exp(-1.0) / z) < 1e-6);
-  for (int j = 0; j < ANNO_CLASSES; j++)
-    output->b[j] = -1e30f;
-  CHECK(unet_predict_channels(u, input, 1, p) == 0);
-  CHECK(fabs(p[3] - 1.0 / ANNO_CLASSES) < 1e-6);
-  free(input);
-  unet_destroy(u);
+/**
+ * @brief Verify linear CRF emissions use all seven local input features.
+ * @return None; records failed assertions through CHECK.
+ */
+static void test_crf_emissions(void) {
+  CrfModel model = {0};
+  float features[ANNO_INPUT_CHANNELS] = {1, 0, 2, 0, 0.5f, -1, 2};
+  double scores[ANNO_CLASSES];
+  model.emission_weights[ANNO_INPUT_CHANNELS] = 2.0;
+  model.emission_weights[(size_t)ANNO_PLUS_START_SINGLE_EXON *
+                         (ANNO_INPUT_CHANNELS + 1) + 2] = 3.0;
+  model.transition_weights[ANNO_PLUS_START_SINGLE_EXON] = 0.75;
+  crf_emissions(&model, features, scores);
+  CHECK(scores[ANNO_INTERGENIC] == 2.0);
+  CHECK(scores[ANNO_PLUS_START_SINGLE_EXON] == 6.0);
+  CHECK(isfinite(scores[ANNO_MINUS_INTRON]));
 }
 
-/** @brief Morlet CWT: strand conjugate identity and block independence. */
+/**
+ * @brief Verify CWT strand conjugacy, block independence, and constant-signal response.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_cwt(void) {
   enum { N = 3000 };
-  char *bases = xcalloc(N + 1, 1), *reverse = xcalloc(N + 1, 1);
+  char *bases = anno_xcalloc(N + 1, 1), *reverse = anno_xcalloc(N + 1, 1);
   uint64_t seed = 1;
   for (int i = 0; i < N; i++)
     bases[i] = "ACGT"[random_below(&seed, 4)];
   for (int i = 0; i < N; i++)
-    reverse[i] = complement(bases[N - 1 - i]);
-  float *a = xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
+    reverse[i] = anno_complement(bases[N - 1 - i]);
+  float *a = anno_xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
                      sizeof(float));
-  float *b = xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
+  float *b = anno_xcalloc((size_t)N * ANNO_CWT_CHANNELS * ANNO_COMPLEX_COMPONENTS,
                      sizeof(float));
   anno_cwt(bases, N, 0, N, a);
   anno_cwt(reverse, N, 0, N, b);
@@ -759,65 +872,34 @@ static void test_cwt(void) {
   free(reverse);
 }
 
-/** @brief Short-window predictions ignore values in the padded tail. */
-static void test_padding_mask(void) {
-  enum { N = 137 };
-  size_t input_size = (size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW;
-  float *zero_padded = xcalloc(input_size, sizeof(float));
-  float *noisy_padded = xcalloc(input_size, sizeof(float));
-  float a[N * ANNO_CLASSES], b[N * ANNO_CLASSES];
-  uint64_t seed = 19;
-  for (int ch = 0; ch < ANNO_INPUT_CHANNELS; ++ch)
-    for (int p = 0; p < ANNO_UNET_WINDOW; ++p) {
-      size_t index = (size_t)ch * ANNO_UNET_WINDOW + p;
-      if (p < N) {
-        float value = anno_random_symmetric(&seed);
-        zero_padded[index] = noisy_padded[index] = value;
-      } else {
-        noisy_padded[index] = anno_random_symmetric(&seed);
-      }
-    }
-  Unet *unet = unet_create(&(UnetConfig){
-      .depth = 4, .kernel = 9, .pool = 2, .channels = {16, 32, 64, 128}});
-  CHECK(unet_predict_channels(unet, zero_padded, N, a) == 0);
-  CHECK(unet_predict_channels(unet, noisy_padded, N, b) == 0);
-  CHECK(!memcmp(a, b, sizeof(a)));
-  unet_destroy(unet);
-  free(zero_padded);
-  free(noisy_padded);
-}
 
-/** @brief model round trip and identical predictions. */
+
+/**
+ * @brief Verify CRF model serialization, loading, and legacy-file rejection.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_model_file(void) {
-  UnetConfig config = {
-      .depth = 4, .kernel = 9, .pool = 2, .channels = {16, 32, 64, 128}};
-  Unet *unet = unet_create(&config), *loaded = NULL;
-  const char *path = "test-model.ann";
-  CHECK(unet_save(path, unet) == 0);
-  CHECK(unet_load(path, &loaded) == 0 && loaded);
-  float *input = xcalloc((size_t)ANNO_INPUT_CHANNELS * ANNO_UNET_WINDOW,
-                         sizeof(float));
-  float p[100 * ANNO_CLASSES], q[100 * ANNO_CLASSES];
-  uint64_t seed = 3;
-  for (int c = 0; c < ANNO_INPUT_CHANNELS; c++)
-    for (int i = 0; i < 100; i++)
-      input[(size_t)c * ANNO_UNET_WINDOW + i] = anno_random_unit(&seed);
-  CHECK(unet_predict_channels(unet, input, 100, p) == 0 &&
-        unet_predict_channels(loaded, input, 100, q) == 0);
-  CHECK(!memcmp(p, q, sizeof(p)));
-  for (int i = 0; i < 100; i++) {
-    double sum = 0.0;
-    for (int j = 0; j < ANNO_CLASSES; j++)
-      sum += p[i * ANNO_CLASSES + j];
-    CHECK(fabs(sum - 1.0) < 1e-5);
-  }
-  free(input);
+  CrfModel model = {0}, loaded = {0};
+  const char *path = "test-model.crf";
+  for (size_t i = 0; i < CRF_EMISSION_WEIGHT_COUNT; ++i)
+    model.emission_weights[i] = (double)i / 17.0;
+  for (size_t i = 0; i < CRF_TRANSITION_WEIGHT_COUNT; ++i)
+    model.transition_weights[i] = -(double)i / 23.0;
+  CHECK(crf_save_model(path, &model) == 0);
+  CHECK(crf_load_model(path, &loaded) == 0);
+  CHECK(!memcmp(&model, &loaded, sizeof(model)));
+  FILE *bad = fopen("test-model-bad.crf", "wb");
+  CHECK(bad && fputs("legacy model", bad) >= 0 && fclose(bad) == 0);
+  CHECK(crf_load_model("test-model-bad.crf", &loaded) != 0);
   remove(path);
-  unet_destroy(unet);
-  unet_destroy(loaded);
+  remove("test-model-bad.crf");
 }
 
-/** @brief Whether anno_read_labels() rejects an annotation (runs in a child).
+/**
+ * @brief Check whether anno_read_labels rejects a fixture in a child process.
+ * @param[in] fasta FASTA fixture path.
+ * @param[in] line GFF3 feature line to test.
+ * @return Nonzero when the child exits with an error.
  */
 static int labels_rejected(const char *fasta, const char *line) {
   write_text("test-bad.gff3", line);
@@ -837,7 +919,11 @@ static int labels_rejected(const char *fasta, const char *line) {
   return WIFEXITED(status) && WEXITSTATUS(status) != 0;
 }
 
-/** @brief Invalid annotations are errors. */
+/**
+ * @brief Verify malformed and out-of-range GFF annotations are rejected.
+ * @param[in] fasta FASTA fixture path.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_label_errors(const char *fasta) {
   CHECK(labels_rejected(fasta, "t\ta\texon\t10\t2001\t.\t+\t.\tParent=x\n"));
   CHECK(labels_rejected(fasta, "t\ta\texon\t20\t10\t.\t+\t.\tParent=x\n"));
@@ -846,16 +932,20 @@ static void test_label_errors(const char *fasta) {
   CHECK(!labels_rejected(fasta, "t\ta\texon\t10\t20\t.\t+\t.\tParent=x\n"));
 }
 
-/** @brief Tiny train -> save -> load -> predict pipeline. */
+/**
+ * @brief Exercise CRF training, model I/O, and genome prediction end to end.
+ * @param[in] s Labeled synthetic sequence used as the training and test input.
+ * @return None; records failed assertions through CHECK.
+ */
 static void test_pipeline(AnnoSequence *s) {
-  Unet *unet = train_unet(s, 1, 3, 2);
-  CHECK(unet_save("test-pipeline.ann", unet) == 0);
-  Unet *loaded = NULL;
-  CHECK(unet_load("test-pipeline.ann", &loaded) == 0);
+  CrfModel *model = train_crf(s, 1, 3, 2);
+  CHECK(crf_save_model("test-pipeline.crf", model) == 0);
+  CrfModel loaded = {0};
+  CHECK(crf_load_model("test-pipeline.crf", &loaded) == 0);
   FILE *file = tmpfile();
-  predict_genome(loaded, s, 1, file, NULL);
+  CHECK(file != NULL);
+  predict_genome(&loaded, s, 1, file, NULL);
   char *text = read_text(file);
-  /* every line is a 9-column record of a known type */
   int ok = 1;
   for (char *line = strtok(text, "\n"); line; line = strtok(NULL, "\n")) {
     int tabs = 0;
@@ -866,15 +956,17 @@ static void test_pipeline(AnnoSequence *s) {
   CHECK(ok);
   free(text);
   fclose(file);
-  remove("test-pipeline.ann");
-  unet_destroy(unet);
-  unet_destroy(loaded);
+  remove("test-pipeline.crf");
+  free(model);
 }
 
+/**
+ * @brief Run all unit, regression, round-trip, and pipeline tests.
+ * @return EXIT_SUCCESS when all checks pass; otherwise EXIT_FAILURE.
+ */
 int main(void) {
   AnnoSequence *sequences = test_sequences("test.fasta", "test.gff3");
   test_labels(&sequences[0]);
-  test_strand_swap();
   test_round_trip(&sequences[0]);
   test_single_exons();
   test_nested_transcripts(&sequences[0]);
@@ -885,10 +977,9 @@ int main(void) {
   test_minimum_decode();
   test_utr_intron_edges();
   test_orf();
-  test_softmax();
+  test_crf_emissions();
   test_cwt();
   test_model_file();
-  test_padding_mask();
   test_gradient();
   test_label_errors("test.fasta");
   test_pipeline(sequences);
