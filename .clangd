@@ -1,3 +1,2 @@
 CompileFlags:
-  Add: [-std=c11, -Wall, -Wextra, -Xpreprocessor, -fopenmp, -I/Users/hyunsu.lim/Codes/annotation/src/include, -I/Users/hyunsu.lim/Codes/annotation/src/src, -I/opt/homebrew/opt/libomp/include]
-  Remove: [-fopenmp]
+  Add: [-Wall, -Wextra, -Xpreprocessor, -fopenmp, -I/Users/hyunsu.lim/Codes/annotation/src/include, -I/Users/hyunsu.lim/Codes/annotation/src/src, -I/opt/homebrew/opt/libomp/include]

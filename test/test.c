@@ -1,9 +1,9 @@
 /**
  * @file test.c
- * @brief Unit and pipeline tests for anno. 
+ * @brief Unit and pipeline tests for anno.
  */
-#include "anno_internal.h"
-#include "crf_internal.h"
+#include "../src/include/anno_internal.h"
+#include "../src/include/crf_internal.h"
 
 #include <errno.h>
 #include <math.h>

@@ -129,7 +129,7 @@ def scores(true_positive: int, false_positive: int, false_negative: int) -> Metr
     return precision, recall, f1
 
 
-def set_scores(reference: set[T], query: set[T]) -> Metric:
+def set_scores(reference, query) -> Metric:
     """Score exact set matches, treating each set member as one item."""
     return scores(
         len(reference & query),

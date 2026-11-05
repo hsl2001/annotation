@@ -132,9 +132,9 @@ for _code, _val in zip(b"ACGTacgt", (0, 1, 2, 3, 0, 1, 2, 3)):
     LUT[_code] = _val
 
 
-def parallel_map[T, R](
-    function: Callable[[T], R], items: Iterable[T], threads: int = 1
-) -> Iterator[R]:
+def parallel_map(
+    function: Callable[[Any], Any], items: Iterable[Any], threads: int = 1
+) -> Iterator[Any]:
     """Ordered reduction with at most one outstanding chunk per worker."""
     if threads < 1:
         raise ValueError("threads must be positive")
@@ -143,7 +143,7 @@ def parallel_map[T, R](
         return
     iterator = iter(items)
     with ThreadPoolExecutor(max_workers=threads) as executor:
-        pending: deque[Future[R]] = deque()
+        pending: deque[Future[Any]] = deque()
         for _ in range(threads):
             try:
                 item = next(iterator)
