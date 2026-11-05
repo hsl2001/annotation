@@ -3,6 +3,9 @@
  * @brief utility functions
  */
 
+#ifndef UTILS_C
+#define UTILS_C
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,3 +133,5 @@ char complement(char base) {
   int index = base_index(base);
   return index < 0 ? 'N' : "TGCA"[index];
 }
+
+#endif /* UTILS_C */

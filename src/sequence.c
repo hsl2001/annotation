@@ -2,8 +2,11 @@
  * @file sequence.c
  * @brief FASTA parsing and sequence-records
  */
+#ifndef SEQUENCE_C
+#define SEQUENCE_C
 
-#include "include/surf_internal.h"
+#include "include/surf.h"
+#include "utils.c"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -105,3 +108,5 @@ void free_sequence(Sequence *sequences, int count) {
   }
   free(sequences);
 }
+
+#endif /* SEQUENCE_C */

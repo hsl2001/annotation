@@ -10,10 +10,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define SHORTGRAMMER_MAX_STATES \
+(1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH))
+#define SHORTGRAMMAR_MAX_BACKPOINTERS (2 * STRANDS + 1)
+
 /** Parameters of CRF */
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
 #define TRANSITIONS (CLASSES * CLASSES)
-#define PARAMETERS (EMMISIONS * TRANSITIONS)
+#define PARAMETERS (EMISSIONS * TRANSITIONS)
 #define L2 1e-4
 
 /** Learned emission and transition parameters for the observed classes. */
@@ -25,10 +29,20 @@ typedef struct {
 /** Just one sampled, compact, and position-major feature window */
 typedef struct {
     int64_t length; // Number of labeled positions
-    const uint8_t *base; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other implemations are 0, 1, 2, 3 and -1
+    const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other implemations are 0, 1, 2, 3 and -1
     const float *cwt; // Position-major normalized CWT power array
     const uint8_t *classes; // Observed class labels per position
-} One;
+} Sample;
+
+/** Grammar for genes */
+typedef struct {
+    int count;
+    uint8_t cls[SHORTGRAMMER_MAX_STATES];
+    int backpointers[SHORTGRAMMER_MAX_STATES];
+    int from[SHORTGRAMMER_MAX_STATES][SHORTGRAMMAR_MAX_BACKPOINTERS];
+    int shift[SHORTGRAMMER_MAX_STATES];
+    int bits[SHORTGRAMMER_MAX_STATES];
+} ShortGrammar;
 
 /** Expanede grammar for decoding (includes inner exons) */
 typedef struct {
@@ -50,7 +64,7 @@ void evaluate_emissions(const Model *model, const float *features,
                    double scores[CLASSES]);
 
 /**
- * @brief Optimize a CRF model with L-BFGS over labeled one examples.
+ * @brief Optimize a CRF model with L-BFGS over labeled one samples.
  * @param[in,out] model: Initial model parameters; replaced with the trained parameters on success.
  * @param[in] grammar: Duration-expanded state grammar.
  * @param[in] ones: Sampled labeled training windows.
@@ -59,8 +73,8 @@ void evaluate_emissions(const Model *model, const float *features,
  * @param[in] threads: Number of objective workers.
  * @return An LbfgsStatus value describing convergence or failure.
  */
-int train_model(Model *model, const LongGrammar *grammar,
-              const One *ones, size_t one_count, int iterations,
+int train(Model *model, const LongGrammar *grammar,
+              const Sample *ones, size_t one_count, int iterations,
               int threads);
 
 /**
@@ -68,13 +82,13 @@ int train_model(Model *model, const LongGrammar *grammar,
  * @param[in] model: Model to inspect.
  * @return Nonzero when all parameters are finite.
  */
-int model_is_finite(const Model *model);
+int is_model_finite(const Model *model);
 
 /** Context shared with the CRF objective callback. */
 typedef struct {
   const LongGrammar *grammar;
-  const One *examples;
-  size_t example_count;
+  const Sample *samples;
+  size_t sample_count;
   uint64_t total_length;
   int threads;
   int failure_status;
@@ -88,5 +102,39 @@ typedef struct {
  * @return Objective value, or NaN if evaluation fails.
  */
 double model_objective(const double *x, double *gradient, void *opaque);
+
+/**
+* @brief Build the duration-expanded grammar.
+* @param[out] grammar: Receives the initialized grammar.
+* @return None.
+*/
+void build_grammar(ShortGrammar *grammar);
+
+/**
+ * @brief Fill channel-major one-hot and normalized CWT features.
+ * @param[in] sequence: Sequence bases and length.
+ * @param[in] power: Position-major CWT power values.
+ * @param[in] power_start: Genomic coordinate of the first power row.
+ * @param[in] start: First feature position.
+ * @param[in] valid: Number of valid positions.
+ * @param[out] features: Receives the channel-major feature matrix.
+ * @return None.
+ */
+void compute_features(const Sequence *sequence, const float *power,
+                   int64_t power_start, int64_t start, int64_t valid,
+                   float *features);
+
+/**
+ * @brief Predict sequences, writing GFF3 and optional class bedGraphs.
+ * @param[in] model: Trained CRF model.
+ * @param[in] sequences: Genome sequences to predict.
+ * @param[in] count: Number of sequences.
+ * @param[in,out] gff: Destination GFF3 stream.
+ * @param[in] prefix: Optional bedGraph output prefix, or NULL.
+ * @return Number of genes written.
+ */
+unsigned long predict(const Model *model,
+                             const Sequence *sequences, int count,
+                             FILE *gff, const char *prefix);
 
 #endif /* CRF_H */

@@ -14,7 +14,8 @@
  * @param[in,out] context: Caller-owned evaluation context.
  * @return Objective value, or a non-finite value on failure.
  */
-typedef double *lbfgs_evaluate(const double *x, double *gradient, void *context);
+typedef double (*lbfgs_evaluate)(const double *x, double *gradient, void *context);
+
 /**
  * @brief Receive progress information after an accepted optimizer iteration.
  * @param[in,out] context: Caller-owned progress context.

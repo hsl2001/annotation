@@ -1,9 +1,9 @@
 /**
- * @file intervals.h
+ * @file intervals.c
  * @brief Half-openned genomic intervals
  */
-#ifndef INTERVALS_H
-#define INTERVALS_H
+#ifndef INTERVALS_C
+#define INTERVALS_C
 
 #include "utils.c"
 
@@ -38,12 +38,12 @@ void push_interval(IntervalList *list, int64_t start, int64_t end) {
 
 
 /**
- * @brief Compare intervals by start coordinate and then end coordinate.
+ * @brief Compare intervals by start coordinate and then end coordinate (mainly for sorting).
  * @param[in] a: First interval.
  * @param[in] b: Second interval.
  * @return Negative, zero, or positive comparison result.
  */
-int compare_inverval(const void *a, const void *b) {
+int compare_interval(const void *a, const void *b) {
   const Interval *x = a, *y = b;
   return x->start < y->start   ? -1
          : x->start > y->start ? 1
@@ -51,4 +51,4 @@ int compare_inverval(const void *a, const void *b) {
                                : x->end > y->end;
 }
 
-#endif /* INTERVALS_H */
+#endif /* INTERVALS_C */
