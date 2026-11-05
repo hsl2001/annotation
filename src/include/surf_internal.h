@@ -63,6 +63,7 @@ typedef struct {
 void build_grammar(Grammar *grammar);
 
 // typedef struct Decoder Decoder;
+// TODO: 이거 필요 없지 않나???
 
 /**
  * @brief Report an error and terminate.
@@ -146,6 +147,17 @@ void compute_features(const Sequence *sequence, const float *power,
                    int64_t power_start, int64_t start, int64_t valid,
                    float *features);
 
-
+/**
+ * @brief Predict sequences, writing GFF3 and optional class bedGraphs.
+ * @param[in] model: Trained CRF model.
+ * @param[in] sequences: Genome sequences to predict.
+ * @param[in] count: Number of sequences.
+ * @param[in,out] gff: Destination GFF3 stream.
+ * @param[in] prefix: Optional bedGraph output prefix, or NULL.
+ * @return Number of genes written.
+ */
+unsigned long predict_genome(const Model *model,
+                             const Sequence *sequences, int count,
+                             FILE *gff, const char *prefix);
 
 #endif /* surf_INTERNAL_H */
