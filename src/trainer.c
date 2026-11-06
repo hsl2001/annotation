@@ -77,6 +77,36 @@ static Sample *prepare_samples(const Sequence *sequences,
 }
 
 /**
+ * @brief Validate grammar dimensions, classes, and backpointer indices.
+ * @param[in] grammar: Grammar to inspect.
+ * @return Nonzero when the grammar is structurally valid.
+ */
+static inline int is_grammar_valid(const LongGrammar *grammar) {
+  if (!grammar || grammar->states <= 0 || grammar->max_backpointers < 0 ||
+      !grammar->state_class || !grammar->backpointer_count ||
+      (grammar->max_backpointers > 0 && !grammar->backpointers))
+    return 0;
+  if ((size_t)grammar->states >
+      SIZE_MAX / (size_t)(grammar->max_backpointers
+                              ? grammar->max_backpointers
+                              : 1))
+    return 0;
+  for (int state = 0; state < grammar->states; ++state) {
+    if (grammar->state_class[state] > MINUS_INTERNAL_EXON ||
+        grammar->backpointer_count[state] > grammar->max_backpointers)
+      return 0;
+    for (int edge = 0; edge < grammar->backpointer_count[state]; ++edge) {
+      int predecessor =
+          grammar->backpointers[(size_t)state * grammar->max_backpointers +
+                                (size_t)edge];
+      if (predecessor < 0 || predecessor >= grammar->states)
+        return 0;
+    }
+  }
+  return 1;
+}
+
+/**
  * @brief Release a set of training samples and all owned feature buffers.
  * @param[in,out] samples: samples to destroy; NULL is accepted.
  * @param[in] count: Number of samples.
@@ -114,15 +144,44 @@ LongGrammar long2short(const ShortGrammar *grammar, uint8_t *classes,
                       counts, backpointers};
 }
 
+int workspace_plan(size_t length, size_t states, size_t requested_block,
+                   WorkspacePlan *plan);
+
+static inline int is_sample_valid(const Sample *sample,
+                                  const LongGrammar *grammar) {
+  if (!sample || !grammar || sample->length < 0)
+    return 0;
+  if (sample->length == 0)
+    return 1;
+  if (!sample->bases || !sample->cwt || !sample->classes)
+    return 0;
+  if ((uint64_t)sample->length >
+          SIZE_MAX / sizeof(float) / CWT_CHANNELS ||
+      (uint64_t)sample->length > SIZE_MAX / sizeof(uint8_t))
+    return 0;
+  WorkspacePlan plan;
+  if (!workspace_plan((size_t)sample->length, (size_t)grammar->states, 0,
+                      &plan))
+    return 0;
+  for (int64_t position = 0; position < sample->length; ++position) {
+    if (sample->classes[position] > MINUS_INTERNAL_EXON ||
+        sample->bases[position] > NUCLEOTIDES)
+      return 0;
+  }
+  return 1;
+}
+
 int train(Model *model, const LongGrammar *grammar,
               const Sample *samples, size_t sample_count, int iterations,
               int threads) {
-  if (!model || !samples || !sample_count ||
+  if (!model || !is_grammar_valid(grammar) || !samples || !sample_count ||
       iterations < 1 || threads < 1 || !is_model_finite(model) ||
       PARAMETERS > SIZE_MAX / sizeof(double))
     return LBFGS_INVALID_ARGUMENT;
   uint64_t total_length = 0;
   for (size_t i = 0; i < sample_count; ++i) {
+    if (!is_sample_valid(&samples[i], grammar))
+      return LBFGS_INVALID_ARGUMENT;
     const uint64_t length = (uint64_t)samples[i].length;
     if (length > UINT64_MAX - total_length) return LBFGS_INVALID_ARGUMENT;
     total_length += length;
