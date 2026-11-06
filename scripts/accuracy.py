@@ -162,6 +162,46 @@ def locus_keys(models: dict[str, TranscriptModel]) -> set[tuple[str, str, int, i
     }
 
 
+def annotation_regions(models: dict[str, TranscriptModel]) -> dict[str, Span]:
+    """Return the coordinate bounds covered by annotations on each sequence."""
+    regions: dict[str, Span] = {}
+    for _, sequence_id, _, spans in models.values():
+        start = min(span_start for span_start, _ in spans)
+        end = max(span_end for _, span_end in spans)
+        previous = regions.get(sequence_id)
+        if previous is None:
+            regions[sequence_id] = (start, end)
+        else:
+            regions[sequence_id] = (
+                min(start, previous[0]),
+                max(end, previous[1]),
+            )
+    return regions
+
+
+def restrict_models(
+    models: dict[str, TranscriptModel], regions: dict[str, Span]
+) -> dict[str, TranscriptModel]:
+    """Keep only model spans within the reference annotation regions."""
+    restricted: dict[str, TranscriptModel] = {}
+    for transcript_id, (gene_id, sequence_id, strand, spans) in models.items():
+        region = regions.get(sequence_id)
+        if region is None:
+            continue
+        start, end = region
+        filtered_spans = [
+            span for span in spans if start <= span[0] and span[1] <= end
+        ]
+        if filtered_spans:
+            restricted[transcript_id] = (
+                gene_id,
+                sequence_id,
+                strand,
+                filtered_spans,
+            )
+    return restricted
+
+
 def merge_intervals(
     models: dict[str, TranscriptModel],
 ) -> dict[tuple[str, str], list[Span]]:
@@ -218,8 +258,13 @@ def nucleotide_scores(
 
 
 def metrics(reference_path: str | Path, query_path: str | Path) -> dict[str, Metric]:
-    """Calculate feature-segment, locus, and nucleotide metrics."""
+    """Calculate metrics within the coordinate range covered by the reference."""
     reference, query = read_models(reference_path), read_models(query_path)
+    regions = annotation_regions(reference["exon"])
+    query = {
+        feature: restrict_models(models, regions)
+        for feature, models in query.items()
+    }
     result = {
         f"{feature}-segment": set_scores(
             segment_keys(reference[feature]), segment_keys(query[feature])
