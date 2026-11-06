@@ -108,16 +108,6 @@ typedef struct {
  */
 double model_objective(const double *x, double *gradient, void *opaque);
 
-/** Dense partition storage size and optional row-chunk dimensions. */
-typedef struct {
-  size_t block_length;
-  size_t blocks;
-  size_t bytes;
-} WorkspacePlan;
-
-int workspace_plan(size_t length, size_t states, size_t requested_block,
-                   WorkspacePlan *plan);
-
 /**
  * @brief Build the duration-expanded grammar.
  * @param[out] grammar: Receives the initialized grammar.

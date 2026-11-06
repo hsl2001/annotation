@@ -63,6 +63,15 @@ static void prepare_samples_destroy(Sample *samples, size_t count) {
   free(samples);
 }
 
+static size_t workspace_size(size_t length, size_t states) {
+  const size_t max_cells = SIZE_MAX / sizeof(double);
+  if (!length || !states || states > max_cells / 2 ||
+      length > (max_cells - 2 * states) / (states + CLASSES + TRANSITIONS))
+    return 0;
+  return (length * (states + CLASSES + TRANSITIONS) + 2 * states) *
+         sizeof(double);
+}
+
 static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
   if (sample->length < 0)
     return 0;
@@ -71,8 +80,7 @@ static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
   if (!sample->bases || !sample->cwt || !sample->classes ||
       (uint64_t)sample->length > SIZE_MAX / sizeof(float) / CWT_CHANNELS)
     return 0;
-  WorkspacePlan plan;
-  if (!workspace_plan((size_t)sample->length, (size_t)grammar->count, 0, &plan))
+  if (!workspace_size((size_t)sample->length, (size_t)grammar->count))
     return 0;
   for (int64_t position = 0; position < sample->length; ++position)
     if (sample->classes[position] >= CLASSES ||
@@ -270,24 +278,6 @@ int compute_transitions(const double *bias, const double *pwm,
   return 1;
 }
 
-int workspace_plan(size_t length, size_t states, size_t requested_block,
-                   WorkspacePlan *plan) {
-  if (!length || !states || !plan)
-    return 0;
-  const size_t max_cells = SIZE_MAX / sizeof(double);
-  if (states > max_cells / 2 ||
-      length > (max_cells - 2 * states) / (states + CLASSES + TRANSITIONS))
-    return 0;
-  size_t block = requested_block ? requested_block : length;
-  if (block > length)
-    block = length;
-  *plan =
-      (WorkspacePlan){block, (length - 1) / block + 1,
-                      (length * (states + CLASSES + TRANSITIONS) + 2 * states) *
-                          sizeof(double)};
-  return 1;
-}
-
 static int forward_row(const Grammar *grammar, const double *emission,
                        const double *transition, const double *previous,
                        double *row, int observed, int initial) {
@@ -322,10 +312,10 @@ static int sample_objective(const double *parameters, const Grammar *grammar,
                             const Sample *sample, double *gradient,
                             double *objective) {
   size_t states = (size_t)grammar->count, length = (size_t)sample->length;
-  WorkspacePlan plan;
-  if (!workspace_plan(length, states, 0, &plan))
+  size_t bytes = workspace_size(length, states);
+  if (!bytes)
     return 0;
-  double *work = malloc(plan.bytes);
+  double *work = malloc(bytes);
   if (!work)
     return -1;
   double *alpha = work, *emissions = alpha + length * states;

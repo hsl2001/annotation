@@ -13,10 +13,11 @@
 #include <string.h>
 
 /** Morlet scales of the CWT channels. */
-static const int cwt_scales[CWT_CHANNELS] = {3, 4, 5};
+enum { CWT_MAX_SCALE = 5 };
+static const int cwt_scales[CWT_CHANNELS] = {3, 4, CWT_MAX_SCALE};
 
 static void transform(const char *bases, int64_t length, int64_t start,
-                      int64_t end, float *out, int power) {
+                      int64_t end, float *out) {
   static const double complex signal[NUCLEOTIDES] = {1.0 + I, -1.0 + I,
                                                      -1.0 - I, 1.0 - I};
   static const double nodes[8] = {0.09501250983763744, 0.2816035507792589,
@@ -30,14 +31,14 @@ static void transform(const char *bases, int64_t length, int64_t start,
   if (start >= end || start < 0 || end > length)
     return;
   int width[CWT_CHANNELS];
-  const int max_width = 4 * CWT_RADIUS * cwt_scales[CWT_CHANNELS - 1] + 3;
+
   const double support = 2.0 * CWT_RADIUS;
   const double omega2 = MORLET_CENTRAL * MORLET_CENTRAL;
   const double correction = exp(-0.5 * omega2);
   const double normalization =
       1.0 /
       sqrt(sqrt(acos(-1.0)) * (1.0 + exp(-omega2) - 2.0 * exp(-0.75 * omega2)));
-  double complex kernel[CWT_CHANNELS][max_width];
+  double complex kernel[CWT_CHANNELS][4 * CWT_RADIUS * CWT_MAX_SCALE + 3];
   for (int s = 0; s < CWT_CHANNELS; s++) {
     double scale = cwt_scales[s];
     width[s] = 4 * CWT_RADIUS * cwt_scales[s] + 3;
@@ -76,24 +77,15 @@ static void transform(const char *bases, int64_t length, int64_t start,
       }
       float real = (float)creal(coefficient), imag = (float)cimag(coefficient);
       size_t index = (size_t)(position - start) * CWT_CHANNELS + (size_t)s;
-      if (power)
-        out[index] = real * real + imag * imag;
-      else {
-        out[2 * index] = real;
-        out[2 * index + 1] = imag;
-      }
+      out[index] = real * real + imag * imag;
+
     }
   }
 }
 
-void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
-         float *out) {
-  transform(bases, length, start, end, out, 0);
-}
-
 void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
                float *out) {
-  transform(bases, length, start, end, out, 1);
+  transform(bases, length, start, end, out);
 }
 
 void compute_features(char base, const float *power, float *features) {

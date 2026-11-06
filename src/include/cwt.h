@@ -15,19 +15,6 @@
    CWT_CHANNELS) // Number of input channels !!3 is for CWT_CHANNELS
 
 /**
- * @brief Morlet CWT of the complex base signal for positions [start,end).
- * @param[in] bases: Input sequence bases.
- * @param[in] length: Total sequence length.
- * @param[in] start: First position, inclusive.
- * @param[in] end: Last position, exclusive.
- * @param[out] out: Receives tensor of (end-start) x CWT_CHANNELS x 2 floats
- * (real, imaginary).
- * @return None.
- */
-void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
-         float *out);
-
-/**
  * @brief Compute CWT power in position-major layout.
  * @param[in] bases Sequence bases.
  * @param[in] length Total sequence length.

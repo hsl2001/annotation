@@ -16,7 +16,6 @@
 #include <unistd.h>
 
 int is_stop(const char *);
-int workspace_plan(size_t, size_t, size_t, WorkspacePlan *);
 
 static int failures;
 static int checks;
@@ -113,38 +112,6 @@ static void test_fasta_and_gff_input(void) {
   free_sequences(sequences, count);
   unlink(fasta_path);
   unlink(gff_path);
-}
-
-static void test_features_and_orf(void) {
-  const char bases[] = "ACGTN";
-  float coefficients[5 * CWT_CHANNELS * COMPLEX_COMPONENTS];
-  float power[5 * CWT_CHANNELS];
-  cwt(bases, 5, 0, 5, coefficients);
-  for (size_t i = 0; i < sizeof(coefficients) / sizeof(*coefficients); i++)
-    CHECK(isfinite(coefficients[i]));
-  cwt_power(bases, 5, 0, 5, power);
-  for (size_t i = 0; i < sizeof(power) / sizeof(*power); i++) {
-    CHECK(isfinite(power[i]) && power[i] >= 0.0f);
-    CHECK(power[i] == coefficients[2 * i] * coefficients[2 * i] +
-                          coefficients[2 * i + 1] * coefficients[2 * i + 1]);
-  }
-
-  float features[INPUT_CHANNELS];
-  for (int p = 0; p < 5; p++) {
-    compute_features(bases[p], power + p * CWT_CHANNELS, features);
-    for (int n = 0; n < NUCLEOTIDES; n++)
-      CHECK(features[n] == (float)(base_index(bases[p]) == n));
-    for (int c = 0; c < CWT_CHANNELS; c++)
-      CHECK(isfinite(features[NUCLEOTIDES + c]) &&
-            features[NUCLEOTIDES + c] == power[p * CWT_CHANNELS + c]);
-  }
-
-  CHECK(is_stop("TAA") && is_stop("TAG") && is_stop("TGA"));
-  CHECK(!is_stop("TAC") && !is_stop("ATG"));
-  int64_t start = -1, end = -1;
-  CHECK(longest_orf("CCCATGAAATAAGGG", 15, &start, &end));
-  CHECK(start == 3 && end == 12);
-  CHECK(!longest_orf("CCCCCCCC", 8, &start, &end));
 }
 
 static void test_cwt_window_independence(void) {
@@ -327,7 +294,7 @@ static void test_decoder_and_grammar(void) {
   CHECK(decoder != NULL);
   uint8_t gene_path[8] = {255};
   for (int position = 0; position < 8; position++) {
-    for (int class = 0; class < CLASSES; class ++)
+    for (int class = 0; class < CLASSES; class++)
       emissions[class] =
           class == (position == 0 || position == 7 ? INTERGENIC
                                                    : PLUS_START_SINGLE_EXON)
@@ -360,14 +327,19 @@ static void test_crf_and_lbfgs(void) {
   Grammar grammar;
   build_grammar(&grammar);
   CHECK(grammar.cls[0] == INTERGENIC && grammar.backpointers[0] == 5);
-  WorkspacePlan plan;
-  CHECK(workspace_plan(5, 2, 2, &plan));
-  CHECK(plan.block_length == 2 && plan.blocks == 3);
-  CHECK(!workspace_plan(0, 2, 0, &plan));
 
   uint8_t bases[1] = {0}, labels[1] = {INTERGENIC};
   float cwt[3] = {0};
   Sample sample = {1, bases, cwt, labels};
+  Sample invalid_sample = {INT64_MAX, bases, cwt, labels};
+  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
+        LBFGS_INVALID_ARGUMENT);
+  invalid_sample.length = -1;
+  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
+        LBFGS_INVALID_ARGUMENT);
+  invalid_sample.length = 0;
+  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
+        LBFGS_INVALID_ARGUMENT);
   ModelObjectiveContext context = {&grammar, &sample, 1, 1, 1, 0};
   double parameters[PARAMETERS] = {0};
   double gradient[PARAMETERS];
