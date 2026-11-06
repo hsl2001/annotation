@@ -24,7 +24,7 @@
  * @brief Prepare samples with window-local feature normalization.
  * @param[in] sequences: Input sequences with per-base labels.
  * @param[in] sequence_count: Number of input sequences.
- * @param[out] sample_count: Receives the number of prepared sequences.
+ * @param[out] sample_count: Receives the number of feature-window samples.
  * @return Allocated samples and their owned feature arrays.
  */
 static Sample *prepare_samples(const Sequence *sequences,
@@ -32,29 +32,36 @@ static Sample *prepare_samples(const Sequence *sequences,
                                          size_t *sample_count) {
   if (sequence_count < 1)
     bye("no sequences to train CRF");
-  size_t count = (size_t)sequence_count;
+  size_t count = 0;
+  for (int s = 0; s < sequence_count; ++s) {
+    if (sequences[s].length < 1)
+      bye("sequence %s has no labels", sequences[s].name);
+    size_t windows = 1 + ((size_t)sequences[s].length - 1) /
+                             FEATURE_WINDOW;
+    if (count > SIZE_MAX - windows)
+      bye("too many training samples");
+    count += windows;
+  }
   Sample *samples = scalloc(count, sizeof(*samples));
   float *input = scalloc((size_t)INPUT_CHANNELS * FEATURE_WINDOW,
                               sizeof(*input));
   float *power = scalloc((size_t)FEATURE_WINDOW * CWT_CHANNELS,
                               sizeof(*power));
+  size_t sample_index = 0;
   for (int s = 0; s < sequence_count; ++s) {
     const Sequence *sequence = &sequences[s];
     if (!sequence->labels || sequence->length < 1)
       bye("sequence %s has no labels", sequence->name);
-    if ((uint64_t)sequence->length > SIZE_MAX)
-      bye("sequence %s is too long", sequence->name);
-    size_t positions = (size_t)sequence->length;
-    size_t cwt_count = smul(positions, CWT_CHANNELS);
-    uint8_t *bases = scalloc(positions, sizeof(*bases));
-    float *cwt = scalloc(cwt_count, sizeof(*cwt));
-    uint8_t *labels = scalloc(positions, sizeof(*labels));
-    memcpy(labels, sequence->labels, positions * sizeof(*labels));
-    samples[s] = (Sample){sequence->length, bases, cwt, labels};
     for (int64_t start = 0; start < sequence->length;) {
       int64_t length = sequence->length - start;
       if (length > FEATURE_WINDOW)
         length = FEATURE_WINDOW;
+      size_t positions = (size_t)length;
+      uint8_t *bases = scalloc(positions, sizeof(*bases));
+      float *cwt = scalloc(smul(positions, CWT_CHANNELS), sizeof(*cwt));
+      uint8_t *labels = scalloc(positions, sizeof(*labels));
+      memcpy(labels, sequence->labels + start, positions * sizeof(*labels));
+      samples[sample_index] = (Sample){length, bases, cwt, labels};
       cwt_power(sequence->bases, sequence->length, start, start + length, power);
       memset(input, 0, (size_t)INPUT_CHANNELS * FEATURE_WINDOW *
                           sizeof(*input));
@@ -62,11 +69,12 @@ static Sample *prepare_samples(const Sequence *sequences,
       for (size_t p = 0; p < (size_t)length; ++p) {
         size_t position = (size_t)start + p;
         int base = base_index(sequence->bases[position]);
-        bases[position] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
+        bases[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
         for (int c = 0; c < CWT_CHANNELS; ++c)
-          cwt[position * CWT_CHANNELS + (size_t)c] =
+          cwt[p * CWT_CHANNELS + (size_t)c] =
               input[(size_t)(NUCLEOTIDES + c) * FEATURE_WINDOW + p];
       }
+      sample_index++;
       start += length;
     }
   }
@@ -147,6 +155,10 @@ LongGrammar long2short(const ShortGrammar *grammar, uint8_t *classes,
 int workspace_plan(size_t length, size_t states, size_t requested_block,
                    WorkspacePlan *plan);
 
+static void *training_progress(void *opaque, int iteration, double objective,
+                               double step, int line_search_trials, size_t n,
+                               const double *gradient);
+
 static inline int is_sample_valid(const Sample *sample,
                                   const LongGrammar *grammar) {
   if (!sample || !grammar || sample->length < 0)
@@ -197,9 +209,9 @@ int train(Model *model, const LongGrammar *grammar,
   ModelObjectiveContext context = {grammar, samples, sample_count,
                                    total_length, threads, 0};
   int completed = 0;
-  LbfgsStatus status = lbfgs_minimize(PARAMETERS, parameters,
-                                     model_objective, NULL, &context, iterations,
-                                     &completed);
+  LbfgsStatus status = lbfgs_minimize(
+      PARAMETERS, parameters, model_objective, training_progress, &context,
+      iterations, &completed);
   if (status == LBFGS_NONFINITE && context.failure_status)
     status = (LbfgsStatus)context.failure_status;
   if (status == LBFGS_MAX_ITERATIONS || status == LBFGS_CONVERGED ||
@@ -209,6 +221,19 @@ int train(Model *model, const LongGrammar *grammar,
            sizeof(model->transition_weights));
   }
   return (int)status;
+}
+
+static void *training_progress(void *opaque, int iteration, double objective,
+                               double step, int line_search_trials, size_t n,
+                               const double *gradient) {
+  (void)opaque;
+  (void)step;
+  (void)line_search_trials;
+  (void)n;
+  (void)gradient;
+  if (iteration % 10 == 0)
+    cry("CRF L-BFGS iteration %d: objective %.9g", iteration, objective);
+  return NULL;
 }
 
 Model *train_pipeline(const Sequence *sequences, int count,
@@ -346,10 +371,9 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
     const int state_class = grammar->state_class[s];
     const int class = model_class(state_class);
     double value = -INFINITY;
-    if ((!gold_only || state_class == sample->classes[t])) {
+    if (!gold_only || state_class == sample->classes[t]) {
       if (t == 0) {
-        if (s == 0)
-          value = emission[class];
+        value = emission[class];
       } else {
         for (int k = 0; k < grammar->backpointer_count[s]; ++k) {
           const int p = grammar->backpointers[(size_t)s *
@@ -436,12 +460,11 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
   }
   double terminal = -INFINITY;
   for (size_t s = 0; s < states; ++s)
-    if (s==0)
-      terminal = logadd(terminal, previous[s]);
+    terminal = logadd(terminal, previous[s]);
   if (!isfinite(terminal) || !isfinite(log_scale + terminal)) goto nonfinite;
   *log_z_out = log_scale + terminal;
   for (size_t s = 0; s < states; ++s)
-    beta[s] = s == 0 ? -terminal : -INFINITY;
+    beta[s] = -terminal;
 
   for (size_t b = plan.blocks; b-- > 0;) {
     const size_t start = b * block;
