@@ -3,12 +3,17 @@
  * @brief Duration grammar construction for CRF training and decoding.
  */
 #include "include/crf.h"
+#include "include/cwt.h"
+#include "include/surf.h"
+#include "include/utils.h"
 
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <zlib.h>
 
 /**
  * @brief Add an incoming edge to a grammar state.
@@ -17,9 +22,9 @@
  * @param[in] to Destination state index.
  * @return None.
  */
-static void grammar_edge(ShortGrammar *grammar, int from, int to) {
+static void grammar_edge(Grammar *grammar, int from, int to) {
   int edge = grammar->backpointers[to]++;
-  if (edge >= SHORTGRAMMAR_MAX_BACKPOINTERS)
+  if (edge >= GRAMMAR_MAX_BACKPOINTERS)
     abort();
   grammar->from[to][edge] = from;
 }
@@ -31,7 +36,7 @@ static void grammar_edge(ShortGrammar *grammar, int from, int to) {
  * @param[in] length Number of states in the chain.
  * @return Index of the first state in the chain.
  */
-static int grammar_chain(ShortGrammar *grammar, uint8_t class, int length) {
+static int grammar_chain(Grammar *grammar, uint8_t class, int length) {
   int head = grammar->count;
   for (int i = 0; i < length; ++i) {
     grammar->cls[grammar->count] = class;
@@ -52,7 +57,7 @@ static int grammar_chain(ShortGrammar *grammar, uint8_t class, int length) {
  * @param[out] grammar Grammar to initialize.
  * @return None.
  */
-void build_grammar(ShortGrammar *grammar) {
+void build_grammar(Grammar *grammar) {
   memset(grammar, 0, sizeof(*grammar));
   int intergenic = grammar_chain(grammar, INTERGENIC, 1);
   for (int strand = 0; strand < STRANDS; ++strand) {
@@ -83,7 +88,7 @@ void build_grammar(ShortGrammar *grammar) {
 }
 
 struct Decoder {
-  ShortGrammar grammar;
+  Grammar grammar;
   int64_t length;
   int64_t position;
   double *previous;
@@ -120,7 +125,7 @@ void decoder_destroy(Decoder *decoder) {
 
 void decoder_step(Decoder *decoder, const double *emission,
                   const double *transition) {
-  const ShortGrammar *grammar = &decoder->grammar;
+  const Grammar *grammar = &decoder->grammar;
   int64_t position = decoder->position++;
   if (!position) {
     for (int state = 0; state < grammar->count; ++state)
@@ -161,7 +166,7 @@ void decoder_step(Decoder *decoder, const double *emission,
 }
 
 int decoder_finish(Decoder *decoder, uint8_t *path) {
-  const ShortGrammar *grammar = &decoder->grammar;
+  const Grammar *grammar = &decoder->grammar;
   if (decoder->position != decoder->length || !isfinite(decoder->previous[0]))
     return ERANGE;
   int state = 0;
@@ -177,30 +182,15 @@ int decoder_finish(Decoder *decoder, uint8_t *path) {
   return state == 0 ? 0 : ERANGE;
 }
 
-#define _POSIX_C_SOURCE 200809L
-#include "include/surf.h"
-#include "include/utils.h"
-#include <errno.h>
-#include <stdlib.h>
-#include <string.h>
-#include <zlib.h>
-typedef struct {
-  int64_t start, end;
-} LabelSegment;
 typedef struct {
   char *parent;
   int sequence;
   char strand;
-  LabelSegment *exons;
-  int count, capacity;
+  IntervalList exons;
   int64_t orf_length;
 } LabelTranscript;
 static void label_fail(const char *path, long line, const char *message) {
   bye("%s:%ld: %s", path, line, message);
-}
-static int label_segment_compare(const void *a, const void *b) {
-  const LabelSegment *x = a, *y = b;
-  return x->start < y->start ? -1 : x->start > y->start;
 }
 static LabelTranscript *label_get_transcript(LabelTranscript **items,
                                              int *count, int *capacity,
@@ -215,15 +205,9 @@ static LabelTranscript *label_get_transcript(LabelTranscript **items,
     *items = srealloc(*items, (size_t)*capacity, sizeof(**items));
   }
   LabelTranscript *t = &(*items)[(*count)++];
-  *t = (LabelTranscript){sstrdup(parent), sequence, strand, NULL, 0, 0, 0};
+  *t = (LabelTranscript){
+      .parent = sstrdup(parent), .sequence = sequence, .strand = strand};
   return t;
-}
-static void label_add_segment(LabelTranscript *t, int64_t start, int64_t end) {
-  if (t->count == t->capacity) {
-    t->capacity = t->capacity ? t->capacity * 2 : 8;
-    t->exons = srealloc(t->exons, (size_t)t->capacity, sizeof(*t->exons));
-  }
-  t->exons[t->count++] = (LabelSegment){start, end};
 }
 static int label_transcript_compare(const void *a, const void *b) {
   const LabelTranscript *x = a, *y = b;
@@ -232,18 +216,8 @@ static int label_transcript_compare(const void *a, const void *b) {
                                          : 0;
 }
 static void label_set_orf_length(LabelTranscript *t, const Sequence *s) {
-  int64_t length = 0;
-  for (int i = 0; i < t->count; ++i)
-    length += t->exons[i].end - t->exons[i].start;
-  char *transcript = scalloc((size_t)length + 1, 1);
-  int64_t at = 0;
-  int plus = t->strand == '+';
-  for (int i = 0; i < t->count; ++i) {
-    const LabelSegment *e = &t->exons[plus ? i : t->count - 1 - i];
-    for (int64_t p = 0; p < e->end - e->start; ++p)
-      transcript[at++] =
-          plus ? s->bases[e->start + p] : complement(s->bases[e->end - 1 - p]);
-  }
+  int64_t length;
+  char *transcript = splice_sequence(s, &t->exons, t->strand, &length);
   int64_t start = INT64_MAX, end = 0;
   t->orf_length =
       longest_orf(transcript, length, &start, &end) ? end - start : 0;
@@ -306,16 +280,17 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     char *parent = label_parent_id(fields[8]);
     if (!parent)
       label_fail(path, line_number, "exon without Parent");
-    label_add_segment(label_get_transcript(&transcripts, &transcript_count,
-                                           &transcript_capacity, parent,
-                                           sequence, strand),
-                      start - 1, finish);
+    LabelTranscript *t =
+        label_get_transcript(&transcripts, &transcript_count,
+                             &transcript_capacity, parent, sequence, strand);
+    push_interval(&t->exons, start - 1, finish);
   }
   if (gzclose(input) != Z_OK)
     bye("cannot read annotation %s", path);
   for (int i = 0; i < transcript_count; ++i) {
     LabelTranscript *t = &transcripts[i];
-    qsort(t->exons, (size_t)t->count, sizeof(*t->exons), label_segment_compare);
+    qsort(t->exons.items, (size_t)t->exons.count, sizeof(*t->exons.items),
+          compare_interval);
     label_set_orf_length(t, &sequences[t->sequence]);
   }
   qsort(transcripts, (size_t)transcript_count, sizeof(*transcripts),
@@ -326,23 +301,24 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     if (!s->labels)
       s->labels = scalloc((size_t)s->length, sizeof(*s->labels));
     int conflict = 0;
-    for (int e = 0; e < t->count && !conflict; ++e)
-      for (int64_t p = t->exons[e].start; p < t->exons[e].end; ++p)
+    for (int e = 0; e < t->exons.count && !conflict; ++e)
+      for (int64_t p = t->exons.items[e].start; p < t->exons.items[e].end; ++p)
         if (s->labels[p]) {
           conflict = 1;
           break;
         }
     if (conflict) {
       free(t->parent);
-      free(t->exons);
+      free(t->exons.items);
       continue;
     }
     int plus = t->strand == '+';
-    int first = plus ? 0 : t->count - 1, last = plus ? t->count - 1 : 0;
-    for (int e = 0; e < t->count; ++e) {
-      LabelSegment exon = t->exons[e];
+    int first = plus ? 0 : t->exons.count - 1;
+    int last = plus ? t->exons.count - 1 : 0;
+    for (int e = 0; e < t->exons.count; ++e) {
+      Interval exon = t->exons.items[e];
       uint8_t class =
-          t->count == 1 ? (plus ? PLUS_START_SINGLE_EXON : MINUS_END_EXON)
+          t->exons.count == 1 ? (plus ? PLUS_START_SINGLE_EXON : MINUS_END_EXON)
           : e == first
               ? (plus ? PLUS_START_SINGLE_EXON : MINUS_START_SINGLE_EXON)
           : e == last ? (plus ? PLUS_END_EXON : MINUS_END_EXON)
@@ -351,20 +327,15 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
         s->labels[p] = class;
     }
     uint8_t intron = plus ? PLUS_INTRON : MINUS_INTRON;
-    for (int e = 0; e + 1 < t->count; ++e)
-      for (int64_t p = t->exons[e].end; p < t->exons[e + 1].start; ++p)
+    for (int e = 0; e + 1 < t->exons.count; ++e)
+      for (int64_t p = t->exons.items[e].end; p < t->exons.items[e + 1].start;
+           ++p)
         s->labels[p] = intron;
     free(t->parent);
-    free(t->exons);
+    free(t->exons.items);
   }
   free(transcripts);
 }
-#include "include/cwt.h"
-#include "include/utils.h"
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 static const char *const prediction_class_names[CLASSES + 2] = {
     "intergenic",   "plus_start_single_exon",  "plus_end_exon",
     "plus_intron",  "minus_start_single_exon", "minus_end_exon",
@@ -420,27 +391,22 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
     Decoder *d = decoder_create(s->length);
     for (int c = 0; c < CLASSES; c++)
       b.value[c] = -1;
-    float *input = scalloc((size_t)INPUT_CHANNELS * CWT_WINDOW, sizeof(*input)),
-          *power = scalloc((size_t)CWT_WINDOW * CWT_CHANNELS, sizeof(*power));
+    float *power = scalloc((size_t)CWT_WINDOW * CWT_CHANNELS, sizeof(*power));
     int64_t windows = (s->length + CWT_WINDOW - 1) / CWT_WINDOW;
     for (int64_t w = 0; w < windows; w++) {
       int64_t start = w * CWT_WINDOW, valid = s->length - start < CWT_WINDOW
                                                   ? s->length - start
                                                   : CWT_WINDOW;
       cwt_power(s->bases, s->length, start, start + valid, power);
-      memset(input, 0, (size_t)INPUT_CHANNELS * (size_t)valid * sizeof(*input));
-      compute_features(s, power, start, start, valid, input);
       for (int64_t p = 0; p < valid; p++) {
         float row[INPUT_CHANNELS];
         double scores[CLASSES];
-        for (int c = 0; c < INPUT_CHANNELS; c++)
-          row[c] = input[(size_t)c * (size_t)valid + p];
+        compute_features(s->bases[start + p], power + p * CWT_CHANNELS, row);
         compute_emissions(model, row, scores);
         prediction_add(&b, s->name, start + p, scores);
         decoder_step(d, scores, model->transition_weights);
       }
     }
-    free(input);
     free(power);
     for (int c = 0; c < CLASSES; c++)
       if (b.files[c])

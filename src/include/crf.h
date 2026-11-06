@@ -10,9 +10,9 @@
 
 #include <stdint.h>
 
-#define SHORTGRAMMER_MAX_STATES                                                \
+#define GRAMMAR_MAX_STATES                                                     \
   (1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH))
-#define SHORTGRAMMAR_MAX_BACKPOINTERS (2 * STRANDS + 1)
+#define GRAMMAR_MAX_BACKPOINTERS (2 * STRANDS + 1)
 
 /** Parameters of CRF */
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
@@ -35,28 +35,17 @@ typedef struct {
   int64_t length;       // Number of labeled positions
   const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other
                         // implemations are 0, 1, 2, 3 and -1
-  const float *cwt;     // Position-major normalized CWT power array
+  const float *cwt;     // Position-major CWT power array
   const uint8_t *classes; // Observed class labels per position
 } Sample;
 
 /** Grammar for genes */
 typedef struct {
   int count;
-  uint8_t cls[SHORTGRAMMER_MAX_STATES];
-  int backpointers[SHORTGRAMMER_MAX_STATES];
-  int from[SHORTGRAMMER_MAX_STATES][SHORTGRAMMAR_MAX_BACKPOINTERS];
-  int shift[SHORTGRAMMER_MAX_STATES];
-  int bits[SHORTGRAMMER_MAX_STATES];
-} ShortGrammar;
-
-/** Expanede grammar for decoding (includes inner exons) */
-typedef struct {
-  int states;                       // Number of expanded states
-  const uint8_t *state_class;       // Observed class emitted by each state
-  int max_backpointers;             // Row stride for backpointer array
-  const uint8_t *backpointer_count; // Incoming-edge per state
-  const int *backpointers;          // Flattened state-major backpointer indcies
-} LongGrammar;
+  uint8_t cls[GRAMMAR_MAX_STATES];
+  int backpointers[GRAMMAR_MAX_STATES];
+  int from[GRAMMAR_MAX_STATES][GRAMMAR_MAX_BACKPOINTERS];
+} Grammar;
 
 typedef struct Decoder Decoder;
 
@@ -74,7 +63,7 @@ void compute_emissions(const Model *model, const float *features,
  * @param[in] threads: Number of objective workers.
  * @return An LbfgsStatus value describing convergence or failure.
  */
-int train(Model *model, const LongGrammar *grammar, const Sample *ones,
+int train(Model *model, const Grammar *grammar, const Sample *ones,
           size_t one_count, int iterations, int threads);
 
 /**
@@ -97,7 +86,7 @@ int is_model_finite(const Model *model);
 
 /** Context shared with the CRF objective callback. */
 typedef struct {
-  const LongGrammar *grammar;
+  const Grammar *grammar;
   const Sample *samples;
   size_t sample_count;
   uint64_t total_length;
@@ -128,7 +117,7 @@ typedef struct {
  * @param[out] grammar: Receives the initialized grammar.
  * @return None.
  */
-void build_grammar(ShortGrammar *grammar);
+void build_grammar(Grammar *grammar);
 
 Decoder *decoder_create(int64_t length);
 void decoder_destroy(Decoder *decoder);

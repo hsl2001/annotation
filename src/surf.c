@@ -108,7 +108,7 @@ int main(int argc, char **argv) {
     int status = load_model(model_path, model);
     if (status == EINVAL)
       bye("invalid or incompatible CRF model %s; retrain with this version of "
-          "anno",
+          "surf",
           model_path);
     if (status)
       bye("cannot read CRF model %s: %s", model_path, strerror(status));

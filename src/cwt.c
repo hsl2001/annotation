@@ -1,6 +1,6 @@
 /**
  * @file cwt.c
- * @brief CWT transforms and normalized per-base model features.
+ * @brief CWT transforms and per-base model features.
  */
 
 #include "include/cwt.h"
@@ -64,11 +64,13 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
                                     0.0622535239386479, 0.0271524594117541};
   if (start >= end || start < 0 || end > length)
     return;
-  const int width[CWT_CHANNELS] = {67, 83, 99};
+  int width[CWT_CHANNELS];
+  const int max_width = 4 * CWT_RADIUS * cwt_scales[CWT_CHANNELS - 1] + 3;
   const double support = 2.0 * CWT_RADIUS;
-  double complex kernel[CWT_CHANNELS][99];
+  double complex kernel[CWT_CHANNELS][max_width];
   for (int s = 0; s < CWT_CHANNELS; s++) {
     double scale = cwt_scales[s];
+    width[s] = 4 * CWT_RADIUS * cwt_scales[s] + 3;
     int radius = width[s] / 2;
     for (int tap = 0; tap < width[s]; tap++) {
       double lower = fmax(((double)(tap - radius) - 0.5) / scale, -support);
@@ -99,7 +101,6 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
       kernel[s][tap] = sqrt(scale) * normalization * integral;
     }
   }
-  const int max_width = 99;
   size_t input_length = (size_t)(end - start);
   if (input_length > CWT_WINDOW)
     input_length = CWT_WINDOW;
@@ -128,19 +129,17 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
     int64_t input_end =
         window_end + radius < length ? window_end + radius : length;
     size_t input_count = (size_t)(input_end - input_start);
-    double complex *transformed = calloc(fft_size, sizeof(*transformed));
-    if (!transformed)
-      bye("out of memory");
+    double complex *transformed =
+        scalloc(smul(fft_size, 2), sizeof(*transformed));
+    double complex *spectrum = transformed + fft_size;
+    for (size_t i = 0; i < input_count; i++) {
+      int base = base_index(bases[input_start + (int64_t)i]);
+      spectrum[i] = base < 0 ? 0.0 : signal[base] / sqrt(2.0);
+    }
+    fft_radix2(spectrum, fft_size, 0);
     for (int s = 0; s < CWT_CHANNELS; s++) {
-      for (size_t i = 0; i < input_count; i++) {
-        int base = base_index(bases[input_start + (int64_t)i]);
-        transformed[i] = base < 0 ? 0.0 : signal[base] / sqrt(2.0);
-      }
-      memset(transformed + input_count, 0,
-             (fft_size - input_count) * sizeof(*transformed));
-      fft_radix2(transformed, fft_size, 0);
       for (size_t i = 0; i < fft_size; i++)
-        transformed[i] *= kernel_fft[(size_t)s * fft_size + i];
+        transformed[i] = spectrum[i] * kernel_fft[(size_t)s * fft_size + i];
       fft_radix2(transformed, fft_size, 1);
       for (int64_t position = window_start; position < window_end; position++) {
         size_t index = (size_t)(position - input_start) +
@@ -171,31 +170,10 @@ void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
   }
 }
 
-void compute_features(const Sequence *sequence, const float *power,
-                      int64_t power_start, int64_t start, int64_t valid,
-                      float *input) {
-  float mean[CWT_CHANNELS] = {0}, variance[CWT_CHANNELS] = {0};
-  for (int64_t q = 0; q < valid; q++)
-    for (int s = 0; s < CWT_CHANNELS; s++)
-      mean[s] += power[(size_t)(start + q - power_start) * CWT_CHANNELS + s];
-  for (int s = 0; s < CWT_CHANNELS; s++)
-    mean[s] /= (float)valid;
-  for (int64_t q = 0; q < valid; q++)
-    for (int s = 0; s < CWT_CHANNELS; s++) {
-      float d =
-          power[(size_t)(start + q - power_start) * CWT_CHANNELS + s] - mean[s];
-      variance[s] += d * d;
-    }
-  for (int s = 0; s < CWT_CHANNELS; s++)
-    variance[s] = sqrtf(variance[s] / (float)valid + 1e-6f);
-  for (int64_t q = 0; q < valid; q++) {
-    int64_t p = start + q;
-    int base = base_index(sequence->bases[p]);
-    if (base >= 0)
-      input[(size_t)base * (size_t)valid + q] = 1.0f;
-    for (int s = 0; s < CWT_CHANNELS; s++)
-      input[(size_t)(NUCLEOTIDES + s) * (size_t)valid + q] =
-          (power[(size_t)(p - power_start) * CWT_CHANNELS + s] - mean[s]) /
-          variance[s];
-  }
+void compute_features(char base, const float *power, float *features) {
+  memset(features, 0, NUCLEOTIDES * sizeof(*features));
+  int index = base_index(base);
+  if (index >= 0)
+    features[index] = 1.0f;
+  memcpy(features + NUCLEOTIDES, power, CWT_CHANNELS * sizeof(*power));
 }

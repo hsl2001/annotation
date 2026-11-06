@@ -40,17 +40,8 @@ void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
                float *out);
 
 /**
- * @brief Fill channel-major one-hot and normalized CWT features.
- * @param[in] sequence: Sequence bases and length.
- * @param[in] power: Position-major CWT power values.
- * @param[in] power_start: Genomic coordinate of the first power row.
- * @param[in] start: First feature position.
- * @param[in] valid: Number of valid positions.
- * @param[out] features: Receives the channel-major feature matrix.
- * @return None.
+ * @brief Fill the nucleotide and CWT power features for one position.
  */
-void compute_features(const Sequence *sequence, const float *power,
-                      int64_t power_start, int64_t start, int64_t valid,
-                      float *features);
+void compute_features(char base, const float *power, float *features);
 
 #endif /** CWT_H */

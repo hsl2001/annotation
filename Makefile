@@ -20,7 +20,7 @@ INCLUDE_DIR = $(SRC_DIR)/include
 APP_SOURCES = $(SRC_DIR)/surf.c
 LIB_SOURCES = $(SRC_DIR)/sequence.c $(SRC_DIR)/cwt.c \
               $(SRC_DIR)/trainer.c $(SRC_DIR)/decoder.c $(SRC_DIR)/gff.c \
-              $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
+              $(SRC_DIR)/intervals.c $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
 HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 
 .PHONY: all clean test integration-test

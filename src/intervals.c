@@ -2,25 +2,8 @@
  * @file intervals.c
  * @brief Half-openned genomic intervals
  */
-#ifndef INTERVALS_C
-#define INTERVALS_C
-
+#include "include/surf.h"
 #include "include/utils.h"
-
-#include <stdint.h>
-
-/** Half-open genomic intervals (for both labels and sequences) */
-typedef struct {
-  int64_t start;
-  int64_t end;
-} Interval;
-
-/** List of half-open genomic intervals (for both labels and sequences) */
-typedef struct {
-  Interval *items;
-  int count;
-  int capacity;
-} IntervalList;
 
 /**
  * @brief Append an interval to a growable list.
@@ -53,4 +36,19 @@ int compare_interval(const void *a, const void *b) {
                                : x->end > y->end;
 }
 
-#endif /* INTERVALS_C */
+char *splice_sequence(const Sequence *sequence, const IntervalList *exons,
+                      char strand, int64_t *length) {
+  *length = 0;
+  for (int i = 0; i < exons->count; i++)
+    *length += exons->items[i].end - exons->items[i].start;
+  char *transcript = scalloc((size_t)*length + 1, 1);
+  int64_t at = 0;
+  for (int i = 0; i < exons->count; i++) {
+    const Interval *e = &exons->items[strand == '+' ? i : exons->count - 1 - i];
+    for (int64_t p = 0; p < e->end - e->start; p++)
+      transcript[at++] = strand == '+'
+                             ? sequence->bases[e->start + p]
+                             : complement(sequence->bases[e->end - 1 - p]);
+  }
+  return transcript;
+}

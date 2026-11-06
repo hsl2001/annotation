@@ -32,7 +32,7 @@ typedef enum {
   MINUS_END_EXON = 5,
   MINUS_INTRON = 6,
 
-  /* Decode-only states: internal exons use the intergenic emission. */
+  /* Internal exons use the intergenic emission. */
   PLUS_INTERNAL_EXON = 7,
   MINUS_INTERNAL_EXON = 8
 } Class;
@@ -44,6 +44,20 @@ typedef struct {
   int64_t length;  // number of bases
   uint8_t *labels; // Classes per-base (during training) or NULL
 } Sequence;
+
+typedef struct {
+  int64_t start, end;
+} Interval;
+
+typedef struct {
+  Interval *items;
+  int count, capacity;
+} IntervalList;
+
+void push_interval(IntervalList *list, int64_t start, int64_t end);
+int compare_interval(const void *a, const void *b);
+char *splice_sequence(const Sequence *sequence, const IntervalList *exons,
+                      char strand, int64_t *length);
 
 /**
  * @brief Read a FASTA(.gz) file.

@@ -5,18 +5,7 @@
 
 #include "include/surf.h"
 #include "include/utils.h"
-#include "intervals.c"
-
 #include <stdlib.h>
-#include <string.h>
-
-/** One GFF3 record */
-typedef struct {
-  const char *type;
-  int64_t start, end;
-  int phase;
-  char id[96], parent[96];
-} Record;
 
 /**
  * @brief Map a decoded class to its strand.
@@ -82,104 +71,45 @@ int longest_orf(const char *transcript, int64_t length, int64_t *start,
   return best > 0;
 }
 
-/**
- * @brief Convert transcript-based coordinations into genome-based coordinations
- * @param[in] exons: Exon intervals in genomic order.
- * @param[in] strand: Transcript strand.
- * @param[in] from: Inclusive transcript start.
- * @param[in] to: Exclusive transcript end.
- * @param[out] out: Destination interval list.
- * @return None.
- */
-static void convert_coordinates(const IntervalList *exons, char strand,
-                                int64_t from, int64_t to, IntervalList *out) {
-  int64_t offset = 0;
-  for (int order = 0; order < exons->count; order++) {
-    const Interval *e =
-        &exons->items[strand == '+' ? order : exons->count - 1 - order];
-    int64_t length = e->end - e->start;
-    int64_t a = from > offset ? from - offset : 0;
-    int64_t b = to < offset + length ? to - offset : length;
-    if (a < b)
-      push_interval(out, strand == '+' ? e->start + a : e->end - b,
-                    strand == '+' ? e->start + b : e->end - a);
-    offset += length;
-  }
-  qsort(out->items, (size_t)out->count, sizeof(Interval), compare_interval);
+static int write_record(FILE *output, const Sequence *sequence,
+                        const char *type, int64_t start, int64_t end,
+                        char strand, int phase, const char *id,
+                        const char *parent) {
+  char phase_text[2] = {phase < 0 ? '.' : (char)('0' + phase), '\0'};
+  return fprintf(output, "%s\tanno\t%s\t%lld\t%lld\t.\t%c\t%s\tID=%s%s%s\n",
+                 sequence->name, type, (long long)start + 1, (long long)end,
+                 strand, phase_text, id, *parent ? ";Parent=" : "", parent) > 0;
 }
 
-/**
- * @brief Test whether an interval lies within one interval.
- * @param[in] list: Intervalt list to inspect.
- * @param[in] start: Inclusive interval start.
- * @param[in] end: Exclusive interval end.
- * @return 1 when contained, otherwise 0.
- */
-static int is_inside(const IntervalList *list, int64_t start, int64_t end) {
-  for (int i = 0; i < list->count; i++)
-    if (start >= list->items[i].start && end <= list->items[i].end)
-      return 1;
-  return 0;
-}
-
-/**
- * @brief Check ID/Parent linkage and containment of the records of one gene.
- * @param[in] records: Records to validate.
- * @param[in] count: Number of records.
- * @param[in] exons: Exon intervals used for containment checks.
- * @return 1 when consistent.
- */
-static int is_valid_records(const Record *records, int count,
-                            const IntervalList *exons) {
-  for (int i = 0; i < count; i++) {
-    const Record *r = &records[i];
-    if (r->start < 0 || r->end <= r->start)
-      return 0;
-    if (i == 0) {
-      if (strcmp(r->type, "gene") || r->parent[0])
+static int write_region(FILE *output, const Sequence *sequence,
+                        const IntervalList *exons, char strand, int64_t length,
+                        int64_t from, int64_t to, const char *type,
+                        const char *id_type, const char *parent, int coding) {
+  int64_t offset = strand == '+' ? 0 : length;
+  int count = 0;
+  for (int i = 0; i < exons->count; i++) {
+    const Interval *exon = &exons->items[i];
+    int64_t width = exon->end - exon->start;
+    if (strand == '-')
+      offset -= width;
+    int64_t a = from > offset ? from : offset;
+    int64_t b = to < offset + width ? to : offset + width;
+    if (a < b) {
+      char id[96];
+      snprintf(id, sizeof(id), "%s.%s%d", parent, id_type, ++count);
+      if (!write_record(output, sequence, type,
+                        strand == '+' ? exon->start + a - offset
+                                      : exon->end - (b - offset),
+                        strand == '+' ? exon->start + b - offset
+                                      : exon->end - (a - offset),
+                        strand, coding ? (int)((3 - (a - from) % 3) % 3) : -1,
+                        id, parent))
         return 0;
-      continue;
     }
-    int parent = -1;
-    for (int j = 0; j < count; j++)
-      if (r->parent[0] && !strcmp(records[j].id, r->parent))
-        parent = j;
-    if (parent < 0 || r->start < records[parent].start ||
-        r->end > records[parent].end)
-      return 0;
-    if (strcmp(r->type, "mRNA") && strcmp(r->type, "exon") &&
-        !is_inside(exons, r->start, r->end))
-      return 0;
-    for (int j = 0; j < i; j++)
-      if (r->id[0] && !strcmp(records[j].id, r->id))
-        return 0;
+    if (strand == '+')
+      offset += width;
   }
   return 1;
-}
-
-/**
- * @brief Append a GFF3 record to a growable record array.
- * @param[in,out] records: Record array to extend.
- * @param[in,out] count: Number of records, updated in place.
- * @param[in] type: GFF3 feature type.
- * @param[in] start: Inclusive genomic start.
- * @param[in] end: Exclusive genomic end.
- * @param[in] phase: CDS phase, or -1.
- * @param[in] id: Record ID.
- * @param[in] parent: Parent record ID, or an empty string.
- * @return None.
- */
-static void push_record(Record **records, int *count, const char *type,
-                        int64_t start, int64_t end, int phase, const char *id,
-                        const char *parent) {
-  *records = srealloc(*records, (size_t)*count + 1, sizeof(**records));
-  Record *r = &(*records)[(*count)++];
-  r->type = type;
-  r->start = start;
-  r->end = end;
-  r->phase = phase;
-  snprintf(r->id, sizeof(r->id), "%s", id);
-  snprintf(r->parent, sizeof(r->parent), "%s", parent);
 }
 
 /**
@@ -194,78 +124,34 @@ static void push_record(Record **records, int *count, const char *type,
 static int write_one_transcript(FILE *output, const Sequence *sequence,
                                 const IntervalList *exons, char strand,
                                 unsigned long gene_number) {
-  int64_t length = 0;
-  for (int i = 0; i < exons->count; i++)
-    length += exons->items[i].end - exons->items[i].start;
-  char *transcript = scalloc((size_t)length + 1, 1);
-  int64_t at = 0;
-  for (int order = 0; order < exons->count; order++) {
-    const Interval *e =
-        &exons->items[strand == '+' ? order : exons->count - 1 - order];
-    for (int64_t p = 0; p < e->end - e->start; p++)
-      transcript[at++] = strand == '+'
-                             ? sequence->bases[e->start + p]
-                             : complement(sequence->bases[e->end - 1 - p]);
-  }
+  int64_t length;
+  char *transcript = splice_sequence(sequence, exons, strand, &length);
   int64_t orf_start = INT64_MAX, orf_end = 0;
   int found = longest_orf(transcript, length, &orf_start, &orf_end);
   free(transcript);
   if (!found)
     return 0;
-  IntervalList utr5 = {0}, cds = {0}, utr3 = {0};
-  convert_coordinates(exons, strand, 0, orf_start, &utr5);
-  convert_coordinates(exons, strand, orf_start, orf_end, &cds);
-  convert_coordinates(exons, strand, orf_end, length, &utr3);
   char gene[48], mrna[64], id[96];
   snprintf(gene, sizeof(gene), "gene%lu", gene_number);
   snprintf(mrna, sizeof(mrna), "%s.t1", gene);
-  Record *records = NULL;
-  int count = 0;
   int64_t start = exons->items[0].start,
           end = exons->items[exons->count - 1].end;
-  push_record(&records, &count, "gene", start, end, -1, gene, "");
-  push_record(&records, &count, "mRNA", start, end, -1, mrna, gene);
+  int ok = write_record(output, sequence, "gene", start, end, strand, -1, gene,
+                        "") &&
+           write_record(output, sequence, "mRNA", start, end, strand, -1, mrna,
+                        gene);
   for (int i = 0; i < exons->count; i++) {
     snprintf(id, sizeof(id), "%s.exon%d", mrna, i + 1);
-    push_record(&records, &count, "exon", exons->items[i].start,
-                exons->items[i].end, -1, id, mrna);
+    ok = ok && write_record(output, sequence, "exon", exons->items[i].start,
+                            exons->items[i].end, strand, -1, id, mrna);
   }
-  for (int i = 0; i < utr5.count; i++) {
-    snprintf(id, sizeof(id), "%s.utr5p%d", mrna, i + 1);
-    push_record(&records, &count, "five_prime_UTR", utr5.items[i].start,
-                utr5.items[i].end, -1, id, mrna);
-  }
-  for (int i = 0; i < cds.count; i++) {
-    int64_t before = 0; /* coding bases upstream in transcript orientation */
-    for (int j = 0; j < cds.count; j++)
-      if (strand == '+' ? j < i : j > i)
-        before += cds.items[j].end - cds.items[j].start;
-    snprintf(id, sizeof(id), "%s.cds%d", mrna, i + 1);
-    push_record(&records, &count, "CDS", cds.items[i].start, cds.items[i].end,
-                (int)((3 - before % 3) % 3), id, mrna);
-  }
-  for (int i = 0; i < utr3.count; i++) {
-    snprintf(id, sizeof(id), "%s.utr3p%d", mrna, i + 1);
-    push_record(&records, &count, "three_prime_UTR", utr3.items[i].start,
-                utr3.items[i].end, -1, id, mrna);
-  }
-  int ok = is_valid_records(records, count, exons);
-  if (!ok)
-    bye("internal error: inconsistent GFF3 records for %s", gene);
-  for (int i = 0; ok && i < count; i++) {
-    const Record *r = &records[i];
-    char phase[12] = ".";
-    if (r->phase >= 0)
-      snprintf(phase, sizeof(phase), "%d", r->phase);
-    ok = fprintf(output, "%s\tanno\t%s\t%lld\t%lld\t.\t%c\t%s\tID=%s%s%s\n",
-                 sequence->name, r->type, (long long)r->start + 1,
-                 (long long)r->end, strand, phase, r->id,
-                 r->parent[0] ? ";Parent=" : "", r->parent) > 0;
-  }
-  free(records);
-  free(utr5.items);
-  free(cds.items);
-  free(utr3.items);
+  ok = ok &&
+       write_region(output, sequence, exons, strand, length, 0, orf_start,
+                    "five_prime_UTR", "utr5p", mrna, 0) &&
+       write_region(output, sequence, exons, strand, length, orf_start, orf_end,
+                    "CDS", "cds", mrna, 1) &&
+       write_region(output, sequence, exons, strand, length, orf_end, length,
+                    "three_prime_UTR", "utr3p", mrna, 0);
   return ok ? 1 : -1;
 }
 
