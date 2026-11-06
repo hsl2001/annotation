@@ -93,7 +93,7 @@ def main() -> None:
 
     exon_f1 = metric(report, "exon-segment")
     nucleotide_f1 = metric(report, "nt")
-    if gene_count < 10 or nucleotide_f1 < 80.0:
+    if gene_count < 10 or nucleotide_f1 < 90.0:
         raise AssertionError(
             f"self-prediction is too weak "
             f"(genes={gene_count}, exon F1={exon_f1:.2f}%, "
