@@ -1,6 +1,4 @@
-*.gff*
 *.crf
-*.fa*
 *bam
 *.bedgraph
 
