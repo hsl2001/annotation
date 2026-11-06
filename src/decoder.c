@@ -187,17 +187,36 @@ int decoder_finish(Decoder *decoder, uint8_t *path) {
 #include <string.h>
 #include <zlib.h>
 typedef struct { int64_t start, end; } LabelSegment;
-typedef struct { char *parent; int sequence; char strand; LabelSegment *exons; int count, capacity; } LabelTranscript;
+typedef struct { char *parent; int sequence; char strand; LabelSegment *exons; int count, capacity; int64_t orf_length; } LabelTranscript;
 static void label_fail(const char *path, long line, const char *message) { bye("%s:%ld: %s", path, line, message); }
 static int label_segment_compare(const void *a, const void *b) { const LabelSegment *x=a,*y=b; return x->start<y->start?-1:x->start>y->start; }
 static LabelTranscript *label_get_transcript(LabelTranscript **items,int *count,int *capacity,const char *parent,int sequence,char strand) {
   for(int i=0;i<*count;i++) if((*items)[i].sequence==sequence&&(*items)[i].strand==strand&&!strcmp((*items)[i].parent,parent)) return &(*items)[i];
   if(*count==*capacity){*capacity=*capacity?*capacity*2:64;*items=srealloc(*items,(size_t)*capacity,sizeof(**items));}
-  LabelTranscript *t=&(*items)[(*count)++]; *t=(LabelTranscript){sstrdup(parent),sequence,strand,NULL,0,0}; return t;
+  LabelTranscript *t=&(*items)[(*count)++]; *t=(LabelTranscript){sstrdup(parent),sequence,strand,NULL,0,0,0}; return t;
 }
 static void label_add_segment(LabelTranscript *t,int64_t start,int64_t end){
   if(t->count==t->capacity){t->capacity=t->capacity?t->capacity*2:8;t->exons=srealloc(t->exons,(size_t)t->capacity,sizeof(*t->exons));}
   t->exons[t->count++]=(LabelSegment){start,end};
+}
+static int label_transcript_compare(const void *a,const void *b){
+  const LabelTranscript *x=a,*y=b;
+  return x->orf_length<y->orf_length?1:x->orf_length>y->orf_length?-1:0;
+}
+static void label_set_orf_length(LabelTranscript *t,const Sequence *s){
+  int64_t length=0;
+  for(int i=0;i<t->count;++i) length+=t->exons[i].end-t->exons[i].start;
+  char *transcript=scalloc((size_t)length+1,1);
+  int64_t at=0;
+  int plus=t->strand=='+';
+  for(int i=0;i<t->count;++i){
+    const LabelSegment *e=&t->exons[plus?i:t->count-1-i];
+    for(int64_t p=0;p<e->end-e->start;++p)
+      transcript[at++]=plus?s->bases[e->start+p]:complement(s->bases[e->end-1-p]);
+  }
+  int64_t start=INT64_MAX,end=0;
+  t->orf_length=longest_orf(transcript,length,&start,&end)?end-start:0;
+  free(transcript);
 }
 static char *label_parent_id(char *attributes){for(char *field=strtok(attributes,";");field;field=strtok(NULL,";")){while(*field==' ')++field;if(!strncmp(field,"Parent=",7)&&field[7])return field+7;}return NULL;}
 void read_gff3(const char *path,Sequence *sequences,int count){
@@ -206,7 +225,9 @@ void read_gff3(const char *path,Sequence *sequences,int count){
   while(gzgets(input,line,sizeof(line))){++line_number;if(line[0]=='#'||line[0]=='\n'||line[0]=='\r')continue;line[strcspn(line,"\r\n")]='\0';char *fields[9],*cursor=line;int columns=0;while(columns<9&&cursor){fields[columns++]=cursor;cursor=strchr(cursor,'\t');if(cursor)*cursor++='\0';}if(columns!=9||cursor)label_fail(path,line_number,"expected 9 columns");if(strcmp(fields[2],"exon"))continue;int sequence=-1;for(int i=0;i<count;++i)if(!strcmp(sequences[i].name,fields[0]))sequence=i;if(sequence<0)label_fail(path,line_number,"sequence absent from FASTA");char *end=NULL;errno=0;int64_t start=strtoll(fields[3],&end,10);if(errno||end==fields[3]||*end||start<1)label_fail(path,line_number,"invalid start coordinate");errno=0;int64_t finish=strtoll(fields[4],&end,10);if(errno||end==fields[4]||*end||finish<start||finish>sequences[sequence].length)label_fail(path,line_number,"invalid end coordinate");char strand=fields[6][0];if((strand!='+'&&strand!='-')||fields[6][1])label_fail(path,line_number,"unsupported strand");char *parent=label_parent_id(fields[8]);if(!parent)label_fail(path,line_number,"exon without Parent");label_add_segment(label_get_transcript(&transcripts,&transcript_count,&transcript_capacity,parent,sequence,strand),start-1,finish);
   }
   if(gzclose(input)!=Z_OK)bye("cannot read annotation %s",path);
-  for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];qsort(t->exons,(size_t)t->count,sizeof(*t->exons),label_segment_compare);Sequence *s=&sequences[t->sequence];if(!s->labels)s->labels=scalloc((size_t)s->length,sizeof(*s->labels));int plus=t->strand=='+';int first=plus?0:t->count-1,last=plus?t->count-1:0;for(int e=0;e<t->count;++e){LabelSegment exon=t->exons[e];uint8_t class=e==first?(plus?PLUS_START_SINGLE_EXON:MINUS_START_SINGLE_EXON):e==last?(plus?PLUS_END_EXON:MINUS_END_EXON):(plus?PLUS_INTERNAL_EXON:MINUS_INTERNAL_EXON);for(int64_t p=exon.start;p<exon.end;++p){if(s->labels[p]&&s->labels[p]!=class)bye("overlapping transcripts on %s",s->name);s->labels[p]=class;}}uint8_t intron=plus?PLUS_INTRON:MINUS_INTRON;for(int e=0;e+1<t->count;++e)for(int64_t p=t->exons[e].end;p<t->exons[e+1].start;++p)s->labels[p]=intron;free(t->parent);free(t->exons);}
+  for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];qsort(t->exons,(size_t)t->count,sizeof(*t->exons),label_segment_compare);label_set_orf_length(t,&sequences[t->sequence]);}
+  qsort(transcripts,(size_t)transcript_count,sizeof(*transcripts),label_transcript_compare);
+  for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];Sequence *s=&sequences[t->sequence];if(!s->labels)s->labels=scalloc((size_t)s->length,sizeof(*s->labels));int conflict=0;for(int e=0;e<t->count&&!conflict;++e)for(int64_t p=t->exons[e].start;p<t->exons[e].end;++p)if(s->labels[p]){conflict=1;break;}if(conflict){free(t->parent);free(t->exons);continue;}int plus=t->strand=='+';int first=plus?0:t->count-1,last=plus?t->count-1:0;for(int e=0;e<t->count;++e){LabelSegment exon=t->exons[e];uint8_t class=e==first?(plus?PLUS_START_SINGLE_EXON:MINUS_START_SINGLE_EXON):e==last?(plus?PLUS_END_EXON:MINUS_END_EXON):(plus?PLUS_INTERNAL_EXON:MINUS_INTERNAL_EXON);for(int64_t p=exon.start;p<exon.end;++p)s->labels[p]=class;}uint8_t intron=plus?PLUS_INTRON:MINUS_INTRON;for(int e=0;e+1<t->count;++e)for(int64_t p=t->exons[e].end;p<t->exons[e+1].start;++p)s->labels[p]=intron;free(t->parent);free(t->exons);}
   free(transcripts);
 }
 #include "include/cwt.h"

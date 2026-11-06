@@ -73,6 +73,9 @@ void free_sequences(Sequence *sequences, int count);
  */
 void read_gff3(const char *path, Sequence *sequences, int count);
 
+int longest_orf(const char *transcript, int64_t length, int64_t *start,
+                int64_t *end);
+
 /**
  * @brief Convert a per-base class path into GFF3 transcript records.
  * @param[in,out] output: Destination GFF3 stream.

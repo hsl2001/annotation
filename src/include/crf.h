@@ -18,13 +18,13 @@
 /** Parameters of CRF */
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
 #define TRANSITIONS (CLASSES * CLASSES)
-#define PARAMETERS (EMISSIONS * TRANSITIONS)
+#define PARAMETERS (EMISSIONS + TRANSITIONS)
 #define L2 1e-4
 
 /** Learned emission and transition parameters for the observed classes. */
 typedef struct {
   double emission_weights[EMISSIONS]; //Class/channel weights and biases.
-  double transition_weights[EMISSIONS]; // Class-pair transition weights.
+  double transition_weights[TRANSITIONS]; // Class-pair transition weights.
 } Model;
 
 /** Just one sampled, compact, and position-major feature window */

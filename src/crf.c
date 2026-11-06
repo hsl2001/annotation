@@ -268,6 +268,10 @@ static inline double transition_score(const double *weights, int from_class,
   return weights[(size_t)from_class * CLASSES + (size_t)to_class];
 }
 
+static inline int model_class(int class) {
+  return class < CLASSES ? class : INTERGENIC;
+}
+
 static int forward_row(const double *parameters, const LongGrammar *grammar,
                              const Sample *sample, int gold_only, size_t t,
                              const double *previous, double *row, double *scale) {
@@ -280,9 +284,10 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
   }
   double top = -INFINITY;
   for (int s = 0; s < grammar->states; ++s) {
-    const int class = grammar->state_class[s];
+    const int state_class = grammar->state_class[s];
+    const int class = model_class(state_class);
     double value = -INFINITY;
-    if ((!gold_only || class == sample->classes[t])) {
+    if ((!gold_only || state_class == sample->classes[t])) {
       if (t == 0) {
         value = emission[class];
       } else {
@@ -290,7 +295,8 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
           const int p = grammar->backpointers[(size_t)s *
                                               grammar->max_backpointers + k];
           value = logadd(value, previous[p] +
-              transition_score(transition, grammar->state_class[p], class));
+              transition_score(transition,
+                              model_class(grammar->state_class[p]), class));
         }
         value += emission[class];
       }
@@ -397,8 +403,9 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
                           ? 0.0 : sample_emission_scores(parameters, sample, t, c);
       for (size_t p = 0; p < states; ++p) previous_beta[p] = -INFINITY;
       for (size_t s = 0; s < states; ++s) {
-        const int class = grammar->state_class[s];
-        if (gold_only && class != sample->classes[t]) continue;
+        const int state_class = grammar->state_class[s];
+        const int class = model_class(state_class);
+        if (gold_only && state_class != sample->classes[t]) continue;
         const double probability = exp(row[s] + beta[s]);
         const size_t base = emission_index(class, 0);
         const uint8_t nucleotide = sample->bases[t];
@@ -415,7 +422,8 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
         for (int k = 0; k < grammar->backpointer_count[s]; ++k) {
           const int p = grammar->backpointers[s *
                               (size_t)grammar->max_backpointers + (size_t)k];
-          const int from_class = grammar->state_class[p];
+          const int from_class =
+              model_class(grammar->state_class[p]);
           const double edge = transition_score(transition, from_class, class);
           previous_beta[p] = logadd(previous_beta[p], edge + suffix);
           if (from_class != class) {
