@@ -92,7 +92,7 @@ int main(int argc, char **argv) {
   }
   int count = 0;
   Sequence *sequences = 0;
-  read_fasta(argv[a], &count, sequences);
+  read_fasta(argv[a], &count, &sequences);
   if (argc - a == 2) {
     double started = whattime();
     read_gff3(argv[a + 1], sequences, count);

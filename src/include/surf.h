@@ -52,9 +52,9 @@ typedef struct {
  * @brief Read a FASTA(.gz) file.
  * @param[in] path: FASTA path.
  * @param[out] count: Receives the number of records.
- * @param[in,out] output: Recieves array or NULL only if the process does not fail.
+ * @param[out] output: Receives the allocated sequence array.
  */
-void read_fasta(const char *path, int *count, Sequence *output);
+void read_fasta(const char *path, int *count, Sequence **output);
 
 /**
  * @brief Free records returned by read_fasta().

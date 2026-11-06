@@ -39,7 +39,7 @@ static char *gz_line(gzFile input) {
   return line;
 }
 
-void read_fasta(const char *path, int *count_out, Sequence *out) {
+void read_fasta(const char *path, int *count_out, Sequence **out) {
   gzFile input = gzopen(path, "rb");
   if (!input)
     bye("cannot open FASTA %s", path);
@@ -97,7 +97,7 @@ void read_fasta(const char *path, int *count_out, Sequence *out) {
   if (!count)
     bye("no FASTA records in %s", path);
   *count_out = count;
-  *out = *sequences;
+  *out = sequences;
 }
 
 void free_sequences(Sequence *sequences, int count) {
