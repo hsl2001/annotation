@@ -50,8 +50,8 @@ static void fft_radix2(double complex *vector, size_t size, int inverse) {
   }
 }
 
-void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
-         float *out) {
+static void transform(const char *bases, int64_t length, int64_t start,
+                      int64_t end, float *out, int power) {
   static const double complex signal[NUCLEOTIDES] = {1.0 + I, -1.0 + I,
                                                      -1.0 - I, 1.0 - I};
   static const double nodes[8] = {0.09501250983763744, 0.2816035507792589,
@@ -67,6 +67,11 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   int width[CWT_CHANNELS];
   const int max_width = 4 * CWT_RADIUS * cwt_scales[CWT_CHANNELS - 1] + 3;
   const double support = 2.0 * CWT_RADIUS;
+  const double omega2 = MORLET_CENTRAL * MORLET_CENTRAL;
+  const double correction = exp(-0.5 * omega2);
+  const double normalization =
+      1.0 /
+      sqrt(sqrt(acos(-1.0)) * (1.0 + exp(-omega2) - 2.0 * exp(-0.75 * omega2)));
   double complex kernel[CWT_CHANNELS][max_width];
   for (int s = 0; s < CWT_CHANNELS; s++) {
     double scale = cwt_scales[s];
@@ -75,29 +80,20 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
     for (int tap = 0; tap < width[s]; tap++) {
       double lower = fmax(((double)(tap - radius) - 0.5) / scale, -support);
       double upper = fmin(((double)(tap - radius) + 0.5) / scale, support);
-      int segments = (int)ceil((upper - lower) * 2.0);
       double complex integral = 0.0;
+      /* Every scale is at least 3, so each bin needs only one segment. */
       if (lower < upper) {
-        double step = (upper - lower) / segments;
-        for (int segment = 0; segment < segments; segment++) {
-          double middle = lower + (segment + 0.5) * step;
-          for (int node = 0; node < 8; node++) {
-            double left = middle - nodes[node] * step / 2.0;
-            double right = middle + nodes[node] * step / 2.0;
-            integral += weights[node] * step / 2.0 *
-                        (cexp(-0.5 * left * left) *
-                             (cexp(-I * MORLET_CENTRAL * left) -
-                              exp(-0.5 * MORLET_CENTRAL * MORLET_CENTRAL)) +
-                         cexp(-0.5 * right * right) *
-                             (cexp(-I * MORLET_CENTRAL * right) -
-                              exp(-0.5 * MORLET_CENTRAL * MORLET_CENTRAL)));
-          }
+        double half = (upper - lower) / 2.0, middle = (upper + lower) / 2.0;
+        for (int node = 0; node < 8; node++) {
+          double left = middle - nodes[node] * half;
+          double right = middle + nodes[node] * half;
+          integral += weights[node] * half *
+                      (exp(-0.5 * left * left) *
+                           (cexp(-I * MORLET_CENTRAL * left) - correction) +
+                       exp(-0.5 * right * right) *
+                           (cexp(-I * MORLET_CENTRAL * right) - correction));
         }
       }
-      double omega2 = MORLET_CENTRAL * MORLET_CENTRAL;
-      double normalization =
-          1.0 / sqrt(sqrt(acos(-1.0)) *
-                     (1.0 + exp(-omega2) - 2.0 * exp(-0.75 * omega2)));
       kernel[s][tap] = sqrt(scale) * normalization * integral;
     }
   }
@@ -109,9 +105,7 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   while (fft_size < input_length + max_width - 1)
     fft_size <<= 1;
   double complex *kernel_fft =
-      calloc((size_t)CWT_CHANNELS * fft_size, sizeof(*kernel_fft));
-  if (!kernel_fft)
-    bye("out of memory");
+      scalloc(smul(CWT_CHANNELS, fft_size), sizeof(*kernel_fft));
   for (int s = 0; s < CWT_CHANNELS; s++) {
     for (int tap = 0; tap < width[s]; tap++)
       kernel_fft[(size_t)s * fft_size + width[s] - 1 - tap] = kernel[s][tap];
@@ -145,10 +139,16 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
         size_t index = (size_t)(position - input_start) +
                        (size_t)(width[s] - 1 - width[s] / 2);
         double complex coefficient = transformed[index] / (double)fft_size;
-        float *value =
-            out + (size_t)(position - start) * CWT_CHANNELS * 2 + (size_t)s * 2;
-        value[0] = (float)creal(coefficient);
-        value[1] = (float)cimag(coefficient);
+        float real = (float)creal(coefficient),
+              imag = (float)cimag(coefficient);
+        size_t out_index =
+            (size_t)(position - start) * CWT_CHANNELS + (size_t)s;
+        if (power)
+          out[out_index] = real * real + imag * imag;
+        else {
+          out[2 * out_index] = real;
+          out[2 * out_index + 1] = imag;
+        }
       }
     }
     free(transformed);
@@ -156,18 +156,14 @@ void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
   free(kernel_fft);
 }
 
+void cwt(const char *bases, int64_t length, int64_t start, int64_t end,
+         float *out) {
+  transform(bases, length, start, end, out, 0);
+}
+
 void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
                float *out) {
-  for (int64_t block = start; block < end; block += CWT_WINDOW) {
-    float values[CWT_WINDOW * CWT_CHANNELS * COMPLEX_COMPONENTS];
-    int64_t stop = block + CWT_WINDOW < end ? block + CWT_WINDOW : end;
-    cwt(bases, length, block, stop, values);
-    for (int64_t i = 0; i < (stop - block) * CWT_CHANNELS; i++)
-      out[(size_t)(block - start) * CWT_CHANNELS + (size_t)i] =
-          values[COMPLEX_COMPONENTS * i] * values[COMPLEX_COMPONENTS * i] +
-          values[COMPLEX_COMPONENTS * i + 1] *
-              values[COMPLEX_COMPONENTS * i + 1];
-  }
+  transform(bases, length, start, end, out, 1);
 }
 
 void compute_features(char base, const float *power, float *features) {

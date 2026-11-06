@@ -7,11 +7,6 @@
 #include "include/utils.h"
 #include <stdlib.h>
 
-/**
- * @brief Map a decoded class to its strand.
- * @param[in] cls Decoded annotation class.
- * @return '+' or '-', or 0 for intergenic.
- */
 static char strand_of_class(uint8_t class) {
   switch (class) {
   case PLUS_START_SINGLE_EXON:
@@ -29,11 +24,6 @@ static char strand_of_class(uint8_t class) {
   }
 }
 
-/**
- * @brief Test whether three bases form a stop codon.
- * @param[in] c: Three-base codon.
- * @return 1 for a stop codon, otherwise 0.
- */
 int is_stop(const char *c) {
   return c[0] == 'T' && ((c[1] == 'A' && (c[2] == 'A' || c[2] == 'G')) ||
                          (c[1] == 'G' && c[2] == 'A'));
@@ -112,15 +102,6 @@ static int write_region(FILE *output, const Sequence *sequence,
   return 1;
 }
 
-/**
- * @brief Emit one transcript (exons on one strand) with its longest ORF.
- * @param[in,out] output Destination GFF3 stream.
- * @param[in] sequence Source sequence record.
- * @param[in] exons Transcript exon intervals.
- * @param[in] strand Transcript strand.
- * @param[in] gene_number Gene number used in generated IDs.
- * @return 1 written, 0 skipped (no ORF), -1 on error.
- */
 static int write_one_transcript(FILE *output, const Sequence *sequence,
                                 const IntervalList *exons, char strand,
                                 unsigned long gene_number) {
@@ -129,8 +110,6 @@ static int write_one_transcript(FILE *output, const Sequence *sequence,
   int64_t orf_start = INT64_MAX, orf_end = 0;
   int found = longest_orf(transcript, length, &orf_start, &orf_end);
   free(transcript);
-  if (!found)
-    return 0;
   char gene[48], mrna[64], id[96];
   snprintf(gene, sizeof(gene), "gene%lu", gene_number);
   snprintf(mrna, sizeof(mrna), "%s.t1", gene);
@@ -145,24 +124,17 @@ static int write_one_transcript(FILE *output, const Sequence *sequence,
     ok = ok && write_record(output, sequence, "exon", exons->items[i].start,
                             exons->items[i].end, strand, -1, id, mrna);
   }
-  ok = ok &&
-       write_region(output, sequence, exons, strand, length, 0, orf_start,
-                    "five_prime_UTR", "utr5p", mrna, 0) &&
-       write_region(output, sequence, exons, strand, length, orf_start, orf_end,
-                    "CDS", "cds", mrna, 1) &&
-       write_region(output, sequence, exons, strand, length, orf_end, length,
-                    "three_prime_UTR", "utr3p", mrna, 0);
+  if (found)
+    ok = ok &&
+         write_region(output, sequence, exons, strand, length, 0, orf_start,
+                      "five_prime_UTR", "utr5p", mrna, 0) &&
+         write_region(output, sequence, exons, strand, length, orf_start,
+                      orf_end, "CDS", "cds", mrna, 1) &&
+         write_region(output, sequence, exons, strand, length, orf_end, length,
+                      "three_prime_UTR", "utr3p", mrna, 0);
   return ok ? 1 : -1;
 }
 
-/**
- * @brief Convert a decoded class path into GFF3 transcript records.
- * @param[in,out] output: Destination GFF3 stream.
- * @param[in] sequence: Sequence metadata and bases.
- * @param[in] path: Per-base decoded classes.
- * @param[in,out] gene_counter: Gene number counter, updated in place.
- * @return Number of transcripts written, or -1 on output error.
- */
 long write_gff(FILE *output, const Sequence *sequence, const uint8_t *path,
                unsigned long *gene_counter) {
   long written = 0;

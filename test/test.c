@@ -123,8 +123,11 @@ static void test_features_and_orf(void) {
   for (size_t i = 0; i < sizeof(coefficients) / sizeof(*coefficients); i++)
     CHECK(isfinite(coefficients[i]));
   cwt_power(bases, 5, 0, 5, power);
-  for (size_t i = 0; i < sizeof(power) / sizeof(*power); i++)
+  for (size_t i = 0; i < sizeof(power) / sizeof(*power); i++) {
     CHECK(isfinite(power[i]) && power[i] >= 0.0f);
+    CHECK(power[i] == coefficients[2 * i] * coefficients[2 * i] +
+                          coefficients[2 * i + 1] * coefficients[2 * i + 1]);
+  }
 
   float features[INPUT_CHANNELS];
   for (int p = 0; p < 5; p++) {
@@ -184,6 +187,25 @@ static void test_intervals_and_gff_output(void) {
   CHECK(strstr(text, "gene1") != NULL);
   CHECK(strstr(text, "\tCDS\t") != NULL);
   fclose(output);
+
+  sequence.bases = "CCCCCCCCCCCCCCC";
+  for (int strand = 0; strand < 2; strand++) {
+    for (int i = 0; i < 15; i++)
+      path[i] = strand ? MINUS_END_EXON : PLUS_START_SINGLE_EXON;
+    output = tmpfile();
+    CHECK(output != NULL);
+    if (!output)
+      continue;
+    gene = 0;
+    CHECK(write_gff(output, &sequence, path, &gene) == 1 && gene == 1);
+    rewind(output);
+    memset(text, 0, sizeof(text));
+    CHECK(fread(text, 1, sizeof(text) - 1, output) > 0);
+    CHECK(strstr(text, "\tgene\t") && strstr(text, "\tmRNA\t") &&
+          strstr(text, "\texon\t") && !strstr(text, "\tCDS\t") &&
+          !strstr(text, "UTR\t") && strstr(text, strand ? "\t-\t" : "\t+\t"));
+    fclose(output);
+  }
 }
 
 static void test_multiexon_gff(void) {
