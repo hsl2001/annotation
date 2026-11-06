@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -274,12 +275,48 @@ static void test_multiexon_gff_input(void) {
   unlink(path);
 }
 
+static void test_gff_label_conflicts(void) {
+  char path[32], bases[65] = {0};
+  memset(bases, 'C', 64);
+  memcpy(bases + 9, "ATGTAA", 6);
+  Sequence sequence = {(char *)"chr", bases, 64, NULL};
+  /* Reject malformed candidates and preserve the longest noncoding transcript.
+   */
+  FILE *gff =
+      make_temp(path, "chr\tanno\texon\t2\t4\t.\t+\t.\tParent=valid\n"
+                      "chr\tanno\texon\t33\t38\t.\t+\t.\tParent=valid\n"
+                      "chr\tanno\texon\t2\t25\t.\t+\t.\tParent=overlap\n"
+                      "chr\tanno\texon\t20\t45\t.\t+\t.\tParent=overlap\n"
+                      "chr\tanno\texon\t2\t25\t.\t+\t.\tParent=adjacent\n"
+                      "chr\tanno\texon\t26\t45\t.\t+\t.\tParent=adjacent\n"
+                      "chr\tanno\texon\t10\t15\t.\t+\t.\tParent=orf\n"
+                      "chr\tanno\texon\t1\t1\t.\t-\t.\tParent=enclosing\n"
+                      "chr\tanno\texon\t40\t42\t.\t-\t.\tParent=enclosing\n"
+                      "chr\tanno\texon\t39\t41\t.\t-\t.\tParent=touching\n");
+  CHECK(gff != NULL);
+  if (!gff)
+    return;
+  fclose(gff);
+  read_gff3(path, &sequence, 1);
+  uint8_t expected[64] = {0};
+  memset(expected + 1, PLUS_START_SINGLE_EXON, 3);
+  memset(expected + 4, PLUS_INTRON, 28);
+  memset(expected + 32, PLUS_END_EXON, 6);
+  CHECK(!memcmp(sequence.labels, expected, sizeof(expected)));
+  uint8_t *labels = sequence.labels;
+  memset(labels, 255, sizeof(expected));
+  read_gff3(path, &sequence, 1);
+  CHECK(sequence.labels == labels &&
+        !memcmp(labels, expected, sizeof(expected)));
+  free(sequence.labels);
+  unlink(path);
+}
+
 static void test_decoder_and_grammar(void) {
   Grammar grammar;
   build_grammar(&grammar);
-  CHECK(grammar.count ==
-        1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH));
-  CHECK(grammar.cls[0] == INTERGENIC && grammar.backpointers[0] == 5);
+  CHECK(grammar.count == CLASSES);
+  CHECK(grammar.backpointers[INTERGENIC] == 5);
 
   Decoder *decoder = decoder_create(1);
   CHECK(decoder != NULL);
@@ -326,12 +363,13 @@ static void test_crf_and_lbfgs(void) {
 
   Grammar grammar;
   build_grammar(&grammar);
-  CHECK(grammar.cls[0] == INTERGENIC && grammar.backpointers[0] == 5);
+  CHECK(grammar.backpointers[INTERGENIC] == 5);
 
   uint8_t bases[1] = {0}, labels[1] = {INTERGENIC};
   float cwt[3] = {0};
-  Sample sample = {1, bases, cwt, labels};
-  Sample invalid_sample = {INT64_MAX, bases, cwt, labels};
+  Sample sample = {.length = 1, .bases = bases, .cwt = cwt, .classes = labels};
+  Sample invalid_sample = sample;
+  invalid_sample.length = INT64_MAX;
   CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
         LBFGS_INVALID_ARGUMENT);
   invalid_sample.length = -1;
@@ -351,7 +389,7 @@ static void test_crf_and_lbfgs(void) {
   model.emission_weights[INPUT_CHANNELS] = 0.0;
   CHECK(train(&model, &grammar, &sample, 1, 1, 1) >= 0);
   Grammar invalid = grammar;
-  invalid.count = GRAMMAR_MAX_STATES + 1;
+  invalid.count = CLASSES + 1;
   CHECK(train(&model, &invalid, &sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
   invalid = grammar;
   invalid.backpointers[0] = GRAMMAR_MAX_BACKPOINTERS + 1;
@@ -362,13 +400,12 @@ static void test_crf_and_lbfgs(void) {
 
   double x[1] = {0};
   int completed = -1;
-  LbfgsStatus status =
-      lbfgs_minimize(1, x, quadratic, NULL, NULL, 20, &completed);
+  LbfgsStatus status = lbfgs_minimize(1, x, quadratic, NULL, 20, &completed);
   CHECK(status == LBFGS_CONVERGED || status == LBFGS_STOPPING_CRITERION ||
         status == LBFGS_MAX_ITERATIONS);
   CHECK(fabs(x[0] - 3.0) < 1e-4);
   CHECK(completed >= 0);
-  CHECK(lbfgs_minimize(0, x, quadratic, NULL, NULL, 1, &completed) ==
+  CHECK(lbfgs_minimize(0, x, quadratic, NULL, 1, &completed) ==
         LBFGS_INVALID_ARGUMENT);
 
   char model_path[32];
@@ -394,23 +431,41 @@ static void test_crf_and_lbfgs(void) {
 static void test_crf_gradient(void) {
   Grammar grammar = {0};
   grammar.count = 2;
-  grammar.cls[1] = PLUS_START_SINGLE_EXON;
+
   for (int state = 0; state < grammar.count; state++) {
     grammar.backpointers[state] = 2;
     grammar.from[state][0] = 0;
     grammar.from[state][1] = 1;
   }
-  uint8_t bases[] = {0, 1, 2, 3, 0};
+  uint8_t bases[] = {0, 1, NUCLEOTIDES, 3, 0, 1, 2, NUCLEOTIDES, 3};
   uint8_t labels[] = {0, 1, 1, 0, 0};
   float cwt[5 * CWT_CHANNELS];
   for (int i = 0; i < 5 * CWT_CHANNELS; i++)
     cwt[i] = (float)(i - 7) / 10;
-  Sample sample = {5, bases, cwt, labels};
+  Sample sample = {.length = 5,
+                   .bases = bases + 2,
+                   .cwt = cwt,
+                   .classes = labels,
+                   .offset = 2,
+                   .sequence_length = sizeof(bases)};
   ModelObjectiveContext context = {&grammar, &sample, 1, 5, 1, 0};
   double parameters[PARAMETERS], gradient[PARAMETERS], scratch[PARAMETERS];
   for (int i = 0; i < PARAMETERS; i++)
     parameters[i] = (double)(i % 7 - 3) / 10;
   CHECK(isfinite(model_objective(parameters, gradient, &context)));
+  Sample full = {.length = sizeof(bases), .bases = bases};
+  double whole[TRANSITIONS], cut[TRANSITIONS];
+  const double *bias = parameters + EMISSIONS, *pwm = bias + TRANSITIONS;
+  for (int offset = 0; offset <= 4; offset += 2) {
+    Sample window = sample;
+    window.bases = bases + offset;
+    window.offset = offset;
+    for (int p = 0; p < 5; p += 4) {
+      CHECK(compute_transitions(bias, pwm, &full, offset + p, whole));
+      CHECK(compute_transitions(bias, pwm, &window, p, cut));
+      CHECK(!memcmp(whole, cut, sizeof(whole)));
+    }
+  }
   for (int i = 0; i < PARAMETERS; i++) {
     double original = parameters[i];
     parameters[i] = original + 1e-6;
@@ -421,6 +476,26 @@ static void test_crf_gradient(void) {
     CHECK(isfinite(plus) && isfinite(minus) &&
           fabs(gradient[i] - (plus - minus) / 2e-6) < 1e-7);
   }
+  Sample samples[] = {sample,
+                      {0},
+                      {4, bases, cwt, labels, 0, 0},
+                      {1, bases, cwt, labels, 0, 0}};
+  ModelObjectiveContext parallel = {&grammar, samples, 4, 10, 1, 0};
+  double serial_loss = model_objective(parameters, gradient, &parallel);
+  CHECK(parallel.failure_status == 0 && isfinite(serial_loss));
+  parallel.threads = 4;
+  CHECK(close_enough(serial_loss,
+                     model_objective(parameters, scratch, &parallel)));
+  CHECK(parallel.failure_status == 0);
+  for (int i = 0; i < PARAMETERS; ++i)
+    CHECK(close_enough(gradient[i], scratch[i]));
+  Model serial, threaded;
+  memcpy(serial.weights, parameters, sizeof(parameters));
+  threaded = serial;
+  CHECK(train(&serial, &grammar, samples, 4, 2, 1) >= 0);
+  CHECK(train(&threaded, &grammar, samples, 4, 2, 4) >= 0);
+  for (int i = 0; i < PARAMETERS; ++i)
+    CHECK(fabs(serial.weights[i] - threaded.weights[i]) < 1e-9);
 }
 
 static void test_prediction(void) {
@@ -435,17 +510,60 @@ static void test_prediction(void) {
   fclose(output);
 }
 
+static void test_prediction_parallel_seam(void) {
+  enum { LENGTH = 16384 + 37 };
+  char bases[LENGTH + 1] = {0}, text[2][1024] = {{0}};
+  memset(bases, 'C', LENGTH);
+  Sequence sequences[] = {{(char *)"seam", bases, LENGTH, NULL},
+                          {(char *)"short", bases, 29, NULL}};
+  Model model = {0};
+  model.emission_weights[PLUS_START_SINGLE_EXON * (INPUT_CHANNELS + 1) +
+                         INPUT_CHANNELS] = 2;
+  model.transition_weights[PLUS_START_SINGLE_EXON * CLASSES] = -1;
+  model
+      .boundary_weights[(CLASSES + PLUS_START_SINGLE_EXON) * BOUNDARY_FEATURES +
+                        BOUNDARY_RADIUS * NUCLEOTIDES + 1] = 0.1;
+  for (int pass = 0; pass < 2; ++pass) {
+    omp_set_num_threads(pass ? 4 : 1);
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (!output)
+      continue;
+    CHECK(predict(&model, sequences, 2, output, NULL) == 2);
+    rewind(output);
+    CHECK(fread(text[pass], 1, sizeof(text[pass]) - 1, output) > 0);
+    CHECK(!ferror(output) && feof(output));
+    fclose(output);
+  }
+  omp_set_num_threads(1);
+  CHECK(!strcmp(text[0], text[1]));
+  CHECK(!strcmp(
+      text[0],
+      "seam\tanno\tgene\t2\t16420\t.\t+\t.\tID=gene1\n"
+      "seam\tanno\tmRNA\t2\t16420\t.\t+\t.\tID=gene1.t1;Parent=gene1\n"
+      "seam\tanno\texon\t2\t16420\t.\t+\t.\tID=gene1.t1.exon1;Parent=gene1.t1\n"
+      "short\tanno\tgene\t2\t28\t.\t+\t.\tID=gene2\n"
+      "short\tanno\tmRNA\t2\t28\t.\t+\t.\tID=gene2.t1;Parent=gene2\n"
+      "short\tanno\texon\t2\t28\t.\t+\t.\tID=gene2.t1.exon1;Parent=gene2."
+      "t1\n"));
+}
+
 int main(void) {
+  omp_set_dynamic(0);
+  omp_set_num_threads(1);
   test_utils();
   test_fasta_and_gff_input();
   test_cwt_window_independence();
   test_intervals_and_gff_output();
   test_multiexon_gff();
   test_multiexon_gff_input();
+  test_gff_label_conflicts();
   test_decoder_and_grammar();
   test_crf_and_lbfgs();
+
   test_crf_gradient();
   test_prediction();
+  test_prediction_parallel_seam();
   fprintf(stderr, "%d checks, %d failures\n", checks, failures);
   return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

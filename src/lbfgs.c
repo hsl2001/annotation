@@ -63,7 +63,7 @@ static LbfgsStatus lbfgs_line_search(size_t n, double *x, double *gradient,
                                      const double *base_x,
                                      const double *direction, double *objective,
                                      double *step, lbfgs_evaluate evaluate,
-                                     void *context, int *trials) {
+                                     void *context) {
   const double initial = *objective;
   const double dginit = lbfgs_dot(n, gradient, direction);
   if (!isfinite(dginit))
@@ -91,7 +91,7 @@ static LbfgsStatus lbfgs_line_search(size_t n, double *x, double *gradient,
     } else {
       if (fabs(derivative) <= -lbfgs_gtol * dginit) {
         *objective = value;
-        *trials = trial;
+
         return LBFGS_CONVERGED;
       }
       if (derivative * (upper - lower) >= 0)
@@ -155,8 +155,7 @@ static int lbfgs_direction(size_t n, const double *gradient, const double *s,
 }
 
 LbfgsStatus lbfgs_minimize(size_t n, double *x, lbfgs_evaluate evaluate,
-                           lbfgs_progress progress, void *context,
-                           int iterations, int *completed) {
+                           void *context, int iterations, int *completed) {
   if (completed)
     *completed = 0;
   if (!n || n > INT_MAX || !x || !evaluate || !completed || iterations < 1 ||
@@ -200,9 +199,9 @@ LbfgsStatus lbfgs_minimize(size_t n, double *x, lbfgs_evaluate evaluate,
   while (*completed < iterations) {
     memcpy(previous_x, x, n * sizeof(*x));
     memcpy(previous_gradient, gradient, n * sizeof(*gradient));
-    int trials = 0;
+
     status = lbfgs_line_search(n, x, gradient, previous_x, direction,
-                               &objective, &step, evaluate, context, &trials);
+                               &objective, &step, evaluate, context);
     if (status != LBFGS_CONVERGED) {
       memcpy(x, previous_x, n * sizeof(*x));
       goto cleanup;
@@ -215,8 +214,6 @@ LbfgsStatus lbfgs_minimize(size_t n, double *x, lbfgs_evaluate evaluate,
       status = LBFGS_NONFINITE;
       goto cleanup;
     }
-    if (progress)
-      progress(context, *completed, objective, step, trials, n, gradient);
 
     if (xnorm < 1)
       xnorm = 1;

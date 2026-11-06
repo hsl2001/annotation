@@ -17,21 +17,6 @@
 typedef double (*lbfgs_evaluate)(const double *x, double *gradient,
                                  void *context);
 
-/**
- * @brief Receive progress information after an accepted optimizer iteration.
- * @param[in,out] context: Caller-owned progress context.
- * @param[in] iteration: Accepted iteration number.
- * @param[in] objective: Current objective value.
- * @param[in] step: Accepted line-search step size.
- * @param[in] line_search_trials: Number of line-search evaluations.
- * @param[in] n: Number of parameters.
- * @param[in] gradient: Current objective gradient.
- * @return None.
- */
-typedef void *lbfgs_progress(void *context, int iteration, double objective,
-                             double step, int line_search_trials, size_t n,
-                             const double *gradient);
-
 /** Status returned by the L-BFGS optimizer. */
 typedef enum {
   LBFGS_MAX_ITERATIONS,     // The configured iteration limit was reached.
@@ -50,14 +35,13 @@ typedef enum {
  * @param[in] n: Number of parameters in the vector.
  * @param[in,out] x: Initial values; receives the best accepted values.
  * @param[in] evaluate: Objective and gradient callback.
- * @param[in] progress: Optional progress callback, or NULL.
- * @param[in,out] context: Caller context passed to callbacks.
+
+ * @param[in,out] context: Caller context passed to evaluate.
  * @param[in] iterations: Maximum accepted iterations.
  * @param[out] completed: Receives the number of accepted iterations.
  * @return Optimizer status, including convergence and failure cases.
  */
 LbfgsStatus lbfgs_minimize(size_t n, double *x, lbfgs_evaluate evaluate,
-                           lbfgs_progress progress, void *context,
-                           int iterations, int *completed);
+                           void *context, int iterations, int *completed);
 
 #endif /* LBFGS_H */

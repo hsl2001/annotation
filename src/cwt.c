@@ -16,8 +16,8 @@
 enum { CWT_MAX_SCALE = 5 };
 static const int cwt_scales[CWT_CHANNELS] = {3, 4, CWT_MAX_SCALE};
 
-static void transform(const char *bases, int64_t length, int64_t start,
-                      int64_t end, float *out) {
+void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
+               float *out) {
   static const double complex signal[NUCLEOTIDES] = {1.0 + I, -1.0 + I,
                                                      -1.0 - I, 1.0 - I};
   static const double nodes[8] = {0.09501250983763744, 0.2816035507792589,
@@ -78,14 +78,8 @@ static void transform(const char *bases, int64_t length, int64_t start,
       float real = (float)creal(coefficient), imag = (float)cimag(coefficient);
       size_t index = (size_t)(position - start) * CWT_CHANNELS + (size_t)s;
       out[index] = real * real + imag * imag;
-
     }
   }
-}
-
-void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
-               float *out) {
-  transform(bases, length, start, end, out);
 }
 
 void compute_features(char base, const float *power, float *features) {

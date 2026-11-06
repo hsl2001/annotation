@@ -1,6 +1,6 @@
 /**
  * @file decoder.c
- * @brief Duration grammar construction for CRF training and decoding.
+ * @brief Gene grammar, annotation labels, and CRF prediction.
  */
 #include "include/crf.h"
 #include "include/cwt.h"
@@ -16,40 +16,7 @@
 #include <zlib.h>
 
 /**
- * @brief Add an incoming edge to a grammar state.
- * @param[in,out] grammar Grammar to modify.
- * @param[in] from Source state index.
- * @param[in] to Destination state index.
- * @return None.
- */
-static void grammar_edge(Grammar *grammar, int from, int to) {
-  int edge = grammar->backpointers[to]++;
-  if (edge >= GRAMMAR_MAX_BACKPOINTERS)
-    abort();
-  grammar->from[to][edge] = from;
-}
-
-/**
- * @brief Add a minimum-duration state chain and its self-loop.
- * @param[in,out] grammar Grammar to modify.
- * @param[in] class Class emitted by each state in the chain.
- * @param[in] length Number of states in the chain.
- * @return Index of the first state in the chain.
- */
-static int grammar_chain(Grammar *grammar, uint8_t class, int length) {
-  int head = grammar->count;
-  for (int i = 0; i < length; ++i) {
-    grammar->cls[grammar->count] = class;
-    if (i)
-      grammar_edge(grammar, grammar->count - 1, grammar->count);
-    grammar->count++;
-  }
-  grammar_edge(grammar, grammar->count - 1, grammar->count - 1);
-  return head;
-}
-
-/**
- * @brief Build the duration-expanded gene grammar.
+ * @brief Build the strand-specific gene grammar without hard duration cutoffs.
  *
  * The intergenic state connects to start and end exons. Exons connect through
  * strand-specific introns, and internal exons may repeat before reaching an
@@ -58,67 +25,44 @@ static int grammar_chain(Grammar *grammar, uint8_t class, int length) {
  * @return None.
  */
 void build_grammar(Grammar *grammar) {
-  memset(grammar, 0, sizeof(*grammar));
-  int intergenic = grammar_chain(grammar, INTERGENIC, 1);
-  for (int strand = 0; strand < STRANDS; ++strand) {
-    uint8_t start_class =
-        strand ? MINUS_START_SINGLE_EXON : PLUS_START_SINGLE_EXON;
-    uint8_t end_class = strand ? MINUS_END_EXON : PLUS_END_EXON;
-    uint8_t internal_class = strand ? MINUS_INTERNAL_EXON : PLUS_INTERNAL_EXON;
-    uint8_t intron_class = strand ? MINUS_INTRON : PLUS_INTRON;
-    int start = grammar_chain(grammar, start_class, MIN_EXON_LENGTH);
-    int end = grammar_chain(grammar, end_class, MIN_EXON_LENGTH);
-    int internal = grammar_chain(grammar, internal_class, MIN_EXON_LENGTH);
-    int intron = grammar_chain(grammar, intron_class, MIN_INTRON_LENGTH);
-    int start_tail = start + MIN_EXON_LENGTH - 1;
-    int end_tail = end + MIN_EXON_LENGTH - 1;
-    int internal_tail = internal + MIN_EXON_LENGTH - 1;
-    int intron_tail = intron + MIN_INTRON_LENGTH - 1;
-
-    grammar_edge(grammar, intergenic, start);
-    grammar_edge(grammar, start_tail, intergenic);
-    if (strand)
-      grammar_edge(grammar, intergenic, end);
-    grammar_edge(grammar, strand ? end_tail : start_tail, intron);
-    grammar_edge(grammar, intron_tail, internal);
-    grammar_edge(grammar, internal_tail, intron);
-    grammar_edge(grammar, intron_tail, strand ? start : end);
-    grammar_edge(grammar, end_tail, intergenic);
-  }
+  *grammar = (Grammar){
+      .count = CLASSES,
+      .backpointers = {5, 2, 2, 3, 3, 2, 3, 2, 2},
+      .from = {{INTERGENIC, PLUS_START_SINGLE_EXON, PLUS_END_EXON,
+                MINUS_START_SINGLE_EXON, MINUS_END_EXON},
+               {PLUS_START_SINGLE_EXON, INTERGENIC},
+               {PLUS_END_EXON, PLUS_INTRON},
+               {PLUS_INTRON, PLUS_START_SINGLE_EXON, PLUS_INTERNAL_EXON},
+               {MINUS_START_SINGLE_EXON, INTERGENIC, MINUS_INTRON},
+               {MINUS_END_EXON, INTERGENIC},
+               {MINUS_INTRON, MINUS_END_EXON, MINUS_INTERNAL_EXON},
+               {PLUS_INTERNAL_EXON, PLUS_INTRON},
+               {MINUS_INTERNAL_EXON, MINUS_INTRON}}};
 }
 
 struct Decoder {
   Grammar grammar;
   int64_t length;
   int64_t position;
-  double *previous;
-  double *current;
-  uint8_t *back;
+  double scores[2][CLASSES];
+  uint32_t *back; // Three bits per state; nine states fit in one word.
 };
 
 Decoder *decoder_create(int64_t length) {
   if (length < 1)
     return NULL;
-  Decoder *decoder = calloc(1, sizeof(*decoder));
-  if (!decoder)
-    abort();
+  Decoder *decoder = scalloc(1, sizeof(*decoder));
   build_grammar(&decoder->grammar);
   decoder->length = length;
-  decoder->previous = calloc((size_t)decoder->grammar.count, sizeof(double));
-  decoder->current = calloc((size_t)decoder->grammar.count, sizeof(double));
-  decoder->back = calloc((size_t)(length > 1 ? length - 1 : 1) *
-                             (size_t)decoder->grammar.count,
-                         sizeof(*decoder->back));
-  if (!decoder->previous || !decoder->current || !decoder->back)
-    abort();
+  decoder->back =
+      scalloc((size_t)(length > 1 ? length - 1 : 1), sizeof(*decoder->back));
   return decoder;
 }
 
 void decoder_destroy(Decoder *decoder) {
   if (!decoder)
     return;
-  free(decoder->previous);
-  free(decoder->current);
+
   free(decoder->back);
   free(decoder);
 }
@@ -127,22 +71,25 @@ void decoder_step(Decoder *decoder, const double *emission,
                   const double *transition) {
   const Grammar *grammar = &decoder->grammar;
   int64_t position = decoder->position++;
+  double *previous = decoder->scores[(position + 1) % 2];
+  double *current = decoder->scores[position % 2];
   if (!position) {
     for (int state = 0; state < grammar->count; ++state)
-      decoder->previous[state] = -INFINITY;
-    decoder->previous[0] = emission[INTERGENIC];
+      current[state] = -INFINITY;
+    current[0] = emission[INTERGENIC];
     return;
   }
   double top = -INFINITY;
+  uint32_t choices = 0;
   for (int state = 0; state < grammar->count; ++state) {
     double best = -INFINITY;
     int choice = 0;
-    uint8_t to_class = grammar->cls[state];
+    int to_class = state;
 
     for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
-      int previous = grammar->from[state][edge];
-      uint8_t from_class = grammar->cls[previous];
-      double score = decoder->previous[previous];
+      int predecessor = grammar->from[state][edge];
+      int from_class = predecessor;
+      double score = previous[predecessor];
       if (transition && from_class != to_class)
         score += transition[(size_t)from_class * CLASSES + to_class];
       if (score > best) {
@@ -150,33 +97,30 @@ void decoder_step(Decoder *decoder, const double *emission,
         choice = edge;
       }
     }
-    decoder->current[state] = best + emission[to_class];
-    if (decoder->current[state] > top)
-      top = decoder->current[state];
-    decoder->back[(size_t)(position - 1) * (size_t)grammar->count +
-                  (size_t)state] = (uint8_t)choice;
+    current[state] = best + emission[to_class];
+    if (current[state] > top)
+      top = current[state];
+    choices |= (uint32_t)choice << (3 * state);
   }
+  decoder->back[position - 1] = choices;
   for (int state = 0; state < grammar->count; ++state)
-    decoder->current[state] -= top;
-  double *swap = decoder->previous;
-  decoder->previous = decoder->current;
-  decoder->current = swap;
+    current[state] -= top;
 }
 
 int decoder_finish(Decoder *decoder, uint8_t *path) {
   const Grammar *grammar = &decoder->grammar;
-  if (decoder->position != decoder->length || !isfinite(decoder->previous[0]))
+  if (decoder->position != decoder->length ||
+      !isfinite(decoder->scores[(decoder->length - 1) % 2][0]))
     return ERANGE;
   int state = 0;
   for (int64_t position = decoder->length - 1; position > 0; --position) {
-    path[position] = grammar->cls[state];
-    int choice = decoder->back[(size_t)(position - 1) * (size_t)grammar->count +
-                               (size_t)state];
+    path[position] = state;
+    int choice = (decoder->back[position - 1] >> (3 * state)) & 7;
     if (choice >= grammar->backpointers[state])
       return ERANGE;
     state = grammar->from[state][choice];
   }
-  path[0] = grammar->cls[state];
+  path[0] = state;
   return state == 0 ? 0 : ERANGE;
 }
 
@@ -185,7 +129,7 @@ typedef struct {
   int sequence;
   char strand;
   IntervalList exons;
-  int64_t orf_length;
+  int64_t length;
 } LabelTranscript;
 static void label_fail(const char *path, long line, const char *message) {
   bye("%s:%ld: %s", path, line, message);
@@ -209,17 +153,7 @@ static LabelTranscript *label_get_transcript(LabelTranscript **items,
 }
 static int label_transcript_compare(const void *a, const void *b) {
   const LabelTranscript *x = a, *y = b;
-  return x->orf_length < y->orf_length   ? 1
-         : x->orf_length > y->orf_length ? -1
-                                         : 0;
-}
-static void label_set_orf_length(LabelTranscript *t, const Sequence *s) {
-  int64_t length;
-  char *transcript = splice_sequence(s, &t->exons, t->strand, &length);
-  int64_t start = INT64_MAX, end = 0;
-  t->orf_length =
-      longest_orf(transcript, length, &start, &end) ? end - start : 0;
-  free(transcript);
+  return x->length < y->length ? 1 : x->length > y->length ? -1 : 0;
 }
 static char *label_parent_id(char *attributes) {
   for (char *field = strtok(attributes, ";"); field;
@@ -235,6 +169,13 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
   gzFile input = gzopen(path, "rb");
   if (!input)
     bye("cannot open annotation %s", path);
+  for (int i = 0; i < count; ++i) {
+    if (sequences[i].labels)
+      memset(sequences[i].labels, INTERGENIC, (size_t)sequences[i].length);
+    else
+      sequences[i].labels =
+          scalloc((size_t)sequences[i].length, sizeof(uint8_t));
+  }
   LabelTranscript *transcripts = NULL;
   int transcript_count = 0, transcript_capacity = 0;
   char line[65536];
@@ -289,22 +230,27 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     LabelTranscript *t = &transcripts[i];
     qsort(t->exons.items, (size_t)t->exons.count, sizeof(*t->exons.items),
           compare_interval);
-    label_set_orf_length(t, &sequences[t->sequence]);
+    for (int e = 0; e < t->exons.count; ++e) {
+      if (e && t->exons.items[e].start <= t->exons.items[e - 1].end) {
+        t->length = 0;
+        break;
+      }
+      t->length += t->exons.items[e].end - t->exons.items[e].start;
+    }
   }
   qsort(transcripts, (size_t)transcript_count, sizeof(*transcripts),
         label_transcript_compare);
   for (int i = 0; i < transcript_count; ++i) {
     LabelTranscript *t = &transcripts[i];
     Sequence *s = &sequences[t->sequence];
-    if (!s->labels)
-      s->labels = scalloc((size_t)s->length, sizeof(*s->labels));
-    int conflict = 0;
-    for (int e = 0; e < t->exons.count && !conflict; ++e)
-      for (int64_t p = t->exons.items[e].start; p < t->exons.items[e].end; ++p)
-        if (s->labels[p]) {
-          conflict = 1;
-          break;
-        }
+    int conflict = !t->length;
+    int64_t begin = t->exons.items[0].start;
+    int64_t end = t->exons.items[t->exons.count - 1].end;
+    /* A single path cannot represent overlapping genes or adjacent genes
+       without an intergenic separator. */
+    for (int64_t p = begin > 0 ? begin - 1 : 0;
+         p < s->length && p <= end && !conflict; ++p)
+      conflict = s->labels[p] != INTERGENIC;
     if (conflict) {
       free(t->parent);
       free(t->exons.items);
@@ -372,6 +318,11 @@ static void prediction_add(PredictionBedgraph *b, const char *name,
 }
 unsigned long predict(const Model *model, const Sequence *sequences, int count,
                       FILE *gff, const char *prefix) {
+  enum { TILE = 16384 };
+  struct {
+    float power[TILE * CWT_CHANNELS];
+    double emission[TILE][CLASSES], transition[TILE][TRANSITIONS];
+  } *tile = scalloc(1, sizeof(*tile));
   PredictionBedgraph b = {0};
   for (int c = 0; prefix && c < CLASSES; c++) {
     char path[PATH_BUFFER];
@@ -394,35 +345,33 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
       int base = base_index(s->bases[p]);
       path[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
     }
-    Sample sample = {s->length, path, NULL, NULL};
+    Sample sample = {.length = s->length, .bases = path};
     for (int c = 0; c < CLASSES; c++)
       b.value[c] = -1;
-    float *power =
-        scalloc(smul((size_t)s->length, CWT_CHANNELS), sizeof(*power));
-    cwt_power(s->bases, s->length, 0, s->length, power);
-    for (int64_t p = 0; p < s->length; p++) {
-      float row[INPUT_CHANNELS];
-      double scores[CLASSES], transition[TRANSITIONS];
-      compute_features(s->bases[p], power + p * CWT_CHANNELS, row);
-      compute_emissions(model, row, scores);
-      if (!compute_transitions(model->transition_weights,
-                               model->boundary_weights, &sample, (size_t)p,
-                               transition))
-        bye("non-finite transition score for %s", s->name);
-      prediction_add(&b, s->name, p, scores);
-      decoder_step(d, scores, transition);
+    for (int64_t start = 0; start < s->length; start += TILE) {
+      int64_t length = s->length - start < TILE ? s->length - start : TILE;
+      cwt_power(s->bases, s->length, start, start + length, tile->power);
+#pragma omp parallel for schedule(static)
+      for (int64_t i = 0; i < length; ++i) {
+        int64_t p = start + i;
+        float row[INPUT_CHANNELS];
+        compute_features(s->bases[p], tile->power + i * CWT_CHANNELS, row);
+        compute_emissions(model, row, tile->emission[i]);
+        if (!compute_transitions(model->transition_weights,
+                                 model->boundary_weights, &sample, (size_t)p,
+                                 tile->transition[i]))
+          bye("non-finite transition score for %s", s->name);
+      }
+      for (int64_t i = 0; i < length; ++i) {
+        prediction_add(&b, s->name, start + i, tile->emission[i]);
+        decoder_step(d, tile->emission[i], tile->transition[i]);
+      }
     }
-    free(power);
     for (int c = 0; c < CLASSES; c++)
       if (b.files[c])
         prediction_emit(&b, s->name, c, s->length);
     if (decoder_finish(d, path))
       bye("grammar decoding failed for %s", s->name);
-    size_t coding = 0;
-    for (int64_t p = 0; p < s->length; p++)
-      if (path[p] != INTERGENIC)
-        coding++;
-    cry("%s: %zu non-intergenic bases", s->name, coding);
     decoder_destroy(d);
     long written = write_gff(gff, s, path, &genes);
     free(path);
@@ -430,6 +379,7 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
       bye("cannot write GFF3");
     cry("%s: %ld genes", s->name, written);
   }
+  free(tile);
   for (int c = 0; c < CLASSES; c++)
     if (b.files[c] && fclose(b.files[c]))
       bye("cannot close bedGraph");

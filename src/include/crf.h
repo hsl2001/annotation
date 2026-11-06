@@ -10,9 +10,7 @@
 
 #include <stdint.h>
 
-#define GRAMMAR_MAX_STATES                                                     \
-  (1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH))
-#define GRAMMAR_MAX_BACKPOINTERS (2 * STRANDS + 1)
+#define GRAMMAR_MAX_BACKPOINTERS 5
 
 /** Parameters of CRF */
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
@@ -23,11 +21,13 @@
 #define PARAMETERS (EMISSIONS + TRANSITIONS + BOUNDARY_WEIGHTS)
 
 /** Learned emission and transition parameters for the observed classes. */
-typedef struct {
-  double emission_weights[EMISSIONS];     // Class/channel weights and biases.
-  double transition_weights[TRANSITIONS]; // Class-pair transition biases.
-  double
-      boundary_weights[BOUNDARY_WEIGHTS]; // Outgoing then incoming class PWMs.
+typedef union {
+  struct {
+    double emission_weights[EMISSIONS];
+    double transition_weights[TRANSITIONS];
+    double boundary_weights[BOUNDARY_WEIGHTS];
+  };
+  double weights[PARAMETERS];
 } Model;
 
 /** Just one sampled, compact, and position-major feature window */
@@ -36,15 +36,15 @@ typedef struct {
   const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other
                         // implemations are 0, 1, 2, 3 and -1
   const float *cwt;     // Position-major CWT power array
-  const uint8_t *classes; // Observed class labels per position
+  const uint8_t *classes;          // Observed class labels per position
+  int64_t offset, sequence_length; // Preserve DNA context across training cuts.
 } Sample;
 
 /** Grammar for genes */
 typedef struct {
   int count;
-  uint8_t cls[GRAMMAR_MAX_STATES];
-  int backpointers[GRAMMAR_MAX_STATES];
-  int from[GRAMMAR_MAX_STATES][GRAMMAR_MAX_BACKPOINTERS];
+  int backpointers[CLASSES];
+  int from[CLASSES][GRAMMAR_MAX_BACKPOINTERS];
 } Grammar;
 
 typedef struct Decoder Decoder;
@@ -58,18 +58,18 @@ int compute_transitions(const double *bias, const double *pwm,
                         double scores[TRANSITIONS]);
 
 /**
- * @brief Optimize a CRF model with L-BFGS over labeled one samples.
+ * @brief Optimize a CRF model with L-BFGS over labeled windows.
  * @param[in,out] model: Initial model parameters; replaced with the trained
  * parameters on success.
- * @param[in] grammar: Duration-expanded state grammar.
- * @param[in] ones: Sampled labeled training windows.
- * @param[in] one_count Number of training windows.
+ * @param[in] grammar: State grammar.
+ * @param[in] samples: Labeled training windows.
+ * @param[in] sample_count Number of training windows.
  * @param[in] iterations: Maximum L-BFGS iterations.
  * @param[in] threads: Number of objective workers.
  * @return An LbfgsStatus value describing convergence or failure.
  */
-int train(Model *model, const Grammar *grammar, const Sample *ones,
-          size_t one_count, int iterations, int threads);
+int train(Model *model, const Grammar *grammar, const Sample *samples,
+          size_t sample_count, int iterations, int threads);
 
 /**
  * @brief Train a CRF from labeled sequences using L-BFGS.
@@ -109,7 +109,7 @@ typedef struct {
 double model_objective(const double *x, double *gradient, void *opaque);
 
 /**
- * @brief Build the duration-expanded grammar.
+ * @brief Build the strand-specific grammar.
  * @param[out] grammar: Receives the initialized grammar.
  * @return None.
  */

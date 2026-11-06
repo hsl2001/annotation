@@ -12,14 +12,10 @@
 #include <stdio.h>
 
 /** Fized constants */
-#define NUCLEOTIDES 4        // A, C, G, T
-#define STRANDS 2            // Plus & minus strands
-#define COMPLEX_COMPONENTS 2 // Real & imaginary components
-#define PATH_BUFFER 4096     // Maximum handled path length
-#define CLASSES 9            // Number of train labels (classes)
-/** Constraints for gene grammar */
-#define MIN_EXON_LENGTH 6    // Minimum exon length
-#define MIN_INTRON_LENGTH 30 // Minimum intron length
+#define NUCLEOTIDES 4 // A, C, G, T
+
+#define PATH_BUFFER 4096 // Maximum handled path length
+#define CLASSES 9        // Number of train labels (classes)
 
 /** Related to trainings */
 #define DEFAULT_ITERATIONS 100 // Maximum L-BFGS iterations
