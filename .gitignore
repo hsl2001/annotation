@@ -6,6 +6,8 @@ __pycache__/
 
 surf
 
+predict.gff3
+
 uv.lock
 .ruff_cache/
 .venv/
