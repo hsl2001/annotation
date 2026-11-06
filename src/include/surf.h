@@ -8,7 +8,6 @@
 #ifndef SURF_H
 #define SURF_H
 
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 

@@ -8,7 +8,6 @@
 #include "cwt.h"
 #include "surf.h"
 
-#include <stddef.h>
 #include <stdint.h>
 
 #define SHORTGRAMMER_MAX_STATES                                                \

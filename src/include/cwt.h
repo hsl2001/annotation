@@ -6,8 +6,6 @@
 
 #include "surf.h"
 
-#include <stdint.h>
-
 #define CWT_CHANNELS 3     // Number of CWT scales
 #define CWT_WINDOW 1024    // Length of parallely processed CWT window
 #define CWT_RADIUS 4       // Radius of scale units of Morlet complex wavelet

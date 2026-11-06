@@ -5,8 +5,6 @@
 #ifndef LBFGS_H
 #define LBFGS_H
 
-#include <stddef.h>
-
 /**
  * @brief Evaluate the objective and its gradient at a parameter vector.
  * @param[in] x: Current parameter vector.
