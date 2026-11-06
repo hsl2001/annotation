@@ -352,10 +352,6 @@ static inline double transition_score(const double *weights, int from_class,
   return weights[(size_t)from_class * CLASSES + (size_t)to_class];
 }
 
-static inline int model_class(int class) {
-  return class < CLASSES ? class : INTERGENIC;
-}
-
 static int forward_row(const double *parameters, const LongGrammar *grammar,
                              const Sample *sample, int gold_only, size_t t,
                              const double *previous, double *row, double *scale) {

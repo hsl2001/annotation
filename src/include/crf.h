@@ -21,6 +21,10 @@
 #define PARAMETERS (EMISSIONS + TRANSITIONS)
 #define L2 1e-4
 
+static inline int model_class(int class) {
+  return class < CLASSES ? class : INTERGENIC;
+}
+
 /** Learned emission and transition parameters for the observed classes. */
 typedef struct {
   double emission_weights[EMISSIONS]; //Class/channel weights and biases.

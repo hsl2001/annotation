@@ -90,7 +90,7 @@ struct Decoder {
   int64_t position;
   double *previous;
   double *current;
-  uint32_t *back;
+  uint8_t *back;
 };
 
 Decoder *decoder_create(int64_t length) {
@@ -103,7 +103,8 @@ Decoder *decoder_create(int64_t length) {
   decoder->length = length;
   decoder->previous = calloc((size_t)decoder->grammar.count, sizeof(double));
   decoder->current = calloc((size_t)decoder->grammar.count, sizeof(double));
-  decoder->back = calloc((size_t)(length > 1 ? length - 1 : 1),
+  decoder->back = calloc((size_t)(length > 1 ? length - 1 : 1) *
+                             (size_t)decoder->grammar.count,
                          sizeof(*decoder->back));
   if (!decoder->previous || !decoder->current || !decoder->back)
     abort();
@@ -129,31 +130,33 @@ void decoder_step(Decoder *decoder, const double *emission,
     decoder->previous[0] = emission[INTERGENIC];
     return;
   }
-  uint32_t packed = 0;
   double top = -INFINITY;
   for (int state = 0; state < grammar->count; ++state) {
     double best = -INFINITY;
     int choice = 0;
     uint8_t to_class = grammar->cls[state];
+    int to_model_class = model_class(to_class);
     for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
       int previous = grammar->from[state][edge];
       uint8_t from_class = grammar->cls[previous];
       double score = decoder->previous[previous];
-      if (transition && from_class != to_class)
-        score += transition[(size_t)from_class * CLASSES + to_class];
+      int from_model_class = model_class(from_class);
+      if (transition && from_model_class != to_model_class)
+        score += transition[(size_t)from_model_class * CLASSES +
+                            to_model_class];
       if (score > best) {
         best = score;
         choice = edge;
       }
     }
-    decoder->current[state] = best + emission[to_class];
+    decoder->current[state] = best + emission[to_model_class];
     if (decoder->current[state] > top)
       top = decoder->current[state];
-    packed |= (uint32_t)choice << grammar->shift[state];
+    decoder->back[(size_t)(position - 1) * (size_t)grammar->count +
+                  (size_t)state] = (uint8_t)choice;
   }
   for (int state = 0; state < grammar->count; ++state)
     decoder->current[state] -= top;
-  decoder->back[position - 1] = packed;
   double *swap = decoder->previous;
   decoder->previous = decoder->current;
   decoder->current = swap;
@@ -167,10 +170,8 @@ int decoder_finish(Decoder *decoder, uint8_t *path) {
   int state = 0;
   for (int64_t position = decoder->length - 1; position > 0; --position) {
     path[position] = grammar->cls[state];
-    int bits = grammar->bits[state];
-    int choice = (int)((decoder->back[position - 1] >>
-                        grammar->shift[state]) &
-                       ((1u << bits) - 1u));
+    int choice = decoder->back[(size_t)(position - 1) *
+                               (size_t)grammar->count + (size_t)state];
     if (choice >= grammar->backpointers[state])
       return ERANGE;
     state = grammar->from[state][choice];
@@ -240,4 +241,4 @@ static const char *const prediction_class_names[CLASSES+2]={"intergenic","plus_s
 typedef struct {FILE *files[CLASSES+2];int value[CLASSES+2];int64_t start[CLASSES+2];} PredictionBedgraph;
 static void prediction_emit(PredictionBedgraph *b,const char *name,int class,int64_t position){if(b->value[class]>=0&&position>b->start[class]&&fprintf(b->files[class],"%s\t%lld\t%lld\t%d.%02d\n",name,(long long)b->start[class],(long long)position,b->value[class]/100,b->value[class]%100)<0)bye("cannot write bedGraph");}
 static void prediction_add(PredictionBedgraph *b,const char *name,int64_t position,const double *scores){if(!b->files[0])return;double top=-INFINITY,total=0;for(int c=0;c<CLASSES;c++)if(scores[c]>top)top=scores[c];for(int c=0;c<CLASSES;c++)total+=exp(scores[c]-top);for(int c=0;c<CLASSES;c++){int value=(int)lrint(exp(scores[c]-top)/total*100.0);if(value==b->value[c])continue;prediction_emit(b,name,c,position);b->value[c]=value;b->start[c]=position;}}
-unsigned long predict(const Model *model,const Sequence *sequences,int count,FILE *gff,const char *prefix){PredictionBedgraph b={0};for(int c=0;prefix&&c<CLASSES;c++){char path[PATH_BUFFER];if(snprintf(path,sizeof(path),"%s.%s.bedgraph",prefix,prediction_class_names[c])>=(int)sizeof(path))bye("output prefix too long");if(!(b.files[c]=fopen(path,"w")))bye("cannot create %s",path);fprintf(b.files[c],"track type=bedGraph name=\"%s\"\n",prediction_class_names[c]);}unsigned long genes=0;for(int si=0;si<count;si++){const Sequence *s=&sequences[si];Decoder *d=decoder_create(s->length);for(int c=0;c<CLASSES;c++)b.value[c]=-1;float *input=scalloc((size_t)INPUT_CHANNELS*FEATURE_WINDOW,sizeof(*input)),*power=scalloc((size_t)FEATURE_WINDOW*CWT_CHANNELS,sizeof(*power));int64_t windows=(s->length+FEATURE_WINDOW-1)/FEATURE_WINDOW;for(int64_t w=0;w<windows;w++){int64_t start=w*FEATURE_WINDOW,valid=s->length-start<FEATURE_WINDOW?s->length-start:FEATURE_WINDOW;cwt_power(s->bases,s->length,start,start+valid,power);memset(input,0,(size_t)INPUT_CHANNELS*FEATURE_WINDOW*sizeof(*input));compute_features(s,power,start,start,valid,input);for(int64_t p=0;p<valid;p++){float row[INPUT_CHANNELS];double scores[CLASSES];for(int c=0;c<INPUT_CHANNELS;c++)row[c]=input[(size_t)c*FEATURE_WINDOW+p];compute_emissions(model,row,scores);prediction_add(&b,s->name,start+p,scores);decoder_step(d,scores,model->transition_weights);}}free(input);free(power);for(int c=0;c<CLASSES;c++)if(b.files[c])prediction_emit(&b,s->name,c,s->length);uint8_t *path=scalloc((size_t)s->length,1);if(decoder_finish(d,path))bye("grammar decoding failed for %s",s->name);decoder_destroy(d);long written=write_gff(gff,s,path,&genes);free(path);if(written<0)bye("cannot write GFF3");cry("%s: %ld genes",s->name,written);}for(int c=0;c<CLASSES;c++)if(b.files[c]&&fclose(b.files[c]))bye("cannot close bedGraph");return genes;}
+unsigned long predict(const Model *model,const Sequence *sequences,int count,FILE *gff,const char *prefix){PredictionBedgraph b={0};for(int c=0;prefix&&c<CLASSES;c++){char path[PATH_BUFFER];if(snprintf(path,sizeof(path),"%s.%s.bedgraph",prefix,prediction_class_names[c])>=(int)sizeof(path))bye("output prefix too long");if(!(b.files[c]=fopen(path,"w")))bye("cannot create %s",path);fprintf(b.files[c],"track type=bedGraph name=\"%s\"\n",prediction_class_names[c]);}unsigned long genes=0;for(int si=0;si<count;si++){const Sequence *s=&sequences[si];Decoder *d=decoder_create(s->length);for(int c=0;c<CLASSES;c++)b.value[c]=-1;float *input=scalloc((size_t)INPUT_CHANNELS*FEATURE_WINDOW,sizeof(*input)),*power=scalloc((size_t)FEATURE_WINDOW*CWT_CHANNELS,sizeof(*power));int64_t windows=(s->length+FEATURE_WINDOW-1)/FEATURE_WINDOW;for(int64_t w=0;w<windows;w++){int64_t start=w*FEATURE_WINDOW,valid=s->length-start<FEATURE_WINDOW?s->length-start:FEATURE_WINDOW;cwt_power(s->bases,s->length,start,start+valid,power);memset(input,0,(size_t)INPUT_CHANNELS*FEATURE_WINDOW*sizeof(*input));compute_features(s,power,start,start,valid,input);for(int64_t p=0;p<valid;p++){float row[INPUT_CHANNELS];double scores[CLASSES];for(int c=0;c<INPUT_CHANNELS;c++)row[c]=input[(size_t)c*FEATURE_WINDOW+p];compute_emissions(model,row,scores);prediction_add(&b,s->name,start+p,scores);decoder_step(d,scores,model->transition_weights);}}free(input);free(power);for(int c=0;c<CLASSES;c++)if(b.files[c])prediction_emit(&b,s->name,c,s->length);uint8_t *path=scalloc((size_t)s->length,1);if(decoder_finish(d,path))bye("grammar decoding failed for %s",s->name);size_t coding=0;for(int64_t p=0;p<s->length;p++)if(path[p]!=INTERGENIC)coding++;cry("%s: %zu non-intergenic bases",s->name,coding);decoder_destroy(d);long written=write_gff(gff,s,path,&genes);free(path);if(written<0)bye("cannot write GFF3");cry("%s: %ld genes",s->name,written);}for(int c=0;c<CLASSES;c++)if(b.files[c]&&fclose(b.files[c]))bye("cannot close bedGraph");return genes;}

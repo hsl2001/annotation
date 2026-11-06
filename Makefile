@@ -1,8 +1,18 @@
-CC = clang
-CFLAGS = -O3 -Wall -Wextra -Xpreprocessor -fopenmp \
-         -I/opt/homebrew/opt/libomp/include -Isrc
-LDFLAGS = -L/opt/homebrew/opt/libomp/lib
-LDLIBS = -lomp -lz -lm
+CC ?= cc
+CFLAGS += -O3 -Wall -Wextra -Isrc
+LDLIBS += -lz -lm
+
+OS := $(shell uname -s)
+
+ifeq ($(OS),Darwin)
+LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
+CFLAGS += -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
+LDFLAGS += -L$(LIBOMP_PREFIX)/lib
+LDLIBS += -lomp
+else
+CFLAGS += -fopenmp
+LDLIBS += -fopenmp
+endif
 
 SRC_DIR = src
 INCLUDE_DIR = $(SRC_DIR)/include
