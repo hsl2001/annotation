@@ -89,6 +89,21 @@ static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
   return 1;
 }
 
+static void *training_progress(void *context, int iteration, double objective,
+                               double step, int line_search_trials, size_t n,
+                               const double *gradient) {
+  (void)context;
+  if (iteration % 10 == 0) {
+    double norm = 0;
+    for (size_t i = 0; i < n; ++i)
+      norm = hypot(norm, gradient[i]);
+    cry("CRF L-BFGS iteration %d: loss %.9g, gradient norm %.3g, step %.3g, "
+        "line-search trials %d",
+        iteration, objective, norm, step, line_search_trials);
+  }
+  return NULL;
+}
+
 int train(Model *model, const Grammar *grammar, const Sample *samples,
           size_t sample_count, int iterations, int threads) {
   if (!model || !is_grammar_valid(grammar) || !samples || !sample_count ||
@@ -117,8 +132,9 @@ int train(Model *model, const Grammar *grammar, const Sample *samples,
   ModelObjectiveContext context = {grammar,      samples, sample_count,
                                    total_length, threads, 0};
   int completed = 0;
-  LbfgsStatus status = lbfgs_minimize(PARAMETERS, parameters, model_objective,
-                                      NULL, &context, iterations, &completed);
+  LbfgsStatus status =
+      lbfgs_minimize(PARAMETERS, parameters, model_objective, training_progress,
+                     &context, iterations, &completed);
   if (status == LBFGS_NONFINITE && context.failure_status)
     status = (LbfgsStatus)context.failure_status;
   if (status == LBFGS_MAX_ITERATIONS || status == LBFGS_CONVERGED ||

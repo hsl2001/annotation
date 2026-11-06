@@ -4,7 +4,6 @@
  */
 
 #include "include/surf.h"
-#include "include/utils.h"
 #include <stdlib.h>
 
 static char strand_of_class(uint8_t class) {

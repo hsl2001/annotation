@@ -22,7 +22,7 @@
 #define MIN_INTRON_LENGTH 30 // Minimum intron length
 
 /** Related to trainings */
-#define DEFAULT_ITERATIONS 1000 // Maximum L-BFGS iterations
+#define DEFAULT_ITERATIONS 100 // Maximum L-BFGS iterations
 typedef enum {
   INTERGENIC = 0,
   PLUS_START_SINGLE_EXON = 1,
@@ -31,7 +31,6 @@ typedef enum {
   MINUS_START_SINGLE_EXON = 4,
   MINUS_END_EXON = 5,
   MINUS_INTRON = 6,
-
   PLUS_INTERNAL_EXON = 7,
   MINUS_INTERNAL_EXON = 8
 } Class;

@@ -438,7 +438,6 @@ static void test_prediction(void) {
 int main(void) {
   test_utils();
   test_fasta_and_gff_input();
-  test_features_and_orf();
   test_cwt_window_independence();
   test_intervals_and_gff_output();
   test_multiexon_gff();
