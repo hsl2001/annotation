@@ -202,9 +202,9 @@ void compute_features(const Sequence *sequence, const float *power,
     int64_t p = start + q;
     int base = base_index(sequence->bases[p]);
     if (base >= 0)
-      input[(size_t)base * FEATURE_WINDOW + q] = 1.0f;
+      input[(size_t)base * (size_t)valid + q] = 1.0f;
     for (int s = 0; s < CWT_CHANNELS; s++)
-      input[(size_t)(NUCLEOTIDES + s) * FEATURE_WINDOW + q] =
+      input[(size_t)(NUCLEOTIDES + s) * (size_t)valid + q] =
           (power[(size_t)(p - power_start) * CWT_CHANNELS + s] - mean[s]) /
           variance[s];
   }

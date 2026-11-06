@@ -18,8 +18,6 @@
 #define COMPLEX_COMPONENTS 2 // Real & imaginary components
 #define PATH_BUFFER 4096 // Maximum handled path length
 #define CLASSES 7 // Number of train labels (classes)
-#define FEATURE_WINDOW 65536 // Length of parallely processed features window
-
 /** Constraints for gene grammar */
 #define MIN_EXON_LENGTH 6 // Minimum exon length
 #define MIN_INTRON_LENGTH 30 // Minimum intron length

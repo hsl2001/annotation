@@ -20,11 +20,20 @@
 #include <omp.h>
 #endif
 
+static int64_t gene_end(const Sequence *sequence, int64_t start) {
+  int64_t end = start;
+  while (end < sequence->length && sequence->labels[end] == INTERGENIC)
+    end++;
+  while (end < sequence->length && sequence->labels[end] != INTERGENIC)
+    end++;
+  return end < sequence->length ? end + 1 : end;
+}
+
 /**
  * @brief Prepare samples with window-local feature normalization.
  * @param[in] sequences: Input sequences with per-base labels.
  * @param[in] sequence_count: Number of input sequences.
- * @param[out] sample_count: Receives the number of feature-window samples.
+ * @param[out] sample_count: Receives the number of gene-boundary samples.
  * @return Allocated samples and their owned feature arrays.
  */
 static Sample *prepare_samples(const Sequence *sequences,
@@ -36,16 +45,17 @@ static Sample *prepare_samples(const Sequence *sequences,
   for (int s = 0; s < sequence_count; ++s) {
     if (sequences[s].length < 1)
       bye("sequence %s has no labels", sequences[s].name);
-    size_t windows = 1 + ((size_t)sequences[s].length - 1) /
-                             FEATURE_WINDOW;
-    if (count > SIZE_MAX - windows)
-      bye("too many training samples");
-    count += windows;
+    for (int64_t start = 0; start < sequences[s].length;) {
+      int64_t end = gene_end(&sequences[s], start);
+      if (++count == SIZE_MAX)
+        bye("too many training samples");
+      start = end;
+    }
   }
   Sample *samples = scalloc(count, sizeof(*samples));
-  float *input = scalloc((size_t)INPUT_CHANNELS * FEATURE_WINDOW,
+  float *input = scalloc((size_t)INPUT_CHANNELS * CWT_WINDOW,
                               sizeof(*input));
-  float *power = scalloc((size_t)FEATURE_WINDOW * CWT_CHANNELS,
+  float *power = scalloc((size_t)CWT_WINDOW * CWT_CHANNELS,
                               sizeof(*power));
   size_t sample_index = 0;
   for (int s = 0; s < sequence_count; ++s) {
@@ -53,29 +63,35 @@ static Sample *prepare_samples(const Sequence *sequences,
     if (!sequence->labels || sequence->length < 1)
       bye("sequence %s has no labels", sequence->name);
     for (int64_t start = 0; start < sequence->length;) {
-      int64_t length = sequence->length - start;
-      if (length > FEATURE_WINDOW)
-        length = FEATURE_WINDOW;
+      int64_t end = gene_end(sequence, start);
+      int64_t length = end - start;
       size_t positions = (size_t)length;
       uint8_t *bases = scalloc(positions, sizeof(*bases));
       float *cwt = scalloc(smul(positions, CWT_CHANNELS), sizeof(*cwt));
       uint8_t *labels = scalloc(positions, sizeof(*labels));
       memcpy(labels, sequence->labels + start, positions * sizeof(*labels));
       samples[sample_index] = (Sample){length, bases, cwt, labels};
-      cwt_power(sequence->bases, sequence->length, start, start + length, power);
-      memset(input, 0, (size_t)INPUT_CHANNELS * FEATURE_WINDOW *
-                          sizeof(*input));
-      compute_features(sequence, power, start, start, length, input);
-      for (size_t p = 0; p < (size_t)length; ++p) {
-        size_t position = (size_t)start + p;
-        int base = base_index(sequence->bases[position]);
-        bases[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
-        for (int c = 0; c < CWT_CHANNELS; ++c)
-          cwt[p * CWT_CHANNELS + (size_t)c] =
-              input[(size_t)(NUCLEOTIDES + c) * FEATURE_WINDOW + p];
+      for (int64_t p = 0; p < length;) {
+        int64_t width = length - p;
+        if (width > CWT_WINDOW)
+          width = CWT_WINDOW;
+        cwt_power(sequence->bases, sequence->length, start + p,
+                  start + p + width, power);
+        memset(input, 0, (size_t)INPUT_CHANNELS * (size_t)width *
+                            sizeof(*input));
+        compute_features(sequence, power, start + p, start + p, width, input);
+        for (int64_t q = 0; q < width; ++q) {
+          size_t position = (size_t)(p + q);
+          int base = base_index(sequence->bases[start + p + q]);
+          bases[position] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
+          for (int c = 0; c < CWT_CHANNELS; ++c)
+            cwt[position * CWT_CHANNELS + (size_t)c] =
+                input[(size_t)(NUCLEOTIDES + c) * (size_t)width + q];
+        }
+        p += width;
       }
       sample_index++;
-      start += length;
+      start = end;
     }
   }
   free(power);
@@ -367,7 +383,8 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
     const int state_class = grammar->state_class[s];
     const int class = model_class(state_class);
     double value = -INFINITY;
-    if (!gold_only || state_class == sample->classes[t]) {
+    if ((!gold_only || state_class == sample->classes[t]) &&
+        (t != 0 || s == 0)) {
       if (t == 0) {
         value = emission[class];
       } else {
@@ -440,6 +457,7 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
   /* The first pass needs only two alpha rows. Checkpoints are the normalized
    * row immediately before each block, not fresh initial distributions. */
   double *previous = alpha, *current = alpha + states;
+  memset(previous, 0, states * sizeof(*previous));
   double log_scale = 0.0;
   for (size_t t = 0; t < length; ++t) {
     double scale;
@@ -455,12 +473,11 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
     current = swap;
   }
   double terminal = -INFINITY;
-  for (size_t s = 0; s < states; ++s)
-    terminal = logadd(terminal, previous[s]);
+  terminal = previous[0];
   if (!isfinite(terminal) || !isfinite(log_scale + terminal)) goto nonfinite;
   *log_z_out = log_scale + terminal;
   for (size_t s = 0; s < states; ++s)
-    beta[s] = -terminal;
+    beta[s] = s == 0 ? -terminal : -INFINITY;
 
   for (size_t b = plan.blocks; b-- > 0;) {
     const size_t start = b * block;
