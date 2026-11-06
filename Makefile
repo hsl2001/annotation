@@ -23,9 +23,17 @@ LIB_SOURCES = $(SRC_DIR)/sequence.c $(SRC_DIR)/cwt.c \
               $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
 HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 
-.PHONY: all clean
+.PHONY: all clean test integration-test
 
 all: surf
+
+test: surf
+	$(CC) $(CFLAGS) -std=c11 -D_POSIX_C_SOURCE=200809L -o /tmp/surf-test \
+		test/test.c $(LIB_SOURCES) $(LDLIBS)
+	/tmp/surf-test
+
+integration-test: surf
+	python3 test/integration_test.py
 
 surf: $(APP_SOURCES) $(LIB_SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(APP_SOURCES) $(LIB_SOURCES) $(LDLIBS)

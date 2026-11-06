@@ -20,11 +20,7 @@
 #include <omp.h>
 #endif
 
-/** @brief Retrun end of continued run of given sequences
- * @param[in] sequence: Sequence of of target region
- * @param[in] start: Start position to be examined
- * @return Returns end position of run (of start position)
- */
+/** @brief Return the end of the labeled run containing start. */
 static int64_t run_end(const Sequence *sequence, int64_t start) {
   int64_t end = start;
   while (end < sequence->length && sequence->labels[end] == INTERGENIC)
@@ -80,23 +76,35 @@ static Sample *prepare_samples(const Sequence *sequences,
       memcpy(labels, sequence->labels + start, positions * sizeof(*labels));
       samples[sample_index] = (Sample){length, bases, cwt, labels};
       for (int64_t p = 0; p < length;) {
-        int64_t width = length - p;
-        if (width > CWT_WINDOW)
-          width = CWT_WINDOW;
-        cwt_power(sequence->bases, sequence->length, start + p,
-                  start + p + width, power);
+        int64_t position_start = start + p;
+        int64_t window_start =
+            position_start / CWT_WINDOW * CWT_WINDOW;
+        int64_t window_end = window_start + CWT_WINDOW;
+        if (window_end > sequence->length)
+          window_end = sequence->length;
+        int64_t width = window_end - window_start;
+        int64_t copy_start = position_start > window_start
+                                 ? position_start
+                                 : window_start;
+        int64_t copy_end = start + length < window_end
+                               ? start + length
+                               : window_end;
+        cwt_power(sequence->bases, sequence->length, window_start, window_end,
+                  power);
         memset(input, 0, (size_t)INPUT_CHANNELS * (size_t)width *
                             sizeof(*input));
-        compute_features(sequence, power, start + p, start + p, width, input);
-        for (int64_t q = 0; q < width; ++q) {
-          size_t position = (size_t)(p + q);
-          int base = base_index(sequence->bases[start + p + q]);
+        compute_features(sequence, power, window_start, window_start, width,
+                         input);
+        for (int64_t genomic = copy_start; genomic < copy_end; ++genomic) {
+          size_t position = (size_t)(genomic - start);
+          int base = base_index(sequence->bases[genomic]);
           bases[position] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
           for (int c = 0; c < CWT_CHANNELS; ++c)
-            cwt[position * CWT_CHANNELS + (size_t)c] =
-                input[(size_t)(NUCLEOTIDES + c) * (size_t)width + q];
+            cwt[position * CWT_CHANNELS + (size_t)c] = input[
+                (size_t)(NUCLEOTIDES + c) * (size_t)width +
+                (size_t)(genomic - window_start)];
         }
-        p += width;
+        p = copy_end - start;
       }
       sample_index++;
       start = end;

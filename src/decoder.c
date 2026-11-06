@@ -79,8 +79,7 @@ void build_grammar(ShortGrammar *grammar) {
     grammar_edge(grammar, intron_tail, internal);
     grammar_edge(grammar, internal_tail, intron);
     grammar_edge(grammar, intron_tail, strand ? start : end);
-    if (!strand)
-      grammar_edge(grammar, end_tail, intergenic);
+    grammar_edge(grammar, end_tail, intergenic);
   }
 }
 
@@ -228,7 +227,7 @@ void read_gff3(const char *path,Sequence *sequences,int count){
   if(gzclose(input)!=Z_OK)bye("cannot read annotation %s",path);
   for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];qsort(t->exons,(size_t)t->count,sizeof(*t->exons),label_segment_compare);label_set_orf_length(t,&sequences[t->sequence]);}
   qsort(transcripts,(size_t)transcript_count,sizeof(*transcripts),label_transcript_compare);
-  for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];Sequence *s=&sequences[t->sequence];if(!s->labels)s->labels=scalloc((size_t)s->length,sizeof(*s->labels));int conflict=0;for(int e=0;e<t->count&&!conflict;++e)for(int64_t p=t->exons[e].start;p<t->exons[e].end;++p)if(s->labels[p]){conflict=1;break;}if(conflict){free(t->parent);free(t->exons);continue;}int plus=t->strand=='+';int first=plus?0:t->count-1,last=plus?t->count-1:0;for(int e=0;e<t->count;++e){LabelSegment exon=t->exons[e];uint8_t class=e==first?(plus?PLUS_START_SINGLE_EXON:MINUS_START_SINGLE_EXON):e==last?(plus?PLUS_END_EXON:MINUS_END_EXON):(plus?PLUS_INTERNAL_EXON:MINUS_INTERNAL_EXON);for(int64_t p=exon.start;p<exon.end;++p)s->labels[p]=class;}uint8_t intron=plus?PLUS_INTRON:MINUS_INTRON;for(int e=0;e+1<t->count;++e)for(int64_t p=t->exons[e].end;p<t->exons[e+1].start;++p)s->labels[p]=intron;free(t->parent);free(t->exons);}
+  for(int i=0;i<transcript_count;++i){LabelTranscript *t=&transcripts[i];Sequence *s=&sequences[t->sequence];if(!s->labels)s->labels=scalloc((size_t)s->length,sizeof(*s->labels));int conflict=0;for(int e=0;e<t->count&&!conflict;++e)for(int64_t p=t->exons[e].start;p<t->exons[e].end;++p)if(s->labels[p]){conflict=1;break;}if(conflict){free(t->parent);free(t->exons);continue;}int plus=t->strand=='+';int first=plus?0:t->count-1,last=plus?t->count-1:0;for(int e=0;e<t->count;++e){LabelSegment exon=t->exons[e];uint8_t class=t->count==1?(plus?PLUS_START_SINGLE_EXON:MINUS_END_EXON):e==first?(plus?PLUS_START_SINGLE_EXON:MINUS_START_SINGLE_EXON):e==last?(plus?PLUS_END_EXON:MINUS_END_EXON):(plus?PLUS_INTERNAL_EXON:MINUS_INTERNAL_EXON);for(int64_t p=exon.start;p<exon.end;++p)s->labels[p]=class;}uint8_t intron=plus?PLUS_INTRON:MINUS_INTRON;for(int e=0;e+1<t->count;++e)for(int64_t p=t->exons[e].end;p<t->exons[e+1].start;++p)s->labels[p]=intron;free(t->parent);free(t->exons);}
   free(transcripts);
 }
 #include "include/cwt.h"
