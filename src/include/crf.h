@@ -5,14 +5,14 @@
 #ifndef CRF_H
 #define CRF_H
 
-#include "surf.h"
 #include "cwt.h"
+#include "surf.h"
 
 #include <stddef.h>
 #include <stdint.h>
 
-#define SHORTGRAMMER_MAX_STATES \
-(1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH))
+#define SHORTGRAMMER_MAX_STATES                                                \
+  (1 + STRANDS * (3 * MIN_EXON_LENGTH + MIN_INTRON_LENGTH))
 #define SHORTGRAMMAR_MAX_BACKPOINTERS (2 * STRANDS + 1)
 
 /** Parameters of CRF */
@@ -27,35 +27,36 @@ static inline int model_class(int class) {
 
 /** Learned emission and transition parameters for the observed classes. */
 typedef struct {
-  double emission_weights[EMISSIONS]; //Class/channel weights and biases.
+  double emission_weights[EMISSIONS];     // Class/channel weights and biases.
   double transition_weights[TRANSITIONS]; // Class-pair transition weights.
 } Model;
 
 /** Just one sampled, compact, and position-major feature window */
 typedef struct {
-    int64_t length; // Number of labeled positions
-    const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other implemations are 0, 1, 2, 3 and -1
-    const float *cwt; // Position-major normalized CWT power array
-    const uint8_t *classes; // Observed class labels per position
+  int64_t length;       // Number of labeled positions
+  const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other
+                        // implemations are 0, 1, 2, 3 and -1
+  const float *cwt;     // Position-major normalized CWT power array
+  const uint8_t *classes; // Observed class labels per position
 } Sample;
 
 /** Grammar for genes */
 typedef struct {
-    int count;
-    uint8_t cls[SHORTGRAMMER_MAX_STATES];
-    int backpointers[SHORTGRAMMER_MAX_STATES];
-    int from[SHORTGRAMMER_MAX_STATES][SHORTGRAMMAR_MAX_BACKPOINTERS];
-    int shift[SHORTGRAMMER_MAX_STATES];
-    int bits[SHORTGRAMMER_MAX_STATES];
+  int count;
+  uint8_t cls[SHORTGRAMMER_MAX_STATES];
+  int backpointers[SHORTGRAMMER_MAX_STATES];
+  int from[SHORTGRAMMER_MAX_STATES][SHORTGRAMMAR_MAX_BACKPOINTERS];
+  int shift[SHORTGRAMMER_MAX_STATES];
+  int bits[SHORTGRAMMER_MAX_STATES];
 } ShortGrammar;
 
 /** Expanede grammar for decoding (includes inner exons) */
 typedef struct {
-    int states;// Number of expanded states
-    const uint8_t *state_class; // Observed class emitted by each state
-    int max_backpointers; // Row stride for backpointer array
-    const uint8_t *backpointer_count; // Incoming-edge per state
-    const int *backpointers; // Flattened state-major backpointer indcies
+  int states;                       // Number of expanded states
+  const uint8_t *state_class;       // Observed class emitted by each state
+  int max_backpointers;             // Row stride for backpointer array
+  const uint8_t *backpointer_count; // Incoming-edge per state
+  const int *backpointers;          // Flattened state-major backpointer indcies
 } LongGrammar;
 
 typedef struct Decoder Decoder;
@@ -65,7 +66,8 @@ void compute_emissions(const Model *model, const float *features,
 
 /**
  * @brief Optimize a CRF model with L-BFGS over labeled one samples.
- * @param[in,out] model: Initial model parameters; replaced with the trained parameters on success.
+ * @param[in,out] model: Initial model parameters; replaced with the trained
+ * parameters on success.
  * @param[in] grammar: Duration-expanded state grammar.
  * @param[in] ones: Sampled labeled training windows.
  * @param[in] one_count Number of training windows.
@@ -73,9 +75,8 @@ void compute_emissions(const Model *model, const float *features,
  * @param[in] threads: Number of objective workers.
  * @return An LbfgsStatus value describing convergence or failure.
  */
-int train(Model *model, const LongGrammar *grammar,
-              const Sample *ones, size_t one_count, int iterations,
-              int threads);
+int train(Model *model, const LongGrammar *grammar, const Sample *ones,
+          size_t one_count, int iterations, int threads);
 
 /**
  * @brief Train a CRF from labeled sequences using L-BFGS.
@@ -85,8 +86,8 @@ int train(Model *model, const LongGrammar *grammar,
  * @param[in] threads: Number of parallel objective workers.
  * @return Newly allocated trained CRF model.
  */
-Model *train_pipeline(const Sequence *sequences, int count,
-                           int iterations, int threads);
+Model *train_pipeline(const Sequence *sequences, int count, int iterations,
+                      int threads);
 
 /**
  * @brief Check that every CRF parameter is finite.
@@ -118,16 +119,16 @@ double model_objective(const double *x, double *gradient, void *opaque);
 #define MAX_WORK_BYTES (64 * 1024 * 1024)
 
 typedef struct {
-    size_t block_length;
-    size_t blocks;
-    size_t bytes;
+  size_t block_length;
+  size_t blocks;
+  size_t bytes;
 } WorkspacePlan;
 
 /**
-* @brief Build the duration-expanded grammar.
-* @param[out] grammar: Receives the initialized grammar.
-* @return None.
-*/
+ * @brief Build the duration-expanded grammar.
+ * @param[out] grammar: Receives the initialized grammar.
+ * @return None.
+ */
 void build_grammar(ShortGrammar *grammar);
 
 Decoder *decoder_create(int64_t length);

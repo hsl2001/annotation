@@ -3,9 +3,9 @@
  * @brief Logics for gene annotation decoding
  */
 
-#include "intervals.c"
-#include "include/utils.h"
 #include "include/surf.h"
+#include "include/utils.h"
+#include "intervals.c"
 
 #include <stdlib.h>
 #include <string.h>
@@ -28,12 +28,15 @@ static char strand_of_class(uint8_t class) {
   case PLUS_START_SINGLE_EXON:
   case PLUS_END_EXON:
   case PLUS_INTRON:
-  case PLUS_INTERNAL_EXON: return '+';
+  case PLUS_INTERNAL_EXON:
+    return '+';
   case MINUS_START_SINGLE_EXON:
   case MINUS_END_EXON:
   case MINUS_INTRON:
-  case MINUS_INTERNAL_EXON: return '-';
-  default: return 0;
+  case MINUS_INTERNAL_EXON:
+    return '-';
+  default:
+    return 0;
   }
 }
 
@@ -57,7 +60,7 @@ int is_stop(const char *c) {
  * @return 1 when found, filling [*start,*end) in transcript coordinates.
  */
 int longest_orf(const char *transcript, int64_t length, int64_t *start,
-                       int64_t *end) {
+                int64_t *end) {
   int64_t best = 0;
   for (int frame = 0; frame < 3; frame++) {
     int64_t open = -1;
@@ -88,8 +91,8 @@ int longest_orf(const char *transcript, int64_t length, int64_t *start,
  * @param[out] out: Destination interval list.
  * @return None.
  */
-static void convert_coordinates(const IntervalList *exons, char strand, int64_t from,
-                      int64_t to, IntervalList *out) {
+static void convert_coordinates(const IntervalList *exons, char strand,
+                                int64_t from, int64_t to, IntervalList *out) {
   int64_t offset = 0;
   for (int order = 0; order < exons->count; order++) {
     const Interval *e =
@@ -127,7 +130,7 @@ static int is_inside(const IntervalList *list, int64_t start, int64_t end) {
  * @return 1 when consistent.
  */
 static int is_valid_records(const Record *records, int count,
-                         const IntervalList *exons) {
+                            const IntervalList *exons) {
   for (int i = 0; i < count; i++) {
     const Record *r = &records[i];
     if (r->start < 0 || r->end <= r->start)
@@ -167,8 +170,8 @@ static int is_valid_records(const Record *records, int count,
  * @return None.
  */
 static void push_record(Record **records, int *count, const char *type,
-                       int64_t start, int64_t end, int phase, const char *id,
-                       const char *parent) {
+                        int64_t start, int64_t end, int phase, const char *id,
+                        const char *parent) {
   *records = srealloc(*records, (size_t)*count + 1, sizeof(**records));
   Record *r = &(*records)[(*count)++];
   r->type = type;
@@ -189,8 +192,8 @@ static void push_record(Record **records, int *count, const char *type,
  * @return 1 written, 0 skipped (no ORF), -1 on error.
  */
 static int write_one_transcript(FILE *output, const Sequence *sequence,
-                            const IntervalList *exons, char strand,
-                            unsigned long gene_number) {
+                                const IntervalList *exons, char strand,
+                                unsigned long gene_number) {
   int64_t length = 0;
   for (int i = 0; i < exons->count; i++)
     length += exons->items[i].end - exons->items[i].start;
@@ -225,12 +228,12 @@ static int write_one_transcript(FILE *output, const Sequence *sequence,
   for (int i = 0; i < exons->count; i++) {
     snprintf(id, sizeof(id), "%s.exon%d", mrna, i + 1);
     push_record(&records, &count, "exon", exons->items[i].start,
-               exons->items[i].end, -1, id, mrna);
+                exons->items[i].end, -1, id, mrna);
   }
   for (int i = 0; i < utr5.count; i++) {
     snprintf(id, sizeof(id), "%s.utr5p%d", mrna, i + 1);
     push_record(&records, &count, "five_prime_UTR", utr5.items[i].start,
-               utr5.items[i].end, -1, id, mrna);
+                utr5.items[i].end, -1, id, mrna);
   }
   for (int i = 0; i < cds.count; i++) {
     int64_t before = 0; /* coding bases upstream in transcript orientation */
@@ -239,12 +242,12 @@ static int write_one_transcript(FILE *output, const Sequence *sequence,
         before += cds.items[j].end - cds.items[j].start;
     snprintf(id, sizeof(id), "%s.cds%d", mrna, i + 1);
     push_record(&records, &count, "CDS", cds.items[i].start, cds.items[i].end,
-               (int)((3 - before % 3) % 3), id, mrna);
+                (int)((3 - before % 3) % 3), id, mrna);
   }
   for (int i = 0; i < utr3.count; i++) {
     snprintf(id, sizeof(id), "%s.utr3p%d", mrna, i + 1);
     push_record(&records, &count, "three_prime_UTR", utr3.items[i].start,
-               utr3.items[i].end, -1, id, mrna);
+                utr3.items[i].end, -1, id, mrna);
   }
   int ok = is_valid_records(records, count, exons);
   if (!ok)
@@ -274,8 +277,8 @@ static int write_one_transcript(FILE *output, const Sequence *sequence,
  * @param[in,out] gene_counter: Gene number counter, updated in place.
  * @return Number of transcripts written, or -1 on output error.
  */
-long write_gff(FILE *output, const Sequence *sequence,
-                    const uint8_t *path, unsigned long *gene_counter) {
+long write_gff(FILE *output, const Sequence *sequence, const uint8_t *path,
+               unsigned long *gene_counter) {
   long written = 0;
   for (int64_t p = 0; p < sequence->length;) {
     char strand = strand_of_class(path[p]);
@@ -288,14 +291,13 @@ long write_gff(FILE *output, const Sequence *sequence,
       int intron = path[p] == PLUS_INTRON || path[p] == MINUS_INTRON;
       int64_t start = p;
       while (p < sequence->length && strand_of_class(path[p]) == strand &&
-             (path[p] == PLUS_INTRON || path[p] == MINUS_INTRON) ==
-                 intron)
+             (path[p] == PLUS_INTRON || path[p] == MINUS_INTRON) == intron)
         p++;
       if (!intron)
         push_interval(&exons, start, p);
     }
     int result = exons.count ? write_one_transcript(output, sequence, &exons,
-                                                strand, *gene_counter + 1)
+                                                    strand, *gene_counter + 1)
                              : 0;
     free(exons.items);
     if (result < 0)

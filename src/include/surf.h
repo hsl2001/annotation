@@ -13,13 +13,13 @@
 #include <stdio.h>
 
 /** Fized constants */
-#define NUCLEOTIDES 4 // A, C, G, T
-#define STRANDS 2 // Plus & minus strands
+#define NUCLEOTIDES 4        // A, C, G, T
+#define STRANDS 2            // Plus & minus strands
 #define COMPLEX_COMPONENTS 2 // Real & imaginary components
-#define PATH_BUFFER 4096 // Maximum handled path length
-#define CLASSES 7 // Number of train labels (classes)
+#define PATH_BUFFER 4096     // Maximum handled path length
+#define CLASSES 7            // Number of train labels (classes)
 /** Constraints for gene grammar */
-#define MIN_EXON_LENGTH 6 // Minimum exon length
+#define MIN_EXON_LENGTH 6    // Minimum exon length
 #define MIN_INTRON_LENGTH 30 // Minimum intron length
 
 /** Related to trainings */
@@ -40,10 +40,10 @@ typedef enum {
 
 /** Sequence records */
 typedef struct {
-    char *name; // FASTA ID
-    char *bases; // !!Upper-case bases!!, NUL for termination
-    int64_t length; // number of bases
-    uint8_t *labels; // Classes per-base (during training) or NULL
+  char *name;      // FASTA ID
+  char *bases;     // !!Upper-case bases!!, NUL for termination
+  int64_t length;  // number of bases
+  uint8_t *labels; // Classes per-base (during training) or NULL
 } Sequence;
 
 /**
@@ -79,10 +79,11 @@ int longest_orf(const char *transcript, int64_t length, int64_t *start,
  * @param[in,out] output: Destination GFF3 stream.
  * @param[in] sequence: Sequence and optional name metadata.
  * @param[in] path: Decoded classes, including inferred INTERNAL_EXON states.
- * @param[in,out] gene_counter: Decoded gene number; updated as records are written.
+ * @param[in,out] gene_counter: Decoded gene number; updated as records are
+ * written.
  * @return number of transcripts written, or -1 on error.
  */
-long write_gff(FILE *output, const Sequence *sequence,
-                    const uint8_t *path, unsigned long *gene_counter);
+long write_gff(FILE *output, const Sequence *sequence, const uint8_t *path,
+               unsigned long *gene_counter);
 
 #endif /* SURF_H */

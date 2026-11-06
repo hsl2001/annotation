@@ -1,7 +1,7 @@
 /**
-* @file lbfgs.h
-* @brief L-BFGS optimizer.
-*/
+ * @file lbfgs.h
+ * @brief L-BFGS optimizer.
+ */
 #ifndef LBFGS_H
 #define LBFGS_H
 
@@ -14,7 +14,8 @@
  * @param[in,out] context: Caller-owned evaluation context.
  * @return Objective value, or a non-finite value on failure.
  */
-typedef double (*lbfgs_evaluate)(const double *x, double *gradient, void *context);
+typedef double (*lbfgs_evaluate)(const double *x, double *gradient,
+                                 void *context);
 
 /**
  * @brief Receive progress information after an accepted optimizer iteration.
@@ -27,17 +28,20 @@ typedef double (*lbfgs_evaluate)(const double *x, double *gradient, void *contex
  * @param[in] gradient: Current objective gradient.
  * @return None.
  */
-typedef void *lbfgs_progress(void *context, int iteration, double objective, double step,
-                               int line_search_trials, size_t n, const double *gradient);
+typedef void *lbfgs_progress(void *context, int iteration, double objective,
+                             double step, int line_search_trials, size_t n,
+                             const double *gradient);
 
 /** Status returned by the L-BFGS optimizer. */
 typedef enum {
-  LBFGS_MAX_ITERATIONS, // The configured iteration limit was reached.
-  LBFGS_CONVERGED, // The gradient-based convergence criterion was met.
+  LBFGS_MAX_ITERATIONS,     // The configured iteration limit was reached.
+  LBFGS_CONVERGED,          // The gradient-based convergence criterion was met.
   LBFGS_STOPPING_CRITERION, // Progress fell below the stopping threshold.
   LBFGS_ALLOCATION_FAILURE = -1, // A required workspace allocation failed.
-  LBFGS_NONFINITE = -2, // An objective, gradient, or search value was non-finite.
-  LBFGS_LINE_SEARCH_FAILURE = -3, // The line search could not find an acceptable step.
+  LBFGS_NONFINITE =
+      -2, // An objective, gradient, or search value was non-finite.
+  LBFGS_LINE_SEARCH_FAILURE =
+      -3, // The line search could not find an acceptable step.
   LBFGS_INVALID_ARGUMENT = -4 // An input argument was invalid.
 } LbfgsStatus;
 
@@ -53,7 +57,7 @@ typedef enum {
  * @return Optimizer status, including convergence and failure cases.
  */
 LbfgsStatus lbfgs_minimize(size_t n, double *x, lbfgs_evaluate evaluate,
-                           lbfgs_progress progress, void *context, int iterations,
-                           int *completed);
+                           lbfgs_progress progress, void *context,
+                           int iterations, int *completed);
 
 #endif /* LBFGS_H */

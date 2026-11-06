@@ -11,15 +11,15 @@
 
 /** Half-open genomic intervals (for both labels and sequences) */
 typedef struct {
-    int64_t start;
-    int64_t end;
+  int64_t start;
+  int64_t end;
 } Interval;
 
 /** List of half-open genomic intervals (for both labels and sequences) */
 typedef struct {
-    Interval *items;
-    int count;
-    int capacity;
+  Interval *items;
+  int count;
+  int capacity;
 } IntervalList;
 
 /**
@@ -38,9 +38,9 @@ void push_interval(IntervalList *list, int64_t start, int64_t end) {
   list->items[list->count++] = (Interval){start, end};
 }
 
-
 /**
- * @brief Compare intervals by start coordinate and then end coordinate (mainly for sorting).
+ * @brief Compare intervals by start coordinate and then end coordinate (mainly
+ * for sorting).
  * @param[in] a: First interval.
  * @param[in] b: Second interval.
  * @return Negative, zero, or positive comparison result.

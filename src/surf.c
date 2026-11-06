@@ -107,8 +107,9 @@ int main(int argc, char **argv) {
     Model *model = scalloc(1, sizeof(*model));
     int status = load_model(model_path, model);
     if (status == EINVAL)
-      bye("invalid or incompatible CRF model %s; retrain with this version of anno",
-                model_path);
+      bye("invalid or incompatible CRF model %s; retrain with this version of "
+          "anno",
+          model_path);
     if (status)
       bye("cannot read CRF model %s: %s", model_path, strerror(status));
     FILE *gff = stdout;
@@ -120,8 +121,7 @@ int main(int argc, char **argv) {
         bye("cannot create %s", path);
     }
     fputs("##gff-version 3\n", gff);
-    unsigned long genes =
-        predict(model, sequences, count, gff, prefix);
+    unsigned long genes = predict(model, sequences, count, gff, prefix);
     if (fflush(gff) || ferror(gff) || (gff != stdout && fclose(gff)))
       bye("cannot write GFF3");
     cry("predicted %lu genes", genes);
