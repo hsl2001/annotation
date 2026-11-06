@@ -17,17 +17,17 @@
 /** Parameters of CRF */
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
 #define TRANSITIONS (CLASSES * CLASSES)
-#define PARAMETERS (EMISSIONS + TRANSITIONS)
-#define L2 1e-4
-
-static inline int model_class(int class) {
-  return class < CLASSES ? class : INTERGENIC;
-}
+#define BOUNDARY_RADIUS 256
+#define BOUNDARY_FEATURES ((2 * BOUNDARY_RADIUS + 1) * NUCLEOTIDES)
+#define BOUNDARY_WEIGHTS (2 * CLASSES * BOUNDARY_FEATURES)
+#define PARAMETERS (EMISSIONS + TRANSITIONS + BOUNDARY_WEIGHTS)
 
 /** Learned emission and transition parameters for the observed classes. */
 typedef struct {
   double emission_weights[EMISSIONS];     // Class/channel weights and biases.
-  double transition_weights[TRANSITIONS]; // Class-pair transition weights.
+  double transition_weights[TRANSITIONS]; // Class-pair transition biases.
+  double
+      boundary_weights[BOUNDARY_WEIGHTS]; // Outgoing then incoming class PWMs.
 } Model;
 
 /** Just one sampled, compact, and position-major feature window */
@@ -51,6 +51,11 @@ typedef struct Decoder Decoder;
 
 void compute_emissions(const Model *model, const float *features,
                        double scores[CLASSES]);
+
+/** Score class transitions at the boundary before position, using DNA only. */
+int compute_transitions(const double *bias, const double *pwm,
+                        const Sample *sample, size_t position,
+                        double scores[TRANSITIONS]);
 
 /**
  * @brief Optimize a CRF model with L-BFGS over labeled one samples.
@@ -95,7 +100,7 @@ typedef struct {
 } ModelObjectiveContext;
 
 /**
- * @brief Compute normalized conditional NLL, regularization, and gradient.
+ * @brief Compute normalized conditional NLL and its full parameter gradient.
  * @param[in] x: Current parameter vector.
  * @param[out] gradient: Receives the objective gradient.
  * @param[in,out] opaque: CRF objective context; records any worker failure.
@@ -103,14 +108,15 @@ typedef struct {
  */
 double model_objective(const double *x, double *gradient, void *opaque);
 
-#define CHECKPOINT_BLOCK 64
-#define MAX_WORK_BYTES (64 * 1024 * 1024)
-
+/** Dense partition storage size and optional row-chunk dimensions. */
 typedef struct {
   size_t block_length;
   size_t blocks;
   size_t bytes;
 } WorkspacePlan;
+
+int workspace_plan(size_t length, size_t states, size_t requested_block,
+                   WorkspacePlan *plan);
 
 /**
  * @brief Build the duration-expanded grammar.

@@ -138,21 +138,19 @@ void decoder_step(Decoder *decoder, const double *emission,
     double best = -INFINITY;
     int choice = 0;
     uint8_t to_class = grammar->cls[state];
-    int to_model_class = model_class(to_class);
+
     for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
       int previous = grammar->from[state][edge];
       uint8_t from_class = grammar->cls[previous];
       double score = decoder->previous[previous];
-      int from_model_class = model_class(from_class);
-      if (transition && from_model_class != to_model_class)
-        score +=
-            transition[(size_t)from_model_class * CLASSES + to_model_class];
+      if (transition && from_class != to_class)
+        score += transition[(size_t)from_class * CLASSES + to_class];
       if (score > best) {
         best = score;
         choice = edge;
       }
     }
-    decoder->current[state] = best + emission[to_model_class];
+    decoder->current[state] = best + emission[to_class];
     if (decoder->current[state] > top)
       top = decoder->current[state];
     decoder->back[(size_t)(position - 1) * (size_t)grammar->count +
@@ -336,14 +334,14 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
   }
   free(transcripts);
 }
-static const char *const prediction_class_names[CLASSES + 2] = {
+static const char *const prediction_class_names[CLASSES] = {
     "intergenic",   "plus_start_single_exon",  "plus_end_exon",
     "plus_intron",  "minus_start_single_exon", "minus_end_exon",
     "minus_intron", "plus_internal_exon",      "minus_internal_exon"};
 typedef struct {
-  FILE *files[CLASSES + 2];
-  int value[CLASSES + 2];
-  int64_t start[CLASSES + 2];
+  FILE *files[CLASSES];
+  int value[CLASSES];
+  int64_t start[CLASSES];
 } PredictionBedgraph;
 static void prediction_emit(PredictionBedgraph *b, const char *name, int class,
                             int64_t position) {
@@ -389,29 +387,35 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
   for (int si = 0; si < count; si++) {
     const Sequence *s = &sequences[si];
     Decoder *d = decoder_create(s->length);
+    /* Context scoring finishes before traceback reuses this buffer as labels.
+     */
+    uint8_t *path = scalloc((size_t)s->length, sizeof(*path));
+    for (int64_t p = 0; p < s->length; ++p) {
+      int base = base_index(s->bases[p]);
+      path[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
+    }
+    Sample sample = {s->length, path, NULL, NULL};
     for (int c = 0; c < CLASSES; c++)
       b.value[c] = -1;
-    float *power = scalloc((size_t)CWT_WINDOW * CWT_CHANNELS, sizeof(*power));
-    int64_t windows = (s->length + CWT_WINDOW - 1) / CWT_WINDOW;
-    for (int64_t w = 0; w < windows; w++) {
-      int64_t start = w * CWT_WINDOW, valid = s->length - start < CWT_WINDOW
-                                                  ? s->length - start
-                                                  : CWT_WINDOW;
-      cwt_power(s->bases, s->length, start, start + valid, power);
-      for (int64_t p = 0; p < valid; p++) {
-        float row[INPUT_CHANNELS];
-        double scores[CLASSES];
-        compute_features(s->bases[start + p], power + p * CWT_CHANNELS, row);
-        compute_emissions(model, row, scores);
-        prediction_add(&b, s->name, start + p, scores);
-        decoder_step(d, scores, model->transition_weights);
-      }
+    float *power =
+        scalloc(smul((size_t)s->length, CWT_CHANNELS), sizeof(*power));
+    cwt_power(s->bases, s->length, 0, s->length, power);
+    for (int64_t p = 0; p < s->length; p++) {
+      float row[INPUT_CHANNELS];
+      double scores[CLASSES], transition[TRANSITIONS];
+      compute_features(s->bases[p], power + p * CWT_CHANNELS, row);
+      compute_emissions(model, row, scores);
+      if (!compute_transitions(model->transition_weights,
+                               model->boundary_weights, &sample, (size_t)p,
+                               transition))
+        bye("non-finite transition score for %s", s->name);
+      prediction_add(&b, s->name, p, scores);
+      decoder_step(d, scores, transition);
     }
     free(power);
     for (int c = 0; c < CLASSES; c++)
       if (b.files[c])
         prediction_emit(&b, s->name, c, s->length);
-    uint8_t *path = scalloc((size_t)s->length, 1);
     if (decoder_finish(d, path))
       bye("grammar decoding failed for %s", s->name);
     size_t coding = 0;

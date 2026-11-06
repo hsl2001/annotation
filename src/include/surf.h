@@ -16,7 +16,7 @@
 #define STRANDS 2            // Plus & minus strands
 #define COMPLEX_COMPONENTS 2 // Real & imaginary components
 #define PATH_BUFFER 4096     // Maximum handled path length
-#define CLASSES 7            // Number of train labels (classes)
+#define CLASSES 9            // Number of train labels (classes)
 /** Constraints for gene grammar */
 #define MIN_EXON_LENGTH 6    // Minimum exon length
 #define MIN_INTRON_LENGTH 30 // Minimum intron length
@@ -32,7 +32,6 @@ typedef enum {
   MINUS_END_EXON = 5,
   MINUS_INTRON = 6,
 
-  /* Internal exons use the intergenic emission. */
   PLUS_INTERNAL_EXON = 7,
   MINUS_INTERNAL_EXON = 8
 } Class;

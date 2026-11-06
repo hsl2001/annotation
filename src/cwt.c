@@ -9,46 +9,11 @@
 
 #include <complex.h>
 #include <math.h>
-#include <stdlib.h>
+
 #include <string.h>
 
 /** Morlet scales of the CWT channels. */
 static const int cwt_scales[CWT_CHANNELS] = {3, 4, 5};
-
-/**
- * @brief Transform a complex vector with an in-place radix-2 FFT.
- * @param[in,out] vector: Complex input vector; replaced by its transform.
- * @param[in] size: Power-of-two vector length.
- * @param[in] inverse Nonzero selects the inverse transform.
- * @return None.
- */
-static void fft_radix2(double complex *vector, size_t size, int inverse) {
-  for (size_t i = 1, j = 0; i < size; i++) {
-    size_t bit = size >> 1;
-    for (; j & bit; bit >>= 1)
-      j ^= bit;
-    j ^= bit;
-    if (i < j) {
-      double complex temporary = vector[i];
-      vector[i] = vector[j];
-      vector[j] = temporary;
-    }
-  }
-  for (size_t half = 1; half < size; half <<= 1) {
-    double angle = (inverse == 1 ? 1.0 : -1.0) * acos(-1.0) / (double)half;
-    double complex step = cos(angle) + I * sin(angle);
-    for (size_t start = 0; start < size; start += 2 * half) {
-      double complex twiddle = 1.0;
-      for (size_t offset = 0; offset < half; offset++) {
-        double complex even = vector[start + offset];
-        double complex odd = vector[start + offset + half] * twiddle;
-        vector[start + offset] = even + odd;
-        vector[start + offset + half] = even - odd;
-        twiddle *= step;
-      }
-    }
-  }
-}
 
 static void transform(const char *bases, int64_t length, int64_t start,
                       int64_t end, float *out, int power) {
@@ -97,63 +62,28 @@ static void transform(const char *bases, int64_t length, int64_t start,
       kernel[s][tap] = sqrt(scale) * normalization * integral;
     }
   }
-  size_t input_length = (size_t)(end - start);
-  if (input_length > CWT_WINDOW)
-    input_length = CWT_WINDOW;
-  input_length += max_width;
-  size_t fft_size = 1;
-  while (fft_size < input_length + max_width - 1)
-    fft_size <<= 1;
-  double complex *kernel_fft =
-      scalloc(smul(CWT_CHANNELS, fft_size), sizeof(*kernel_fft));
-  for (int s = 0; s < CWT_CHANNELS; s++) {
-    for (int tap = 0; tap < width[s]; tap++)
-      kernel_fft[(size_t)s * fft_size + width[s] - 1 - tap] = kernel[s][tap];
-    fft_radix2(kernel_fft + (size_t)s * fft_size, fft_size, 0);
-  }
-  const int64_t window_count = (end - start + CWT_WINDOW - 1) / CWT_WINDOW;
 #pragma omp parallel for schedule(static)
-  for (int64_t window = 0; window < window_count; window++) {
-    int64_t window_start = start + window * CWT_WINDOW;
-    int64_t window_end = window_start + CWT_WINDOW;
-    if (window_end > end)
-      window_end = end;
-    int radius = max_width / 2;
-    int64_t input_start = window_start > radius ? window_start - radius : 0;
-    int64_t input_end =
-        window_end + radius < length ? window_end + radius : length;
-    size_t input_count = (size_t)(input_end - input_start);
-    double complex *transformed =
-        scalloc(smul(fft_size, 2), sizeof(*transformed));
-    double complex *spectrum = transformed + fft_size;
-    for (size_t i = 0; i < input_count; i++) {
-      int base = base_index(bases[input_start + (int64_t)i]);
-      spectrum[i] = base < 0 ? 0.0 : signal[base] / sqrt(2.0);
-    }
-    fft_radix2(spectrum, fft_size, 0);
+  for (int64_t position = start; position < end; position++) {
     for (int s = 0; s < CWT_CHANNELS; s++) {
-      for (size_t i = 0; i < fft_size; i++)
-        transformed[i] = spectrum[i] * kernel_fft[(size_t)s * fft_size + i];
-      fft_radix2(transformed, fft_size, 1);
-      for (int64_t position = window_start; position < window_end; position++) {
-        size_t index = (size_t)(position - input_start) +
-                       (size_t)(width[s] - 1 - width[s] / 2);
-        double complex coefficient = transformed[index] / (double)fft_size;
-        float real = (float)creal(coefficient),
-              imag = (float)cimag(coefficient);
-        size_t out_index =
-            (size_t)(position - start) * CWT_CHANNELS + (size_t)s;
-        if (power)
-          out[out_index] = real * real + imag * imag;
-        else {
-          out[2 * out_index] = real;
-          out[2 * out_index + 1] = imag;
-        }
+      double complex coefficient = 0.0;
+      for (int tap = 0; tap < width[s]; tap++) {
+        int64_t p = position + tap - width[s] / 2;
+        if (p < 0 || p >= length)
+          continue;
+        int base = base_index(bases[p]);
+        if (base >= 0)
+          coefficient += signal[base] / sqrt(2.0) * kernel[s][tap];
+      }
+      float real = (float)creal(coefficient), imag = (float)cimag(coefficient);
+      size_t index = (size_t)(position - start) * CWT_CHANNELS + (size_t)s;
+      if (power)
+        out[index] = real * real + imag * imag;
+      else {
+        out[2 * index] = real;
+        out[2 * index + 1] = imag;
       }
     }
-    free(transformed);
   }
-  free(kernel_fft);
 }
 
 void cwt(const char *bases, int64_t length, int64_t start, int64_t end,

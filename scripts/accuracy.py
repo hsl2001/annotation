@@ -6,6 +6,8 @@ UTR segment metrics. Only the Python standard library is required.
 All query features are scored, including those outside the reference bounds.
 """
 
+from __future__ import annotations
+
 import argparse
 import gzip
 import sys

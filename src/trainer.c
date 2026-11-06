@@ -1,14 +1,9 @@
 /**
- * @file crf.c
- * @brief Training linear-chain CRF
+ * @file trainer.c
+ * @brief Linear-chain CRF training and model serialization.
  */
-
-#ifndef CRF_C
-#define CRF_C
-
 #include "include/crf.h"
 #include "include/lbfgs.h"
-#include "include/surf.h"
 #include "include/utils.h"
 
 #include <errno.h>
@@ -20,68 +15,33 @@
 #include <omp.h>
 #endif
 
-static int64_t run_end(const Sequence *sequence, int64_t start) {
-  int64_t end = start;
-  while (end < sequence->length && sequence->labels[end] == INTERGENIC)
-    end++;
-  while (end < sequence->length && sequence->labels[end] != INTERGENIC)
-    end++;
-  return end < sequence->length ? end + 1 : end;
-}
-
-/**
- * @brief Prepare samples with CWT power features.
- * @param[in] sequences: Input sequences with per-base labels.
- * @param[in] sequence_count: Number of input sequences.
- * @param[out] sample_count: Receives the number of samples.
- * @return Allocated samples and their owned feature arrays.
- */
-static Sample *prepare_samples(const Sequence *sequences, int sequence_count,
-                               size_t *sample_count) {
+static Sample *prepare_samples(const Sequence *sequences, int sequence_count) {
   if (sequence_count < 1)
     bye("no sequences to train CRF");
-  size_t count = 0;
-  for (int s = 0; s < sequence_count; ++s) {
-    if (!sequences[s].labels || sequences[s].length < 1)
-      bye("sequence %s has no labels", sequences[s].name);
-    for (int64_t start = 0; start < sequences[s].length;
-         start = run_end(&sequences[s], start))
-      if (++count == SIZE_MAX)
-        bye("too many training samples");
-  }
-  Sample *samples = scalloc(count, sizeof(*samples));
-  size_t sample_index = 0;
+  Sample *samples = scalloc((size_t)sequence_count, sizeof(*samples));
   for (int s = 0; s < sequence_count; ++s) {
     const Sequence *sequence = &sequences[s];
-    for (int64_t start = 0; start < sequence->length;) {
-      int64_t end = run_end(sequence, start), length = end - start;
-      uint8_t *bases = scalloc((size_t)length, sizeof(*bases));
-      float *cwt = scalloc(smul((size_t)length, CWT_CHANNELS), sizeof(*cwt));
-      samples[sample_index++] =
-          (Sample){length, bases, cwt, sequence->labels + start};
-      cwt_power(sequence->bases, sequence->length, start, end, cwt);
-      for (int64_t p = 0; p < length; p++) {
-        int base = base_index(sequence->bases[start + p]);
-        bases[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
-      }
-      start = end;
+    if (!sequence->labels || sequence->length < 1)
+      bye("sequence %s has no labels", sequence->name);
+    size_t length = (size_t)sequence->length;
+    uint8_t *bases = scalloc(length, sizeof(*bases));
+    float *cwt = scalloc(smul(length, CWT_CHANNELS), sizeof(*cwt));
+    samples[s] = (Sample){sequence->length, bases, cwt, sequence->labels};
+    cwt_power(sequence->bases, sequence->length, 0, sequence->length, cwt);
+    for (size_t p = 0; p < length; p++) {
+      int base = base_index(sequence->bases[p]);
+      bases[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
     }
   }
-  *sample_count = count;
+
   return samples;
 }
 
-/**
- * @brief Validate grammar dimensions, classes, and backpointer indices.
- * @param[in] grammar: Grammar to inspect.
- * @return Nonzero when the grammar is structurally valid.
- */
-static inline int is_grammar_valid(const Grammar *grammar) {
+static int is_grammar_valid(const Grammar *grammar) {
   if (!grammar || grammar->count <= 0 || grammar->count > GRAMMAR_MAX_STATES)
     return 0;
   for (int state = 0; state < grammar->count; ++state) {
-    if (grammar->cls[state] > MINUS_INTERNAL_EXON ||
-        grammar->backpointers[state] < 0 ||
+    if (grammar->cls[state] >= CLASSES || grammar->backpointers[state] < 0 ||
         grammar->backpointers[state] > GRAMMAR_MAX_BACKPOINTERS)
       return 0;
     for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
@@ -93,12 +53,6 @@ static inline int is_grammar_valid(const Grammar *grammar) {
   return 1;
 }
 
-/**
- * @brief Release a set of training samples and all owned feature buffers.
- * @param[in,out] samples: samples to destroy; NULL is accepted.
- * @param[in] count: Number of samples.
- * @return None.
- */
 static void prepare_samples_destroy(Sample *samples, size_t count) {
   if (!samples)
     return;
@@ -109,40 +63,28 @@ static void prepare_samples_destroy(Sample *samples, size_t count) {
   free(samples);
 }
 
-int workspace_plan(size_t length, size_t states, size_t requested_block,
-                   WorkspacePlan *plan);
-
-static void *training_progress(void *opaque, int iteration, double objective,
-                               double step, int line_search_trials, size_t n,
-                               const double *gradient);
-
-static inline int is_sample_valid(const Sample *sample,
-                                  const Grammar *grammar) {
-  if (!sample || !grammar || sample->length < 0)
+static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
+  if (sample->length < 0)
     return 0;
   if (sample->length == 0)
     return 1;
-  if (!sample->bases || !sample->cwt || !sample->classes)
-    return 0;
-  if ((uint64_t)sample->length > SIZE_MAX / sizeof(float) / CWT_CHANNELS ||
-      (uint64_t)sample->length > SIZE_MAX / sizeof(uint8_t))
+  if (!sample->bases || !sample->cwt || !sample->classes ||
+      (uint64_t)sample->length > SIZE_MAX / sizeof(float) / CWT_CHANNELS)
     return 0;
   WorkspacePlan plan;
   if (!workspace_plan((size_t)sample->length, (size_t)grammar->count, 0, &plan))
     return 0;
-  for (int64_t position = 0; position < sample->length; ++position) {
-    if (sample->classes[position] > MINUS_INTERNAL_EXON ||
+  for (int64_t position = 0; position < sample->length; ++position)
+    if (sample->classes[position] >= CLASSES ||
         sample->bases[position] > NUCLEOTIDES)
       return 0;
-  }
   return 1;
 }
 
 int train(Model *model, const Grammar *grammar, const Sample *samples,
           size_t sample_count, int iterations, int threads) {
   if (!model || !is_grammar_valid(grammar) || !samples || !sample_count ||
-      iterations < 1 || threads < 1 || !is_model_finite(model) ||
-      PARAMETERS > SIZE_MAX / sizeof(double))
+      iterations < 1 || threads < 1 || !is_model_finite(model))
     return LBFGS_INVALID_ARGUMENT;
   uint64_t total_length = 0;
   for (size_t i = 0; i < sample_count; ++i) {
@@ -160,14 +102,15 @@ int train(Model *model, const Grammar *grammar, const Sample *samples,
   memcpy(parameters, model->emission_weights, sizeof(model->emission_weights));
   memcpy(parameters + EMISSIONS, model->transition_weights,
          sizeof(model->transition_weights));
+  memcpy(parameters + EMISSIONS + TRANSITIONS, model->boundary_weights,
+         sizeof(model->boundary_weights));
   if ((size_t)threads > sample_count)
     threads = (int)sample_count;
   ModelObjectiveContext context = {grammar,      samples, sample_count,
                                    total_length, threads, 0};
   int completed = 0;
-  LbfgsStatus status =
-      lbfgs_minimize(PARAMETERS, parameters, model_objective, training_progress,
-                     &context, iterations, &completed);
+  LbfgsStatus status = lbfgs_minimize(PARAMETERS, parameters, model_objective,
+                                      NULL, &context, iterations, &completed);
   if (status == LBFGS_NONFINITE && context.failure_status)
     status = (LbfgsStatus)context.failure_status;
   if (status == LBFGS_MAX_ITERATIONS || status == LBFGS_CONVERGED ||
@@ -176,35 +119,87 @@ int train(Model *model, const Grammar *grammar, const Sample *samples,
            sizeof(model->emission_weights));
     memcpy(model->transition_weights, parameters + EMISSIONS,
            sizeof(model->transition_weights));
+    memcpy(model->boundary_weights, parameters + EMISSIONS + TRANSITIONS,
+           sizeof(model->boundary_weights));
   }
   return (int)status;
 }
 
-static void *training_progress(void *opaque, int iteration, double objective,
-                               double step, int line_search_trials, size_t n,
-                               const double *gradient) {
-  (void)opaque;
-  (void)step;
-  (void)line_search_trials;
-  (void)n;
-  (void)gradient;
-  if (iteration % 10 == 0)
-    cry("CRF L-BFGS iteration %d: objective %.9g", iteration, objective);
-  return NULL;
+static int boundary_features(const Sample *sample, size_t position,
+                             size_t indices[2 * BOUNDARY_RADIUS + 1]) {
+  size_t begin = position > BOUNDARY_RADIUS ? position - BOUNDARY_RADIUS : 0;
+  size_t end = (size_t)sample->length - position > BOUNDARY_RADIUS
+                   ? position + BOUNDARY_RADIUS + 1
+                   : (size_t)sample->length;
+  int count = 0;
+  for (size_t p = begin; p < end; ++p)
+    if (sample->bases[p] < NUCLEOTIDES)
+      indices[count++] =
+          (p + BOUNDARY_RADIUS - position) * NUCLEOTIDES + sample->bases[p];
+  return count;
 }
 
 Model *train_pipeline(const Sequence *sequences, int count, int iterations,
                       int threads) {
   Grammar grammar;
   build_grammar(&grammar);
-  size_t sample_count = 0;
-  Sample *sample = prepare_samples(sequences, count, &sample_count);
+  Sample *sample = prepare_samples(sequences, count);
   Model *model = scalloc(1, sizeof(*model));
   double started = whattime();
-  cry("Training: %zu sequences, %d iterations", sample_count, iterations);
+  /* Accumulate sufficient statistics in the zero-initialized model. */
+  for (int s = 0; s < count; ++s)
+    for (size_t t = 0; t < (size_t)sample[s].length; ++t) {
+      int to = sample[s].classes[t];
+      if (to >= CLASSES)
+        bye("invalid CRF training label");
+      if (sample[s].bases[t] < NUCLEOTIDES)
+        model->emission_weights[to * (INPUT_CHANNELS + 1) +
+                                sample[s].bases[t]]++;
+      if (!t)
+        continue;
+      int from = sample[s].classes[t - 1];
+      model->transition_weights[from * CLASSES + to]++;
+      if (from != to) {
+        size_t indices[2 * BOUNDARY_RADIUS + 1];
+        int n = boundary_features(&sample[s], t, indices);
+        for (int i = 0; i < n; ++i) {
+          model->boundary_weights[from * BOUNDARY_FEATURES + indices[i]]++;
+          model->boundary_weights[(CLASSES + to) * BOUNDARY_FEATURES +
+                                  indices[i]]++;
+        }
+      }
+    }
+  for (int c = 0; c < CLASSES; ++c) {
+    double *emission = model->emission_weights + c * (INPUT_CHANNELS + 1);
+    double *transition = model->transition_weights + c * CLASSES;
+    double bases = NUCLEOTIDES, outgoing = CLASSES;
+    for (int b = 0; b < NUCLEOTIDES; ++b)
+      bases += emission[b];
+    for (int to = 0; to < CLASSES; ++to)
+      outgoing += transition[to];
+    for (int b = 0; b < NUCLEOTIDES; ++b)
+      emission[b] = log((emission[b] + 1) / bases);
+    for (int to = 0; to < CLASSES; ++to)
+      transition[to] = log((transition[to] + 1) / outgoing);
+    emission[INPUT_CHANNELS] = transition[c];
+  }
+  /* Each change cancels the destination's stay score already in its bias. */
+  for (int from = 0; from < CLASSES; ++from)
+    for (int to = 0; to < CLASSES; ++to)
+      model->transition_weights[from * CLASSES + to] -=
+          model->emission_weights[to * (INPUT_CHANNELS + 1) + INPUT_CHANNELS];
+  for (size_t i = 0; i < BOUNDARY_WEIGHTS; i += NUCLEOTIDES) {
+    double total = NUCLEOTIDES;
+    for (int b = 0; b < NUCLEOTIDES; ++b)
+      total += model->boundary_weights[i + b];
+    for (int b = 0; b < NUCLEOTIDES; ++b)
+      model->boundary_weights[i + b] =
+          log(NUCLEOTIDES * (model->boundary_weights[i + b] + 1) / total);
+  }
+  cry("Training: %d sequences, %d iterations", count, iterations);
   int status =
-      train(model, &grammar, sample, sample_count, iterations, threads);
-  prepare_samples_destroy(sample, sample_count);
+      train(model, &grammar, sample, (size_t)count, iterations, threads);
+  prepare_samples_destroy(sample, (size_t)count);
   if (status != LBFGS_MAX_ITERATIONS && status != LBFGS_CONVERGED &&
       status != LBFGS_STOPPING_CRITERION)
     bye("CRF L-BFGS training failed (status %d)", status);
@@ -212,13 +207,7 @@ Model *train_pipeline(const Sequence *sequences, int count, int iterations,
   return model;
 }
 
-/**
- * @brief Compute log(exp(a) + exp(b)) without avoidable overflow.
- * @param[in] a: First log-space value.
- * @param[in] b: Second log-space value.
- * @return Logarithm of the sum in log space.
- */
-static inline double logadd(double a, double b) {
+static double logadd(double a, double b) {
   if (a == -INFINITY)
     return b;
   if (b == -INFINITY)
@@ -231,43 +220,13 @@ static inline double logadd(double a, double b) {
   return a + log1p(exp(b - a));
 }
 
-/**
- * @brief Return the flattened emission-parameter offset.
- * @param[in] class: Observed class index.
- * @param[in] channel: Input channel or bias index.
- * @return Offset of the class/channel parameter.
- */
-static inline size_t emission_index(int class, int channel) {
-  return (size_t) class * (INPUT_CHANNELS + 1) + (size_t)channel;
+static size_t emission_index(int class, int channel) {
+  return (size_t)class * (INPUT_CHANNELS + 1) + (size_t)channel;
 }
 
-/**
- * @brief Score one class from a dense feature row.
- * @param[in] weights: Class-major emission weights and bias.
- * @param[in] features: One row of INPUT_CHANNELS values.
- * @param[in] class: Observed class index.
- * @return Linear emission score.
- */
-static inline double emission_scores(const double *weights,
-                                     const float *features, int class) {
-  const size_t base = emission_index(class, 0);
-  double score = weights[base + INPUT_CHANNELS];
-  for (int c = 0; c < INPUT_CHANNELS; ++c)
-    score += weights[base + (size_t)c] * (double)features[c];
-  return score;
-}
-
-/**
- * @brief Score classes of samples directly from a training sample.
- * @param[in] weights: Class-major emission weights and bias.
- * @param[in] sample: Compact sequence features.
- * @param[in] t: Position within the sample.
- * @param[in] class: Observed class index.
- * @return Linear emission score.
- */
-static inline double sample_emission_scores(const double *weights,
-                                            const Sample *sample, size_t t,
-                                            int class) {
+static double sample_emission_scores(const double *weights,
+                                     const Sample *sample, size_t t,
+                                     int class) {
   const size_t base = emission_index(class, 0);
   double score = weights[base + INPUT_CHANNELS];
   uint8_t nucleotide = sample->bases[t];
@@ -279,220 +238,183 @@ static inline double sample_emission_scores(const double *weights,
   return score;
 }
 
-/**
- * @brief Evaluate all class emissions for one position.
- * @param[in] model CRF model containing emission weights.
- * @param[in] features One input-feature row.
- * @param[out] scores Receives one score for each observed class.
- * @return None; invalid pointers leave the output unchanged.
- */
 void compute_emissions(const Model *model, const float *features,
                        double scores[CLASSES]) {
   if (!model || !features || !scores)
     return;
-  for (int c = 0; c < CLASSES; ++c)
-    scores[c] = emission_scores(model->emission_weights, features, c);
-}
-
-/**
- * @brief Return the learned score for a class transition.
- * @param[in] weights: Class-pair transition weights.
- * @param[in] from_class: Previous observed class.
- * @param[in] to_class: Next observed class.
- * @return Transition score; same-class transitions have score zero.
- */
-static inline double transition_score(const double *weights, int from_class,
-                                      int to_class) {
-  if (from_class == to_class)
-    return 0.0;
-  return weights[(size_t)from_class * CLASSES + (size_t)to_class];
-}
-
-static int forward_row(const double *parameters, const Grammar *grammar,
-                       const Sample *sample, int gold_only, size_t t,
-                       const double *previous, double *row, double *scale) {
-  const double *transition = parameters + EMISSIONS;
-  double emission[CLASSES];
   for (int c = 0; c < CLASSES; ++c) {
-    emission[c] = gold_only && c != model_class(sample->classes[t])
-                      ? 0.0
-                      : sample_emission_scores(parameters, sample, t, c);
-    if (!isfinite(emission[c]))
-      return 0;
+    const double *weights = model->emission_weights + emission_index(c, 0);
+    scores[c] = weights[INPUT_CHANNELS];
+    for (int k = 0; k < INPUT_CHANNELS; ++k)
+      scores[c] += weights[k] * features[k];
   }
-  double top = -INFINITY;
-  for (int s = 0; s < grammar->count; ++s) {
-    const int state_class = grammar->cls[s];
-    const int class = model_class(state_class);
-    double value = -INFINITY;
-    if ((!gold_only || state_class == sample->classes[t]) &&
-        (t != 0 || s == 0)) {
-      if (t == 0) {
-        value = emission[class];
-      } else {
-        for (int k = 0; k < grammar->backpointers[s]; ++k) {
-          const int p = grammar->from[s][k];
-          value = logadd(
-              value, previous[p] +
-                         transition_score(transition,
-                                          model_class(grammar->cls[p]), class));
-        }
-        value += emission[class];
-      }
+}
+
+int compute_transitions(const double *bias, const double *pwm,
+                        const Sample *sample, size_t position,
+                        double scores[TRANSITIONS]) {
+  size_t indices[2 * BOUNDARY_RADIUS + 1];
+  int count = boundary_features(sample, position, indices);
+  double context[2 * CLASSES] = {0};
+  for (int c = 0; c < 2 * CLASSES; ++c)
+    for (int i = 0; i < count; ++i)
+      context[c] += pwm[c * BOUNDARY_FEATURES + indices[i]];
+  for (int from = 0; from < CLASSES; ++from)
+    for (int to = 0; to < CLASSES; ++to) {
+      int pair = from * CLASSES + to;
+      scores[pair] =
+          from == to ? 0 : bias[pair] + context[from] + context[CLASSES + to];
+      if (!isfinite(scores[pair]))
+        return 0;
     }
-    row[s] = value;
-    if (value > top)
-      top = value;
-  }
-  if (!isfinite(top))
-    return 0;
-  for (int s = 0; s < grammar->count; ++s)
-    row[s] -= top;
-  *scale = top;
   return 1;
 }
 
-/** Plan O(states * (block + length / block)) capped partition workspace. */
 int workspace_plan(size_t length, size_t states, size_t requested_block,
                    WorkspacePlan *plan) {
   if (!length || !states || !plan)
     return 0;
-  size_t block = requested_block;
-  if (!block) {
-    size_t root = (size_t)sqrt((double)length);
-    if (!root)
-      root = 1;
-    if (root < length / root + (length % root != 0))
-      ++root;
-    block = CHECKPOINT_BLOCK > 0 ? (size_t)CHECKPOINT_BLOCK : 1;
-    if (block < root)
-      block = root;
-  }
+  const size_t max_cells = SIZE_MAX / sizeof(double);
+  if (states > max_cells / 2 ||
+      length > (max_cells - 2 * states) / (states + CLASSES + TRANSITIONS))
+    return 0;
+  size_t block = requested_block ? requested_block : length;
   if (block > length)
     block = length;
-  const size_t blocks = (length - 1) / block + 1;
-  const size_t max_cells = MAX_WORK_BYTES / sizeof(double);
-  /* (blocks - 1) checkpoints, (block + 1) alpha rows, two beta rows,
-   * and block scalar normalizers. Subtraction keeps every size check bounded.
-   */
-  if (block > max_cells || block > SIZE_MAX - 2 ||
-      blocks > SIZE_MAX - block - 2)
-    return 0;
-  const size_t rows = blocks + block + 2;
-  if (states > (max_cells - block) / rows)
-    return 0;
-  plan->block_length = block;
-  plan->blocks = blocks;
-  plan->bytes = (rows * states + block) * sizeof(double);
+  *plan =
+      (WorkspacePlan){block, (length - 1) / block + 1,
+                      (length * (states + CLASSES + TRANSITIONS) + 2 * states) *
+                          sizeof(double)};
   return 1;
 }
 
-/** Evaluate exact marginals, recomputing alpha blocks from saved checkpoints.
- */
-int compute_gradient(const double *parameters, const Grammar *grammar,
-                     const Sample *sample, int gold_only, double sign,
-                     double *gradient, double *log_z_out,
-                     size_t checkpoint_block) {
-  const size_t states = (size_t)grammar->count;
-  const size_t length = (size_t)sample->length;
-  WorkspacePlan plan;
-  if (!workspace_plan(length, states, checkpoint_block, &plan))
-    return 0;
-  double *work = (double *)malloc(plan.bytes);
-  if (!work)
-    return -1;
-  const size_t block = plan.block_length;
-  double *checkpoints = work;
-  double *alpha = checkpoints + (plan.blocks - 1) * states;
-  double *beta = alpha + (block + 1) * states;
-  double *previous_beta = beta + states;
-  double *scales = previous_beta + states;
-  const double *transition = parameters + EMISSIONS;
-
-  /* The first pass needs only two alpha rows. Checkpoints are the normalized
-   * row immediately before each block, not fresh initial distributions. */
-  double *previous = alpha, *current = alpha + states;
-  memset(previous, 0, states * sizeof(*previous));
-  double log_scale = 0.0;
-  for (size_t t = 0; t < length; ++t) {
-    double scale;
-    if (!forward_row(parameters, grammar, sample, gold_only, t, previous,
-                     current, &scale))
-      goto nonfinite;
-    log_scale += scale;
-    if ((t + 1) % block == 0 && t + 1 < length)
-      memcpy(checkpoints + ((t + 1) / block - 1) * states, current,
-             states * sizeof(*current));
-    double *swap = previous;
-    previous = current;
-    current = swap;
-  }
-  double terminal = previous[0];
-  if (!isfinite(terminal) || !isfinite(log_scale + terminal))
-    goto nonfinite;
-  *log_z_out = log_scale + terminal;
-  for (size_t s = 0; s < states; ++s)
-    beta[s] = s == 0 ? -terminal : -INFINITY;
-
-  for (size_t b = plan.blocks; b-- > 0;) {
-    const size_t start = b * block;
-    const size_t width = length - start < block ? length - start : block;
-    if (b)
-      memcpy(alpha, checkpoints + (b - 1) * states, states * sizeof(*alpha));
-    for (size_t offset = 0; offset < width; ++offset)
-      if (!forward_row(parameters, grammar, sample, gold_only, start + offset,
-                       alpha + offset * states, alpha + (offset + 1) * states,
-                       &scales[offset]))
-        goto nonfinite;
-
-    for (size_t offset = width; offset-- > 0;) {
-      const size_t t = start + offset;
-      const double *row = alpha + (offset + 1) * states;
-      double emission[CLASSES];
-      for (int c = 0; c < CLASSES; ++c)
-        emission[c] = gold_only && c != model_class(sample->classes[t])
-                          ? 0.0
-                          : sample_emission_scores(parameters, sample, t, c);
-      for (size_t p = 0; p < states; ++p)
-        previous_beta[p] = -INFINITY;
-      for (size_t s = 0; s < states; ++s) {
-        const int state_class = grammar->cls[s];
-        const int class = model_class(state_class);
-        if (gold_only && state_class != sample->classes[t])
-          continue;
-        const double probability = exp(row[s] + beta[s]);
-        const size_t base = emission_index(class, 0);
-        const uint8_t nucleotide = sample->bases[t];
-        if (nucleotide < NUCLEOTIDES)
-          gradient[base + nucleotide] += sign * probability;
-        const float *cwt = sample->cwt + t * CWT_CHANNELS;
-        for (int c = 0; c < CWT_CHANNELS; ++c)
-          gradient[base + NUCLEOTIDES + (size_t)c] +=
-              sign * probability * (double)cwt[c];
-        gradient[base + INPUT_CHANNELS] += sign * probability;
-
-        if (!t)
-          continue;
-        const double suffix = emission[class] + beta[s] - scales[offset];
+static int forward_row(const Grammar *grammar, const double *emission,
+                       const double *transition, const double *previous,
+                       double *row, int observed, int initial) {
+  double top = -INFINITY;
+  for (int s = 0; s < grammar->count; ++s) {
+    int class = grammar->cls[s];
+    double value = -INFINITY;
+    if (observed < 0 || class == observed) {
+      if (initial) {
+        if (s == 0)
+          value = 0;
+      } else {
         for (int k = 0; k < grammar->backpointers[s]; ++k) {
-          const int p = grammar->from[s][k];
-          const int from_class = model_class(grammar->cls[p]);
-          const double edge = transition_score(transition, from_class, class);
-          previous_beta[p] = logadd(previous_beta[p], edge + suffix);
-          if (from_class != class) {
-            const size_t index =
-                EMISSIONS + (size_t)from_class * CLASSES + (size_t) class;
-            gradient[index] +=
-                sign * exp(alpha[offset * states + (size_t)p] + edge + suffix);
-          }
+          int p = grammar->from[s][k];
+          value =
+              logadd(value, previous[p] +
+                                transition[grammar->cls[p] * CLASSES + class]);
         }
       }
-      if (t) {
-        double *swap = beta;
-        beta = previous_beta;
-        previous_beta = swap;
+      value += emission[class];
+    }
+    if (value != -INFINITY && !isfinite(value))
+      return 0;
+    row[s] = value;
+    if (value > top)
+      top = value;
+  }
+  return isfinite(top);
+}
+
+static int sample_objective(const double *parameters, const Grammar *grammar,
+                            const Sample *sample, double *gradient,
+                            double *objective) {
+  size_t states = (size_t)grammar->count, length = (size_t)sample->length;
+  WorkspacePlan plan;
+  if (!workspace_plan(length, states, 0, &plan))
+    return 0;
+  double *work = malloc(plan.bytes);
+  if (!work)
+    return -1;
+  double *alpha = work, *emissions = alpha + length * states;
+  double *transitions = emissions + length * CLASSES;
+  double *gold_previous = transitions + length * TRANSITIONS;
+  double *gold_current = gold_previous + states;
+  for (size_t t = 0; t < length; ++t) {
+    double *emission = emissions + t * CLASSES;
+    double *transition = transitions + t * TRANSITIONS;
+    for (int c = 0; c < CLASSES; ++c) {
+      emission[c] = sample_emission_scores(parameters, sample, t, c);
+      if (!isfinite(emission[c]))
+        goto nonfinite;
+    }
+    if (!compute_transitions(parameters + EMISSIONS,
+                             parameters + EMISSIONS + TRANSITIONS, sample, t,
+                             transition) ||
+        !forward_row(grammar, emission, transition,
+                     t ? alpha + (t - 1) * states : NULL, alpha + t * states,
+                     -1, t == 0) ||
+        !forward_row(grammar, emission, transition, gold_previous, gold_current,
+                     sample->classes[t], t == 0))
+      goto nonfinite;
+    double *swap = gold_previous;
+    gold_previous = gold_current;
+    gold_current = swap;
+  }
+  double log_z = alpha[(length - 1) * states];
+  if (!isfinite(log_z) || !isfinite(gold_previous[0]))
+    goto nonfinite;
+  *objective = log_z - gold_previous[0];
+  double *beta = gold_previous, *previous_beta = gold_current;
+  for (size_t s = 0; s < states; ++s)
+    beta[s] = s == 0 ? -log_z : -INFINITY;
+
+  /* All gold-compatible state paths have identical class features. Their
+   * forward sum retains multiplicity; its derivative is the observed counts. */
+  for (size_t t = length; t-- > 0;) {
+    const double *emission = emissions + t * CLASSES;
+    const double *transition = transitions + t * TRANSITIONS;
+    double mass[CLASSES] = {0}, edges[TRANSITIONS] = {0};
+    for (size_t s = 0; s < states; ++s)
+      previous_beta[s] = -INFINITY;
+    for (size_t s = 0; s < states; ++s) {
+      int class = grammar->cls[s];
+      mass[class] += exp(alpha[t * states + s] + beta[s]);
+      if (!t)
+        continue;
+      double suffix = emission[class] + beta[s];
+      for (int k = 0; k < grammar->backpointers[s]; ++k) {
+        int p = grammar->from[s][k], from = grammar->cls[p];
+        size_t pair = (size_t)from * CLASSES + (size_t)class;
+        double value = transition[pair] + suffix;
+        previous_beta[p] = logadd(previous_beta[p], value);
+        if (from != class)
+          edges[pair] += exp(alpha[(t - 1) * states + (size_t)p] + value);
       }
     }
+    for (int c = 0; c < CLASSES; ++c) {
+      double residual = mass[c] - (sample->classes[t] == c);
+      size_t base = emission_index(c, 0);
+      if (sample->bases[t] < NUCLEOTIDES)
+        gradient[base + sample->bases[t]] += residual;
+      for (int k = 0; k < CWT_CHANNELS; ++k)
+        gradient[base + NUCLEOTIDES + (size_t)k] +=
+            residual * sample->cwt[t * CWT_CHANNELS + (size_t)k];
+      gradient[base + INPUT_CHANNELS] += residual;
+    }
+    if (t) {
+      int from = sample->classes[t - 1], to = sample->classes[t];
+      if (from != to)
+        edges[from * CLASSES + to] -= 1;
+      size_t indices[2 * BOUNDARY_RADIUS + 1];
+      int count = boundary_features(sample, t, indices);
+      double changes[2 * CLASSES] = {0};
+      for (int pair = 0; pair < TRANSITIONS; ++pair) {
+        gradient[EMISSIONS + pair] += edges[pair];
+        changes[pair / CLASSES] += edges[pair];
+        changes[CLASSES + pair % CLASSES] += edges[pair];
+      }
+      for (int c = 0; c < 2 * CLASSES; ++c)
+        if (changes[c] != 0)
+          for (int i = 0; i < count; ++i)
+            gradient[EMISSIONS + TRANSITIONS + c * BOUNDARY_FEATURES +
+                     indices[i]] += changes[c];
+    }
+    double *swap = beta;
+    beta = previous_beta;
+    previous_beta = swap;
   }
   free(work);
   return 1;
@@ -503,24 +425,25 @@ nonfinite:
 }
 
 double model_objective(const double *x, double *gradient, void *opaque) {
-  ModelObjectiveContext *context = (ModelObjectiveContext *)opaque;
+  typedef struct {
+    double gradient[PARAMETERS], objective;
+    int status;
+  } Worker;
+  ModelObjectiveContext *context = opaque;
   memset(gradient, 0, PARAMETERS * sizeof(*gradient));
   context->failure_status = 0;
-  const size_t workers = (size_t)context->threads;
-  if (!workers || workers > SIZE_MAX / PARAMETERS ||
-      workers * PARAMETERS > SIZE_MAX / sizeof(double)) {
+  size_t count = (size_t)context->threads;
+  if (!count || count > SIZE_MAX / sizeof(Worker) || !context->total_length) {
     context->failure_status = LBFGS_INVALID_ARGUMENT;
     return NAN;
   }
-  double *thread_gradient =
-      (double *)calloc(workers * PARAMETERS, sizeof(*thread_gradient));
-  double *thread_objective =
-      (double *)calloc(workers, sizeof(*thread_objective));
-  int *thread_status = (int *)calloc(workers, sizeof(*thread_status));
-  if (!thread_gradient || !thread_objective || !thread_status) {
-    free(thread_gradient);
-    free(thread_objective);
-    free(thread_status);
+  for (size_t i = 0; i < PARAMETERS; ++i)
+    if (!isfinite(x[i])) {
+      context->failure_status = LBFGS_NONFINITE;
+      return NAN;
+    }
+  Worker *workers = calloc(count, sizeof(*workers));
+  if (!workers) {
     context->failure_status = LBFGS_ALLOCATION_FAILURE;
     return NAN;
   }
@@ -532,69 +455,49 @@ double model_objective(const double *x, double *gradient, void *opaque) {
 #ifdef _OPENMP
     thread = omp_get_thread_num();
 #endif
-    double *local_gradient = thread_gradient + (size_t)thread * PARAMETERS;
+    Worker *worker = &workers[thread];
     const Sample *sample = &context->samples[i];
     if (!sample->length)
       continue;
-    double log_z_all, log_z_gold;
-    int all_status = compute_gradient(x, context->grammar, sample, 0, 1.0,
-                                      local_gradient, &log_z_all, 0);
-    int gold_status =
-        all_status > 0 ? compute_gradient(x, context->grammar, sample, 1, -1.0,
-                                          local_gradient, &log_z_gold, 0)
-                       : all_status;
-    if (all_status <= 0 || gold_status <= 0) {
-      int status = all_status < 0 || gold_status < 0 ? LBFGS_ALLOCATION_FAILURE
-                                                     : LBFGS_NONFINITE;
-      thread_status[thread] = status;
-      continue;
+    double value;
+    int status =
+        sample_objective(x, context->grammar, sample, worker->gradient, &value);
+    if (status > 0)
+      worker->objective += value;
+    else
+      worker->status = status < 0 ? LBFGS_ALLOCATION_FAILURE : LBFGS_NONFINITE;
+  }
+  double objective = 0, inverse_length = 1.0 / (double)context->total_length;
+  for (size_t thread = 0; thread < count; ++thread) {
+    if (workers[thread].status)
+      context->failure_status = workers[thread].status;
+    objective += workers[thread].objective * inverse_length;
+    for (size_t i = 0; i < PARAMETERS; ++i) {
+      gradient[i] += workers[thread].gradient[i] * inverse_length;
+      if (!isfinite(gradient[i]))
+        context->failure_status = LBFGS_NONFINITE;
     }
-    thread_objective[thread] += log_z_all - log_z_gold;
   }
-  double objective = 0.0;
-  for (size_t thread = 0; thread < workers; ++thread) {
-    if (thread_status[thread])
-      context->failure_status = thread_status[thread];
-    objective += thread_objective[thread];
-    for (size_t i = 0; i < PARAMETERS; ++i)
-      gradient[i] += thread_gradient[thread * PARAMETERS + i];
-  }
-  free(thread_gradient);
-  free(thread_objective);
-  free(thread_status);
-  if (context->failure_status)
-    return NAN;
-  const double inverse_total_length = 1.0 / (double)context->total_length;
-  objective *= inverse_total_length;
-  for (size_t i = 0; i < PARAMETERS; ++i) {
-    gradient[i] *= inverse_total_length;
-    objective += 0.5 * L2 * x[i] * x[i];
-    gradient[i] += L2 * x[i];
-  }
-  if (!isfinite(objective)) {
+  free(workers);
+  if (!isfinite(objective))
     context->failure_status = LBFGS_NONFINITE;
-    return NAN;
-  }
-  return objective;
+  return context->failure_status ? NAN : objective;
 }
 
-/**
- * @brief Check that every model parameter is finite.
- * @param[in] model: Model to inspect.
- * @return Nonzero when all parameters are finite.
- */
 int is_model_finite(const Model *model) {
-  for (size_t i = 0; i < PARAMETERS; ++i) {
-    const double value = i < EMISSIONS
-                             ? model->emission_weights[i]
-                             : model->transition_weights[i - EMISSIONS];
-    if (!isfinite(value))
-      return 0;
-  }
+  if (!model)
+    return 0;
+  const double *weights[] = {model->emission_weights, model->transition_weights,
+                             model->boundary_weights};
+  const size_t counts[] = {EMISSIONS, TRANSITIONS, BOUNDARY_WEIGHTS};
+  for (size_t group = 0; group < 3; ++group)
+    for (size_t i = 0; i < counts[group]; ++i)
+      if (!isfinite(weights[group][i]))
+        return 0;
   return 1;
 }
 
-static const char model_magic[4] = {'S', 'U', 'R', '2'};
+static const char model_magic[4] = {'S', 'U', 'R', '4'};
 
 int save_model(const char *path, const Model *model) {
   if (!path || !model || !is_model_finite(model))
@@ -635,5 +538,3 @@ int load_model(const char *path, Model *model) {
   *model = candidate;
   return 0;
 }
-
-#endif /** CRF_C */
