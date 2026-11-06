@@ -20,7 +20,12 @@
 #include <omp.h>
 #endif
 
-static int64_t gene_end(const Sequence *sequence, int64_t start) {
+/** @brief Retrun end of continued run of given sequences
+ * @param[in] sequence: Sequence of of target region
+ * @param[in] start: Start position to be examined
+ * @return Returns end position of run (of start position)
+ */
+static int64_t run_end(const Sequence *sequence, int64_t start) {
   int64_t end = start;
   while (end < sequence->length && sequence->labels[end] == INTERGENIC)
     end++;
@@ -39,6 +44,7 @@ static int64_t gene_end(const Sequence *sequence, int64_t start) {
 static Sample *prepare_samples(const Sequence *sequences,
                                          int sequence_count,
                                          size_t *sample_count) {
+  /** allocation test*/
   if (sequence_count < 1)
     bye("no sequences to train CRF");
   size_t count = 0;
@@ -46,12 +52,14 @@ static Sample *prepare_samples(const Sequence *sequences,
     if (sequences[s].length < 1)
       bye("sequence %s has no labels", sequences[s].name);
     for (int64_t start = 0; start < sequences[s].length;) {
-      int64_t end = gene_end(&sequences[s], start);
+      int64_t end = run_end(&sequences[s], start);
       if (++count == SIZE_MAX)
         bye("too many training samples");
       start = end;
     }
   }
+  /** test ends */
+
   Sample *samples = scalloc(count, sizeof(*samples));
   float *input = scalloc((size_t)INPUT_CHANNELS * CWT_WINDOW,
                               sizeof(*input));
@@ -63,7 +71,7 @@ static Sample *prepare_samples(const Sequence *sequences,
     if (!sequence->labels || sequence->length < 1)
       bye("sequence %s has no labels", sequence->name);
     for (int64_t start = 0; start < sequence->length;) {
-      int64_t end = gene_end(sequence, start);
+      int64_t end = run_end(sequence, start);
       int64_t length = end - start;
       size_t positions = (size_t)length;
       uint8_t *bases = scalloc(positions, sizeof(*bases));
