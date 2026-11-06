@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 
 enum { LBFGS_HISTORY = 6, LBFGS_PAST = 10, LBFGS_MAX_LINE_SEARCH = 20 };

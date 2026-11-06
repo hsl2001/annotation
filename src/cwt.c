@@ -5,7 +5,7 @@
 
 #include "include/cwt.h"
 #include "include/surf.h"
-#include "utils.c"
+#include "include/utils.h"
 
 #include <complex.h>
 #include <math.h>

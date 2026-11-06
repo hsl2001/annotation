@@ -4,7 +4,7 @@
  */
 #include "include/surf.h"
 #include "include/crf.h"
-#include "utils.c"
+#include "include/utils.h"
 
 #include <errno.h>
 #include <limits.h>

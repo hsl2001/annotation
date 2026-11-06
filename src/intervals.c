@@ -5,7 +5,9 @@
 #ifndef INTERVALS_C
 #define INTERVALS_C
 
-#include "utils.c"
+#include "include/utils.h"
+
+#include <stdint.h>
 
 /** Half-open genomic intervals (for both labels and sequences) */
 typedef struct {

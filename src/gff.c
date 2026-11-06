@@ -4,7 +4,11 @@
  */
 
 #include "intervals.c"
+#include "include/utils.h"
 #include "include/surf.h"
+
+#include <stdlib.h>
+#include <string.h>
 
 /** One GFF3 record */
 typedef struct {

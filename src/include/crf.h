@@ -54,15 +54,10 @@ typedef struct {
     const int *backpointers; // Flattened state-major backpointer indcies
 } LongGrammar;
 
-/**
- * @brief Evaluate all class emissions for one position.
- * @param[in] model: CRF model containing emission weights.
- * @param[in] features: One input-feature row.
- * @param[out] scores: Receives one score for each observed class.
- * @return None; invalid pointers leave the output unchanged.
- */
-void evaluate_emissions(const Model *model, const float *features,
-                   double scores[CLASSES]);
+typedef struct Decoder Decoder;
+
+void compute_emissions(const Model *model, const float *features,
+                       double scores[CLASSES]);
 
 /**
  * @brief Optimize a CRF model with L-BFGS over labeled one samples.
@@ -131,18 +126,17 @@ typedef struct {
 */
 void build_grammar(ShortGrammar *grammar);
 
+Decoder *decoder_create(int64_t length);
+void decoder_destroy(Decoder *decoder);
+void decoder_step(Decoder *decoder, const double *emission,
+                  const double *transition);
+int decoder_finish(Decoder *decoder, uint8_t *path);
+
 /**
  * @brief Predict sequences, writing GFF3 and optional class bedGraphs.
- * @param[in] model: Trained CRF model.
- * @param[in] sequences: Genome sequences to predict.
- * @param[in] count: Number of sequences.
- * @param[in,out] gff: Destination GFF3 stream.
- * @param[in] prefix: Optional bedGraph output prefix, or NULL.
- * @return Number of genes written.
  */
-unsigned long predict(const Model *model,
-                             const Sequence *sequences, int count,
-                             FILE *gff, const char *prefix);
+unsigned long predict(const Model *model, const Sequence *sequences, int count,
+                      FILE *gff, const char *prefix);
 
 /**
  * @brief Write a versioned CRF model file.
@@ -152,12 +146,6 @@ unsigned long predict(const Model *model,
  */
 int save_model(const char *path, const Model *model);
 
-/**
- * @brief Load a nine-class CRF model; seven-class models must be retrained.
- * @param[in] path: Source model path.
- * @param[out] model: Receives the loaded model on success.
- * @return Zero on success, or an errno-style error code.
- */
 int load_model(const char *path, Model *model);
 
 #endif /* CRF_H */

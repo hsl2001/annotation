@@ -6,7 +6,7 @@
 #define SEQUENCE_C
 
 #include "include/surf.h"
-#include "utils.c"
+#include "include/utils.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -100,7 +100,7 @@ void read_fasta(const char *path, int *count_out, Sequence *out) {
   *out = *sequences;
 }
 
-void free_sequence(Sequence *sequences, int count) {
+void free_sequences(Sequence *sequences, int count) {
   for (int i = 0; sequences && i < count; i++) {
     free(sequences[i].name);
     free(sequences[i].bases);

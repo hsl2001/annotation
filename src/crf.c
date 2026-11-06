@@ -9,10 +9,12 @@
 #include "include/surf.h"
 #include "include/crf.h"
 #include "include/lbfgs.h"
-#include "utils.c"
+#include "include/utils.h"
 
 #include <math.h>
 #include <errno.h>
+#include <stdlib.h>
+#include <string.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -241,18 +243,17 @@ static inline double sample_emission_scores(const double *weights,
 
 /**
  * @brief Evaluate all class emissions for one position.
- * @param[in] model: CRF model containing emission weights.
- * @param[in] features: One input-feature row.
- * @param[out] scores: Receives one score for each observed class.
+ * @param[in] model CRF model containing emission weights.
+ * @param[in] features One input-feature row.
+ * @param[out] scores Receives one score for each observed class.
  * @return None; invalid pointers leave the output unchanged.
  */
 void compute_emissions(const Model *model, const float *features,
-                   double scores[CLASSES]) {
+                       double scores[CLASSES]) {
   if (!model || !features || !scores) return;
   for (int c = 0; c < CLASSES; ++c)
     scores[c] = emission_scores(model->emission_weights, features, c);
 }
-
 
 /**
  * @brief Return the learned score for a class transition.

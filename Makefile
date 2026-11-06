@@ -1,27 +1,24 @@
-CC = clang
-CFLAGS = -O3 -Wall -Wextra -Xpreprocessor -fopenmp \
-         -I/opt/homebrew/opt/libomp/include
-LIBS = -lz -lm -L/opt/homebrew/opt/libomp/lib -lomp
+CC ?= clang
+CFLAGS ?= -O3
+CFLAGS += -std=c11 -Wall -Wextra -D_POSIX_C_SOURCE=200809L -Isrc -fopenmp
+CPPFLAGS +=
+LDLIBS += -lz -lm -fopenmp
 
-SRC_DIR = src/
-INCLUDE_DIR = src/include/
+SRC_DIR = src
+INCLUDE_DIR = $(SRC_DIR)/include
 
-LIB_SOURCES = $(SRC_DIR)util.c $(SRC_DIR)sequence.c $(SRC_DIR)labels.c $(SRC_DIR)segments.c $(SRC_DIR)features.c $(SRC_DIR)crf.c \
-              $(SRC_DIR)crf_pipeline.c $(SRC_DIR)decoder.c $(SRC_DIR)gff.c $(SRC_DIR)prediction.c $(SRC_DIR)lbfgs.c
-HEADERS = $(INCLUDE_DIR)anno.h $(INCLUDE_DIR)anno_internal.h $(INCLUDE_DIR)crf.h $(INCLUDE_DIR)crf_internal.h $(INCLUDE_DIR)lbfgs.h
+APP_SOURCES = $(SRC_DIR)/surf.c
+LIB_SOURCES = $(SRC_DIR)/sequence.c $(SRC_DIR)/cwt.c \
+          $(SRC_DIR)/crf.c $(SRC_DIR)/decoder.c $(SRC_DIR)/gff.c \
+          $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
+HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 
-.PHONY: all clean test
+.PHONY: all clean
 
-all: anno
+all: surf
 
-anno: $(SRC_DIR)anno.c $(LIB_SOURCES) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ $(SRC_DIR)anno.c $(LIB_SOURCES) $(LIBS)
-
-test-bin: test/test.c $(LIB_SOURCES) $(HEADERS)
-	$(CC) $(CFLAGS) -o $@ test/test.c $(LIB_SOURCES) $(LIBS)
-
-test: anno test-bin
-	./test-bin
+surf: $(APP_SOURCES) $(LIB_SOURCES) $(HEADERS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(APP_SOURCES) $(LIB_SOURCES) $(LDLIBS)
 
 clean:
-	rm -f anno test-bin
+	rm -f surf
