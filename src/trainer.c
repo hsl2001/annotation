@@ -337,7 +337,7 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
   const double *transition = parameters + EMISSIONS;
   double emission[CLASSES];
   for (int c = 0; c < CLASSES; ++c) {
-    emission[c] = gold_only && c != sample->classes[t]
+    emission[c] = gold_only && c != model_class(sample->classes[t])
                       ? 0.0 : sample_emission_scores(parameters, sample, t, c);
     if (!isfinite(emission[c])) return 0;
   }
@@ -348,7 +348,8 @@ static int forward_row(const double *parameters, const LongGrammar *grammar,
     double value = -INFINITY;
     if ((!gold_only || state_class == sample->classes[t])) {
       if (t == 0) {
-        value = emission[class];
+        if (s == 0)
+          value = emission[class];
       } else {
         for (int k = 0; k < grammar->backpointer_count[s]; ++k) {
           const int p = grammar->backpointers[(size_t)s *
@@ -458,7 +459,7 @@ int compute_gradient(const double *parameters, const LongGrammar *grammar,
       const double *row = alpha + (offset + 1) * states;
       double emission[CLASSES];
       for (int c = 0; c < CLASSES; ++c)
-        emission[c] = gold_only && c != sample->classes[t]
+        emission[c] = gold_only && c != model_class(sample->classes[t])
                           ? 0.0 : sample_emission_scores(parameters, sample, t, c);
       for (size_t p = 0; p < states; ++p) previous_beta[p] = -INFINITY;
       for (size_t s = 0; s < states; ++s) {
