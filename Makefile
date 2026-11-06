@@ -31,6 +31,7 @@ test: surf
 	$(CC) $(CFLAGS) -std=c11 -D_POSIX_C_SOURCE=200809L -o /tmp/surf-test \
 		test/test.c $(LIB_SOURCES) $(LDLIBS)
 	/tmp/surf-test
+	python3 -m unittest discover -s test -p 'test_*.py'
 
 integration-test: surf
 	python3 test/integration_test.py
