@@ -18,7 +18,7 @@
 #define CLASSES 9        // Number of train labels (classes)
 
 /** Related to trainings */
-#define DEFAULT_ITERATIONS 100 // Maximum L-BFGS iterations
+#define DEFAULT_ITERATIONS 1000 // Maximum L-BFGS iterations
 typedef enum {
   INTERGENIC = 0,
   PLUS_START_SINGLE_EXON = 1,

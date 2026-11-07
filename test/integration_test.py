@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Train full Nipponbare chr5 within 120 seconds and check self-prediction."""
 
 from __future__ import annotations
