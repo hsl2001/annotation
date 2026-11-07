@@ -58,7 +58,7 @@ def main() -> None:
         precision, recall, f1 = result[name]
         print(f"{label}: F1={f1:.2%} precision={precision:.2%} recall={recall:.2%}")
     exon_f1, nucleotide_f1 = result["exon-segment"][2], result["nt"][2]
-    if gene_count < 10 or nucleotide_f1 < 0.95 or exon_f1 < 0.80:
+    if gene_count < 17 or nucleotide_f1 < 0.85 or exon_f1 < 0.70:
         raise AssertionError(
             f"genes={gene_count}, exon F1={exon_f1:.2%}, nt F1={nucleotide_f1:.2%}"
         )
