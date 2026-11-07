@@ -14,8 +14,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from scripts.accuracy import OUTPUT_LABELS, metrics
 
-FASTA = ROOT / "data/truth.nip.chr5.fasta"
-GFF = ROOT / "data/truth.nip.chr5.gff3"
+FASTA = ROOT / "data/truth.nip.chr5.100k.fasta"
+GFF = ROOT / "data/truth.nip.chr5.100k.gff3"
 
 
 def main() -> None:
