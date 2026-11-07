@@ -29,6 +29,7 @@ all: surf
 
 test: surf
 	$(CC) $(CFLAGS) $(LDFLAGS) -o surf-test test/test.c $(LIB_SOURCES) $(LDLIBS)
+	./surf-test
 
 itest: surf
 	python3 test/integration_test.py
