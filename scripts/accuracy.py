@@ -4,17 +4,17 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-import sys
+
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
 
-Span = tuple[int, int]  # 1-based inclusive
-Loc = tuple[str, str]  # seqid, strand
+Span = tuple[int, int]
+Loc = tuple[str, str]
 IntervalKey = tuple[str, str, int, int]
 
-# Feature types are GFF3 Sequence Ontology terms; names are case-insensitive.
+
 FEATURE_TYPES = {
     "exon": "exon",
     "cds": "CDS",
@@ -431,10 +431,10 @@ def calculate(ref: list[Transcript], pred: list[Transcript],
 
 
 ORDER = (
-    "exon-segment", "locus", "locus-overlap", "nt", "CDS-segment",
-    "five_prime_UTR-segment", "three_prime_UTR-segment", "UTR-segment",
-    "exon-nt", "CDS-nt", "five_prime_UTR-nt", "three_prime_UTR-nt", "UTR-nt",
-    "intron-segment", "donor-site", "acceptor-site",
+    "locus", "locus-overlap",
+    "nt", "exon-nt", "CDS-nt", "five_prime_UTR-nt", "three_prime_UTR-nt", "UTR-nt",
+    "exon-segment", "CDS-segment", "five_prime_UTR-segment", "three_prime_UTR-segment",
+    "UTR-segment", "intron-segment", "donor-site", "acceptor-site",
     "transcript-exon-chain", "transcript-CDS-chain", "transcript-full-chain",
 )
 
@@ -479,15 +479,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{name}\t{num(d['f1'])}\t{num(d['precision'])}\t{num(d['recall'])}\t"
                   f"{d['tp']}\t{d['fp']}\t{d['fn']}\t{d['reference']}\t{d['prediction']}")
     else:
-        print(f"# UTR source: {args.utr_source}; protein-coding-only: {args.protein_coding_only}; "
-              f"gene reciprocal-overlap threshold: {args.min_reciprocal_overlap:.2f}")
-        print(f"# transcripts: reference={len(ref)} query={len(pred)}")
+        headers = ("metric", "F1", "precision", "recall", "TP", "FP", "FN")
+        rows = []
         for name in ORDER:
             d = result[name].as_dict()
             def pct(x: float | None) -> str:
                 return "NA" if x is None else f"{x:.2%}"
-            print(f"{name}: F1={pct(d['f1'])} precision={pct(d['precision'])} "
-                  f"recall={pct(d['recall'])} TP={d['tp']} FP={d['fp']} FN={d['fn']}")
+            rows.append((name, pct(d["f1"]), pct(d["precision"]), pct(d["recall"]),
+                         str(d["tp"]), str(d["fp"]), str(d["fn"])))
+        widths = [max(len(row[i]) for row in [headers, *rows]) for i in range(len(headers))]
+        print("  ".join(value.ljust(widths[i]) for i, value in enumerate(headers)))
+        print("  ".join("-" * width for width in widths))
+        for row in rows:
+            print("  ".join(value.ljust(widths[i]) for i, value in enumerate(row)))
     return 0
 
 
