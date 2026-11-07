@@ -33,8 +33,7 @@ typedef union {
 /** Just one sampled, compact, and position-major feature window */
 typedef struct {
   int64_t length;       // Number of labeled positions
-  const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous); CAUTION: other
-                        // implemations are 0, 1, 2, 3 and -1
+  const uint8_t *bases; // A, C, G, T as 0..3, (4 for ambiguous);
   const float *cwt;     // Position-major CWT power array
   const uint8_t *classes;          // Observed class labels per position
   int64_t offset, sequence_length; // Preserve DNA context across training cuts.

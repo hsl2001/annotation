@@ -1,257 +1,495 @@
 #!/usr/bin/env python3
-"""Compare exon, locus, and nucleotide accuracy between two GFF3 files.
-
-The report includes exon-segment, locus, and nucleotide metrics, plus CDS and
-UTR segment metrics. Only the Python standard library is required.
-All query features are scored, including those outside the reference bounds.
-"""
-
 from __future__ import annotations
 
 import argparse
 import gzip
+import json
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TextIO
+from urllib.parse import unquote
 
-FEATURES: tuple[str, ...] = (
-    "exon",
-    "cds",
-    "five_prime_utr",
-    "three_prime_utr",
-)
+Span = tuple[int, int]  # 1-based inclusive
+Loc = tuple[str, str]  # seqid, strand
+IntervalKey = tuple[str, str, int, int]
 
-Span = tuple[int, int]
-TranscriptModel = tuple[str, str, str, list[Span]]
-Metric = tuple[float, float, float]
-
-OUTPUT_LABELS: tuple[tuple[str, str], ...] = (
-    ("exon-segment", "exon-segment"),
-    ("locus", "locus"),
-    ("nt", "nt"),
-    ("cds-segment", "CDS-segment"),
-    ("five_prime_utr-segment", "five_prime_UTR-segment"),
-    ("three_prime_utr-segment", "three_prime_UTR-segment"),
-)
-
-
-def open_text(path: str | Path) -> TextIO:
-    """Open a UTF-8 plain-text or gzip-compressed annotation."""
-    path = Path(path)
-    if path.suffix == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8")
-    return path.open("rt", encoding="utf-8")
+# Feature types are GFF3 Sequence Ontology terms; names are case-insensitive.
+FEATURE_TYPES = {
+    "exon": "exon",
+    "cds": "CDS",
+    "five_prime_utr": "five_prime_UTR",
+    "5_prime_utr": "five_prime_UTR",
+    "5utr": "five_prime_UTR",
+    "three_prime_utr": "three_prime_UTR",
+    "3_prime_utr": "three_prime_UTR",
+    "3utr": "three_prime_UTR",
+    "utr": "UTR_untyped",
+    "5'-utr": "five_prime_UTR",
+    "3'-utr": "three_prime_UTR",
+    "start_codon": "start_codon",
+    "stop_codon": "stop_codon",
+}
+TRANSCRIPT_TYPES = {
+    "mrna", "transcript", "primary_transcript", "ncrna", "lnc_rna",
+    "trna", "rrna", "mirna", "snrna", "snorna", "pseudogenic_transcript",
+}
+FEATURES = ("exon", "CDS", "five_prime_UTR", "three_prime_UTR", "UTR")
 
 
-def parse_attributes(text: str) -> dict[str, str]:
-    """Parse GFF3 key/value attributes, ignoring fields without '='."""
-    attributes = {}
-    for field in text.split(";"):
-        key, separator, value = field.strip().partition("=")
-        if separator:
-            attributes[key] = value
-    return attributes
+@dataclass
+class Transcript:
+    tid: str
+    gid: str
+    seqid: str
+    strand: str
+    raw: dict[str, list[Span]] = field(default_factory=lambda: defaultdict(list))
+    spans: dict[str, list[Span]] = field(default_factory=dict)
 
 
-def read_models(path: str | Path) -> dict[str, dict[str, TranscriptModel]]:
-    """Read per-transcript spans, keyed by feature and transcript ID.
+@dataclass(frozen=True)
+class Counts:
+    tp: int
+    fp: int
+    fn: int
 
-    Each transcript record contains its gene ID, sequence ID, strand, and
-    sorted 1-based inclusive intervals.
-    """
-    transcript_genes: dict[str, str] = {}
-    spans_by_feature: dict[str, dict[str, set[Span]]] = {
-        feature: defaultdict(set) for feature in FEATURES
+    @property
+    def reference(self) -> int:
+        return self.tp + self.fn
+
+    @property
+    def prediction(self) -> int:
+        return self.tp + self.fp
+
+    def as_dict(self) -> dict:
+        if not self.reference:
+            return {"tp": self.tp, "fp": self.fp, "fn": self.fn,
+                    "reference": 0, "prediction": self.prediction,
+                    "precision": None, "recall": None, "f1": None}
+        p = self.tp / self.prediction if self.prediction else 0.0
+        r = self.tp / self.reference
+        f1 = 2 * p * r / (p + r) if p + r else 0.0
+        return {"tp": self.tp, "fp": self.fp, "fn": self.fn,
+                "reference": self.reference, "prediction": self.prediction,
+                "precision": p, "recall": r, "f1": f1}
+
+
+def parse_attributes(s: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for piece in s.split(";"):
+        if "=" not in piece:
+            continue
+        key, raw_value = piece.strip().split("=", 1)
+        out[key] = raw_value
+    return out
+
+
+def attr_value(attrs: dict[str, str], name: str) -> str:
+    return unquote(attrs.get(name, ""))
+
+
+def parents(attrs: dict[str, str]) -> list[str]:
+    return [unquote(p) for p in attrs.get("Parent", "").split(",") if p]
+
+
+def merge(spans: list[Span]) -> list[Span]:
+    result: list[list[int]] = []
+    for a, b in sorted(spans):
+        if result and a <= result[-1][1] + 1:
+            result[-1][1] = max(b, result[-1][1])
+        else:
+            result.append([a, b])
+    return [(a, b) for a, b in result]
+
+
+def finalize_transcript(t: Transcript, utr_source: str) -> dict[str, int]:
+    raw = t.raw
+    cds = merge(raw.get("CDS", []))
+    has_exon_rows = bool(raw.get("exon"))
+    explicit_5 = merge(raw.get("five_prime_UTR", []))
+    explicit_3 = merge(raw.get("three_prime_UTR", []))
+    generic_utr = merge(raw.get("UTR_untyped", []))
+    codons = merge(raw.get("start_codon", []) + raw.get("stop_codon", []))
+    exons = merge(raw["exon"] if has_exon_rows else
+                  cds + codons + explicit_5 + explicit_3 + generic_utr)
+
+    inferred5: list[Span] = []
+    inferred3: list[Span] = []
+    untyped_unclassified = 0
+    if cds:
+        coding_left = min(a for a, _ in cds + codons)
+        coding_right = max(b for _, b in cds + codons)
+
+        def side_intervals(spans: list[Span]) -> tuple[list[Span], list[Span], int]:
+            left: list[Span] = []
+            right: list[Span] = []
+            ambiguous = 0
+            for a, b in spans:
+                if a < coding_left:
+                    left.append((a, min(b, coding_left - 1)))
+                if b > coding_right:
+                    right.append((max(a, coding_right + 1), b))
+                if max(a, coding_left) <= min(b, coding_right):
+                    ambiguous += 1
+            if t.strand == "-":
+                return right, left, ambiguous
+            return left, right, ambiguous
+
+        g5, g3, untyped_unclassified = side_intervals(generic_utr)
+        explicit_5 += g5
+        explicit_3 += g3
+        if utr_source == "auto":
+            inferred5, inferred3, _ = side_intervals(exons)
+    else:
+        untyped_unclassified = len(generic_utr)
+
+    five = merge(explicit_5 + inferred5)
+    three = merge(explicit_3 + inferred3)
+    t.spans = {
+        "exon": exons,
+        "CDS": cds,
+        "five_prime_UTR": five,
+        "three_prime_UTR": three,
+        "UTR": merge(five + three),
     }
-    locations: dict[str, tuple[str, str]] = {}
+    return {
+        "transcripts_with_explicit_exons": int(has_exon_rows),
+        "transcripts_with_CDS": int(bool(cds)),
+        "explicit_5prime_rows": len(raw.get("five_prime_UTR", [])),
+        "explicit_3prime_rows": len(raw.get("three_prime_UTR", [])),
+        "generic_UTR_rows": len(raw.get("UTR_untyped", [])),
+        "inferred_5prime_segments": len(inferred5),
+        "inferred_3prime_segments": len(inferred3),
+        "unclassified_generic_UTR_segments": untyped_unclassified,
+    }
 
-    with open_text(path) as stream:
-        for line_number, line in enumerate(stream, 1):
+
+def read_gff3(path: str, utr_source: str) -> tuple[list[Transcript], dict]:
+    op = gzip.open if path.endswith(".gz") else open
+    transcripts: dict[str, tuple[str, Loc]] = {}
+    gene_ids: set[str] = set()
+    child_rows: list[tuple[int, str, Loc, Span, list[str]]] = []
+    seqids: set[str] = set()
+
+    with op(path, "rt", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, 1):
             if line.startswith("##FASTA"):
                 break
             if not line.strip() or line.startswith("#"):
                 continue
-
             fields = line.rstrip("\r\n").split("\t")
             if len(fields) != 9:
-                raise ValueError(f"{path}:{line_number}: expected 9 columns")
-
+                raise ValueError(f"{path}:{line_no}: expected 9 tab-separated fields")
+            seqid, _, raw_type, start_str, end_str, _, strand, _, attr_str = fields
             try:
-                start, end = int(fields[3]), int(fields[4])
-            except ValueError as error:
-                raise ValueError(f"{path}:{line_number}: invalid interval") from error
+                start, end = int(start_str), int(end_str)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_no}: invalid feature coordinates") from exc
             if start < 1 or end < start:
-                raise ValueError(f"{path}:{line_number}: invalid interval")
-
-            feature = fields[2].lower()
-            attributes = parse_attributes(fields[8])
-            if feature in ("mrna", "transcript") and "ID" in attributes:
-                transcript_id = attributes["ID"]
-                transcript_genes[transcript_id] = attributes.get(
-                    "Parent", transcript_id
-                ).split(",")[0]
+                raise ValueError(f"{path}:{line_no}: invalid interval {start}-{end}")
+            feature_type = raw_type.lower()
+            is_relevant = (feature_type in FEATURE_TYPES or
+                           feature_type in TRANSCRIPT_TYPES or
+                           feature_type in ("gene", "pseudogene"))
+            if not is_relevant:
                 continue
-            if feature not in spans_by_feature:
-                continue
-
-            sequence_id, strand = fields[0], fields[6]
             if strand not in ("+", "-"):
-                raise ValueError(f"{path}:{line_number}: invalid strand")
-            for transcript_id in filter(None, attributes.get("Parent", "").split(",")):
-                spans_by_feature[feature][transcript_id].add((start, end))
-                locations[transcript_id] = (sequence_id, strand)
+                if feature_type in FEATURE_TYPES:
+                    raise ValueError(f"{path}:{line_no}: feature {raw_type} needs + or - strand")
+                continue
+            seqids.add(seqid)
+            attrs = parse_attributes(attr_str)
+            fid = attr_value(attrs, "ID")
+            loc = (seqid, strand)
+            if feature_type in ("gene", "pseudogene") and fid:
+                gene_ids.add(fid)
+            elif feature_type in TRANSCRIPT_TYPES and fid:
+                ps = parents(attrs)
+                gid = ps[0] if ps else fid
+                if fid in transcripts and transcripts[fid] != (gid, loc):
+                    raise ValueError(f"{path}:{line_no}: conflicting transcript ID {fid!r}")
+                transcripts[fid] = (gid, loc)
+            elif feature_type in FEATURE_TYPES:
+                ps = parents(attrs)
+                if not ps:
+                    raise ValueError(f"{path}:{line_no}: {raw_type} lacks Parent=; "
+                                     "please convert to hierarchical GFF3 first")
+                child_rows.append((line_no, FEATURE_TYPES[feature_type], loc,
+                                   (start, end), ps))
 
-    models: dict[str, dict[str, TranscriptModel]] = {}
-    for feature, transcripts in spans_by_feature.items():
-        models[feature] = {}
-        for transcript_id, spans in transcripts.items():
-            sequence_id, strand = locations[transcript_id]
-            models[feature][transcript_id] = (
-                transcript_genes.get(transcript_id, transcript_id),
-                sequence_id,
-                strand,
-                sorted(spans),
-            )
-    return models
-
-
-def scores(true_positive: int, false_positive: int, false_negative: int) -> Metric:
-    """Return precision, recall, and F1 for the supplied counts."""
-    precision = (
-        true_positive / (true_positive + false_positive)
-        if true_positive + false_positive
-        else 0.0
-    )
-    recall = (
-        true_positive / (true_positive + false_negative)
-        if true_positive + false_negative
-        else 0.0
-    )
-    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
-    return precision, recall, f1
-
-
-def set_scores(reference, query) -> Metric:
-    """Score exact set matches, treating each set member as one item."""
-    return scores(
-        len(reference & query),
-        len(query - reference),
-        len(reference - query),
-    )
-
-
-def segment_keys(models: dict[str, TranscriptModel]) -> set[tuple[str, str, int, int]]:
-    """Return feature intervals keyed by sequence and strand."""
-    return {
-        (sequence_id, strand, start, end)
-        for _, sequence_id, strand, spans in models.values()
-        for start, end in spans
-    }
-
-
-def locus_keys(models: dict[str, TranscriptModel]) -> set[tuple[str, str, int, int]]:
-    """Return the outer genomic span for each gene, sequence, and strand."""
-    gene_spans: dict[tuple[str, str, str], tuple[int, int]] = {}
-    for gene_id, sequence_id, strand, spans in models.values():
-        key = (gene_id, sequence_id, strand)
-        start = min(span_start for span_start, _ in spans)
-        end = max(span_end for _, span_end in spans)
-        previous = gene_spans.get(key, (start, end))
-        gene_spans[key] = (min(start, previous[0]), max(end, previous[1]))
-    return {
-        (sequence_id, strand, start, end)
-        for (_, sequence_id, strand), (start, end) in gene_spans.items()
-    }
-
-
-def merge_intervals(
-    models: dict[str, TranscriptModel],
-) -> dict[tuple[str, str], list[Span]]:
-    """Union overlapping or adjacent intervals per sequence and strand."""
-    grouped: dict[tuple[str, str], list[Span]] = defaultdict(list)
-    for _, sequence_id, strand, spans in models.values():
-        grouped[sequence_id, strand].extend(spans)
-
-    merged: dict[tuple[str, str], list[Span]] = {}
-    for key, spans in grouped.items():
-        intervals: list[list[int]] = []
-        for start, end in sorted(spans):
-            if intervals and start <= intervals[-1][1] + 1:
-                intervals[-1][1] = max(intervals[-1][1], end)
+    models: dict[str, Transcript] = {}
+    for line_no, kind, loc, span, ps in child_rows:
+        for pid in ps:
+            if pid in gene_ids and pid not in transcripts:
+                tid, gid = f"__direct_gene__:{pid}", pid
+            elif pid in transcripts:
+                tid, gid = pid, transcripts[pid][0]
+                if transcripts[pid][1] != loc:
+                    raise ValueError(f"{path}:{line_no}: {pid!r} location/strand "
+                                     "conflicts with parent transcript")
             else:
-                intervals.append([start, end])
-        merged[key] = [(start, end) for start, end in intervals]
-    return merged
+                tid, gid = pid, pid
+            if tid not in models:
+                models[tid] = Transcript(tid, gid, loc[0], loc[1])
+            t = models[tid]
+            if (t.seqid, t.strand) != loc:
+                raise ValueError(f"{path}:{line_no}: transcript {tid!r} spans "
+                                 "different contigs or strands")
+            t.raw[kind].append(span)
+
+    stats: Counter[str] = Counter()
+    for t in models.values():
+        stats.update(finalize_transcript(t, utr_source))
+    stats["transcripts_scored"] = len(models)
+    stats["unique_seqids"] = len(seqids)
+    return list(models.values()), dict(stats)
 
 
-def covered_bases(intervals: dict[tuple[str, str], list[Span]]) -> int:
-    """Count bases covered by a disjoint interval mapping."""
-    return sum(end - start + 1 for spans in intervals.values() for start, end in spans)
+def filter_protein_coding(transcripts: list[Transcript]) -> list[Transcript]:
+    return [t for t in transcripts if t.spans["CDS"]]
 
 
-def nucleotide_scores(
-    reference: dict[str, TranscriptModel], query: dict[str, TranscriptModel]
-) -> Metric:
-    """Score exon overlap at nucleotide resolution."""
-    reference_intervals = merge_intervals(reference)
-    query_intervals = merge_intervals(query)
+def segment_keys(transcripts: list[Transcript], kind: str) -> set[IntervalKey]:
+    return {(t.seqid, t.strand, a, b) for t in transcripts
+            for a, b in t.spans[kind]}
+
+
+def exact_counts(ref: set | Counter, pred: set | Counter) -> Counts:
+    if isinstance(ref, set):
+        tp = len(ref & pred)
+        return Counts(tp, len(pred) - tp, len(ref) - tp)
+    tp = sum((ref & pred).values())
+    return Counts(tp, sum(pred.values()) - tp, sum(ref.values()) - tp)
+
+
+def union_coverage(transcripts: list[Transcript], kind: str) -> dict[Loc, list[Span]]:
+    by_loc: dict[Loc, list[Span]] = defaultdict(list)
+    for t in transcripts:
+        by_loc[t.seqid, t.strand].extend(t.spans[kind])
+    return {loc: merge(spans) for loc, spans in by_loc.items()}
+
+
+def base_counts(ref: list[Transcript], pred: list[Transcript], kind: str) -> Counts:
+    a = union_coverage(ref, kind)
+    b = union_coverage(pred, kind)
+    nref = sum(y - x + 1 for spans in a.values() for x, y in spans)
+    npred = sum(y - x + 1 for spans in b.values() for x, y in spans)
     overlap = 0
-
-    for key, reference_spans in reference_intervals.items():
-        query_spans = query_intervals.get(key, [])
-        ref_index = query_index = 0
-        while ref_index < len(reference_spans) and query_index < len(query_spans):
-            ref_start, ref_end = reference_spans[ref_index]
-            query_start, query_end = query_spans[query_index]
-            overlap += max(
-                0,
-                min(ref_end, query_end) - max(ref_start, query_start) + 1,
-            )
-            if ref_end < query_end:
-                ref_index += 1
+    for loc, xspans in a.items():
+        yspans = b.get(loc, [])
+        i = j = 0
+        while i < len(xspans) and j < len(yspans):
+            x0, x1 = xspans[i]
+            y0, y1 = yspans[j]
+            overlap += max(0, min(x1, y1) - max(x0, y0) + 1)
+            if x1 <= y1:
+                i += 1
             else:
-                query_index += 1
-
-    return scores(
-        overlap,
-        covered_bases(query_intervals) - overlap,
-        covered_bases(reference_intervals) - overlap,
-    )
+                j += 1
+    return Counts(overlap, npred - overlap, nref - overlap)
 
 
-def metrics(reference_path: str | Path, query_path: str | Path) -> dict[str, Metric]:
-    """Calculate metrics over all features in the two annotations."""
-    reference, query = read_models(reference_path), read_models(query_path)
-    result = {
-        f"{feature}-segment": set_scores(
-            segment_keys(reference[feature]), segment_keys(query[feature])
-        )
-        for feature in FEATURES
-    }
-    result["locus"] = set_scores(
-        locus_keys(reference["exon"]), locus_keys(query["exon"])
-    )
-    result["nt"] = nucleotide_scores(reference["exon"], query["exon"])
+def intron_keys(transcripts: list[Transcript]) -> set[IntervalKey]:
+    out: set[IntervalKey] = set()
+    for t in transcripts:
+        for (_, prev_end), (next_start, _) in zip(t.spans["exon"], t.spans["exon"][1:]):
+            if prev_end + 1 < next_start:
+                out.add((t.seqid, t.strand, prev_end + 1, next_start - 1))
+    return out
+
+
+def junction_sites(introns: set[IntervalKey], site: str) -> set[tuple[str, str, int]]:
+    output = set()
+    for seqid, strand, a, b in introns:
+        pos = (a if strand == "+" else b) if site == "donor" else (b if strand == "+" else a)
+        output.add((seqid, strand, pos))
+    return output
+
+
+def chain_counts(ref: list[Transcript], pred: list[Transcript], kind: str) -> Counts:
+    def chains(xs: list[Transcript]) -> Counter:
+        return Counter((t.seqid, t.strand, tuple(t.spans[kind])) for t in xs
+                       if t.spans[kind])
+    return exact_counts(chains(ref), chains(pred))
+
+
+def full_transcript_counts(ref: list[Transcript], pred: list[Transcript]) -> Counts:
+    kinds = ("exon", "CDS", "five_prime_UTR", "three_prime_UTR")
+
+    def models(xs: list[Transcript]) -> Counter:
+        return Counter((t.seqid, t.strand, *(tuple(t.spans[k]) for k in kinds))
+                       for t in xs if t.spans["exon"])
+
+    return exact_counts(models(ref), models(pred))
+
+
+def gene_loci(transcripts: list[Transcript]) -> list[IntervalKey]:
+    genes: dict[tuple[str, str, str], Span] = {}
+    for t in transcripts:
+        spans = t.spans["exon"]
+        if not spans:
+            continue
+        key = (t.gid, t.seqid, t.strand)
+        a, b = spans[0][0], spans[-1][1]
+        if key in genes:
+            c, d = genes[key]
+            genes[key] = (min(a, c), max(b, d))
+        else:
+            genes[key] = (a, b)
+    return [(seqid, strand, a, b)
+            for (_, seqid, strand), (a, b) in genes.items()]
+
+
+def locus_overlap_counts(ref: list[IntervalKey], pred: list[IntervalKey],
+                         min_reciprocal: float) -> Counts:
+    rlocs: dict[Loc, list[tuple[int, int, int]]] = defaultdict(list)
+    qlocs: dict[Loc, list[tuple[int, int, int]]] = defaultdict(list)
+    for i, (seqid, strand, a, b) in enumerate(ref):
+        rlocs[seqid, strand].append((a, b, i))
+    for j, (seqid, strand, a, b) in enumerate(pred):
+        qlocs[seqid, strand].append((a, b, j))
+
+    adj: list[list[int]] = [[] for _ in ref]
+    for loc, rs in rlocs.items():
+        qs = sorted(qlocs.get(loc, []))
+        rs = sorted(rs)
+        left = 0
+        for a, b, i in rs:
+            while left < len(qs) and qs[left][1] < a:
+                left += 1
+            pos = left
+            while pos < len(qs):
+                qa, qb, j = qs[pos]
+                if qa > b:
+                    break
+                overlap = min(b, qb) - max(a, qa) + 1
+                if (overlap > 0 and overlap / (b - a + 1) >= min_reciprocal
+                        and overlap / (qb - qa + 1) >= min_reciprocal):
+                    adj[i].append(j)
+                pos += 1
+
+    pair_r = [-1] * len(ref)
+    pair_q = [-1] * len(pred)
+    dist = [-1] * len(ref)
+
+    def bfs() -> bool:
+        q = deque()
+        for u in range(len(ref)):
+            dist[u] = 0 if pair_r[u] == -1 else -1
+            if pair_r[u] == -1:
+                q.append(u)
+        reachable = False
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                mate = pair_q[v]
+                if mate == -1:
+                    reachable = True
+                elif dist[mate] == -1:
+                    dist[mate] = dist[u] + 1
+                    q.append(mate)
+        return reachable
+
+    def dfs(u: int) -> bool:
+        for v in adj[u]:
+            mate = pair_q[v]
+            if mate == -1 or (dist[mate] == dist[u] + 1 and dfs(mate)):
+                pair_r[u] = v
+                pair_q[v] = u
+                return True
+        dist[u] = -1
+        return False
+
+    matched = 0
+    while bfs():
+        for u in range(len(ref)):
+            if pair_r[u] == -1 and dfs(u):
+                matched += 1
+    return Counts(matched, len(pred) - matched, len(ref) - matched)
+
+
+def calculate(ref: list[Transcript], pred: list[Transcript],
+              min_reciprocal: float) -> dict[str, Counts]:
+    result: dict[str, Counts] = {}
+    for kind in FEATURES:
+        result[f"{kind}-segment"] = exact_counts(segment_keys(ref, kind), segment_keys(pred, kind))
+        result[f"{kind}-nt"] = base_counts(ref, pred, kind)
+    result["nt"] = result["exon-nt"]
+    ref_introns, pred_introns = intron_keys(ref), intron_keys(pred)
+    result["intron-segment"] = exact_counts(ref_introns, pred_introns)
+    result["donor-site"] = exact_counts(junction_sites(ref_introns, "donor"),
+                                        junction_sites(pred_introns, "donor"))
+    result["acceptor-site"] = exact_counts(junction_sites(ref_introns, "acceptor"),
+                                           junction_sites(pred_introns, "acceptor"))
+    result["transcript-exon-chain"] = chain_counts(ref, pred, "exon")
+    result["transcript-CDS-chain"] = chain_counts(ref, pred, "CDS")
+    result["transcript-full-chain"] = full_transcript_counts(ref, pred)
+    rl, ql = gene_loci(ref), gene_loci(pred)
+    result["locus"] = exact_counts(Counter(rl), Counter(ql))
+    result["locus-overlap"] = locus_overlap_counts(rl, ql, min_reciprocal)
     return result
 
 
+ORDER = (
+    "exon-segment", "locus", "locus-overlap", "nt", "CDS-segment",
+    "five_prime_UTR-segment", "three_prime_UTR-segment", "UTR-segment",
+    "exon-nt", "CDS-nt", "five_prime_UTR-nt", "three_prime_UTR-nt", "UTR-nt",
+    "intron-segment", "donor-site", "acceptor-site",
+    "transcript-exon-chain", "transcript-CDS-chain", "transcript-full-chain",
+)
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="")
-    parser.add_argument("-r", "--reference", required=True, help="reference GFF3(.gz)")
-    parser.add_argument("-q", "--query", required=True, help="query GFF3(.gz)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-r", "--reference", required=True)
+    parser.add_argument("-q", "--query", required=True)
+    parser.add_argument("--utr-source", choices=("auto", "explicit"), default="auto")
+    parser.add_argument("--protein-coding-only", action="store_true")
+    parser.add_argument("--min-reciprocal-overlap", type=float, default=0.5)
+    parser.add_argument("--format", choices=("text", "tsv", "json"), default="text")
     args = parser.parse_args(argv)
-
+    if not 0 < args.min_reciprocal_overlap <= 1:
+        parser.error("--min-reciprocal-overlap must be >0 and <=1")
     try:
-        result = metrics(args.reference, args.query)
-    except (OSError, ValueError) as error:
-        parser.error(str(error))
+        ref, ref_meta = read_gff3(args.reference, args.utr_source)
+        pred, pred_meta = read_gff3(args.query, args.utr_source)
+        if args.protein_coding_only:
+            ref = filter_protein_coding(ref)
+            pred = filter_protein_coding(pred)
+        result = calculate(ref, pred, args.min_reciprocal_overlap)
+    except (ValueError, OSError, RecursionError) as exc:
+        parser.error(str(exc))
 
-    for name, label in OUTPUT_LABELS:
-        precision, recall, f1 = result[name]
-        print(f"{label}: F1={f1:.2%} precision={precision:.2%} recall={recall:.2%}")
+    ref_seqids = {t.seqid for t in ref}
+    pred_seqids = {t.seqid for t in pred}
+
+    if args.format == "json":
+        print(json.dumps({"settings": {"utr_source": args.utr_source,
+                                        "protein_coding_only": args.protein_coding_only,
+                                        "min_reciprocal_overlap": args.min_reciprocal_overlap},
+                          "reference": {**ref_meta, "transcripts_scored": len(ref)},
+                          "query": {**pred_meta, "transcripts_scored": len(pred)},
+                          "metrics": {k: result[k].as_dict() for k in ORDER}}, indent=2))
+    elif args.format == "tsv":
+        print("metric\tf1\tprecision\trecall\ttp\tfp\tfn\treference\tprediction")
+        for name in ORDER:
+            d = result[name].as_dict()
+            def num(x: float | None) -> str:
+                return "NA" if x is None else f"{x:.8f}"
+            print(f"{name}\t{num(d['f1'])}\t{num(d['precision'])}\t{num(d['recall'])}\t"
+                  f"{d['tp']}\t{d['fp']}\t{d['fn']}\t{d['reference']}\t{d['prediction']}")
+    else:
+        print(f"# UTR source: {args.utr_source}; protein-coding-only: {args.protein_coding_only}; "
+              f"gene reciprocal-overlap threshold: {args.min_reciprocal_overlap:.2f}")
+        print(f"# transcripts: reference={len(ref)} query={len(pred)}")
+        for name in ORDER:
+            d = result[name].as_dict()
+            def pct(x: float | None) -> str:
+                return "NA" if x is None else f"{x:.2%}"
+            print(f"{name}: F1={pct(d['f1'])} precision={pct(d['precision'])} "
+                  f"recall={pct(d['recall'])} TP={d['tp']} FP={d['fp']} FN={d['fn']}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
