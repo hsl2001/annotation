@@ -28,8 +28,7 @@ HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 all: surf
 
 test: surf
-	$(CC) $(CFLAGS) $(LDFLAGS) -std=c11 -D_POSIX_C_SOURCE=200809L -o surf-test \
-		test/test.c $(LIB_SOURCES) $(LDLIBS) surf-test
+	$(CC) $(CFLAGS) $(LDFLAGS) -o surf-test test/test.c $(LIB_SOURCES) $(LDLIBS)
 
 itest: surf
 	python3 test/integration_test.py
