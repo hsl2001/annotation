@@ -15,20 +15,18 @@
 #define NUCLEOTIDES 4 // A, C, G, T
 
 #define PATH_BUFFER 4096 // Maximum handled path length
-#define CLASSES 9        // Number of train labels (classes)
+#define CLASSES 7        // Number of training and decoding states
 
 /** Related to trainings */
 #define DEFAULT_ITERATIONS 1000 // Maximum L-BFGS iterations
 typedef enum {
-  INTERGENIC = 0,
+  INTERGENIC = 0, // Background, including unmarked internal exons.
   PLUS_START_SINGLE_EXON = 1,
   PLUS_END_EXON = 2,
   PLUS_INTRON = 3,
   MINUS_START_SINGLE_EXON = 4,
   MINUS_END_EXON = 5,
-  MINUS_INTRON = 6,
-  PLUS_INTERNAL_EXON = 7,
-  MINUS_INTERNAL_EXON = 8
+  MINUS_INTRON = 6
 } Class;
 
 /** Sequence records */
@@ -85,7 +83,7 @@ int longest_orf(const char *transcript, int64_t length, int64_t *start,
  * @brief Convert a per-base class path into GFF3 transcript records.
  * @param[in,out] output: Destination GFF3 stream.
  * @param[in] sequence: Sequence and optional name metadata.
- * @param[in] path: Decoded classes, including inferred INTERNAL_EXON states.
+ * @param[in] path: Seven-class path; internal exons are inferred from introns.
  * @param[in,out] gene_counter: Decoded gene number; updated as records are
  * written.
  * @return number of transcripts written, or -1 on error.

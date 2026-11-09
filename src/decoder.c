@@ -15,44 +15,30 @@
 #include <string.h>
 #include <zlib.h>
 
-/**
- * @brief Build the strand-specific gene grammar without hard duration cutoffs.
- *
- * The intergenic state connects to start and end exons. Exons connect through
- * strand-specific introns, and internal exons may repeat before reaching an
- * end exon. Minus-strand paths use the reverse transcript order.
- * @param[out] grammar Grammar to initialize.
- * @return None.
- */
-void build_grammar(Grammar *grammar) {
-  *grammar = (Grammar){
-      .count = CLASSES,
-      .backpointers = {5, 2, 2, 3, 3, 2, 3, 2, 2},
-      .from = {{INTERGENIC, PLUS_START_SINGLE_EXON, PLUS_END_EXON,
-                MINUS_START_SINGLE_EXON, MINUS_END_EXON},
-               {PLUS_START_SINGLE_EXON, INTERGENIC},
-               {PLUS_END_EXON, PLUS_INTRON},
-               {PLUS_INTRON, PLUS_START_SINGLE_EXON, PLUS_INTERNAL_EXON},
-               {MINUS_START_SINGLE_EXON, INTERGENIC, MINUS_INTRON},
-               {MINUS_END_EXON, INTERGENIC},
-               {MINUS_INTRON, MINUS_END_EXON, MINUS_INTERNAL_EXON},
-               {PLUS_INTERNAL_EXON, PLUS_INTRON},
-               {MINUS_INTERNAL_EXON, MINUS_INTRON}}};
-}
+/* Internal exons share background with intergenic sequence. Local transitions
+   retain exon boundaries; write_gff validates and reconstructs whole genes. */
+const Grammar gene_grammar = {
+    .backpointers = {6, 2, 2, 3, 3, 2, 3},
+    .from = {{INTERGENIC, PLUS_START_SINGLE_EXON, PLUS_END_EXON,
+              MINUS_START_SINGLE_EXON, PLUS_INTRON, MINUS_INTRON},
+             {PLUS_START_SINGLE_EXON, INTERGENIC},
+             {PLUS_END_EXON, PLUS_INTRON},
+             {PLUS_INTRON, PLUS_START_SINGLE_EXON, INTERGENIC},
+             {MINUS_START_SINGLE_EXON, INTERGENIC, MINUS_INTRON},
+             {MINUS_END_EXON, INTERGENIC},
+             {MINUS_INTRON, MINUS_END_EXON, INTERGENIC}}};
 
 struct Decoder {
-  Grammar grammar;
   int64_t length;
   int64_t position;
   double scores[2][CLASSES];
-  uint32_t *back; // Three bits per state; nine states fit in one word.
+  uint32_t *back; // Three bits per state; seven states fit in one word.
 };
 
 Decoder *decoder_create(int64_t length) {
   if (length < 1)
     return NULL;
   Decoder *decoder = scalloc(1, sizeof(*decoder));
-  build_grammar(&decoder->grammar);
   decoder->length = length;
   decoder->back =
       scalloc((size_t)(length > 1 ? length - 1 : 1), sizeof(*decoder->back));
@@ -69,59 +55,54 @@ void decoder_destroy(Decoder *decoder) {
 
 void decoder_step(Decoder *decoder, const double *emission,
                   const double *transition) {
-  const Grammar *grammar = &decoder->grammar;
   int64_t position = decoder->position++;
   double *previous = decoder->scores[(position + 1) % 2];
   double *current = decoder->scores[position % 2];
   if (!position) {
-    for (int state = 0; state < grammar->count; ++state)
+    for (int state = 0; state < CLASSES; ++state)
       current[state] = -INFINITY;
-    current[0] = emission[INTERGENIC];
+    current[INTERGENIC] = emission[INTERGENIC];
     return;
   }
   double top = -INFINITY;
   uint32_t choices = 0;
-  for (int state = 0; state < grammar->count; ++state) {
+  for (int state = 0; state < CLASSES; ++state) {
     double best = -INFINITY;
     int choice = 0;
-    int to_class = state;
-
-    for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
-      int predecessor = grammar->from[state][edge];
-      int from_class = predecessor;
+    for (int edge = 0; edge < gene_grammar.backpointers[state]; ++edge) {
+      int predecessor = gene_grammar.from[state][edge];
       double score = previous[predecessor];
-      if (transition && from_class != to_class)
-        score += transition[(size_t)from_class * CLASSES + to_class];
+      if (transition && predecessor != state)
+        score += transition[predecessor * CLASSES + state];
       if (score > best) {
         best = score;
         choice = edge;
       }
     }
-    current[state] = best + emission[to_class];
+    current[state] = best + emission[state];
     if (current[state] > top)
       top = current[state];
     choices |= (uint32_t)choice << (3 * state);
   }
   decoder->back[position - 1] = choices;
-  for (int state = 0; state < grammar->count; ++state)
+  for (int state = 0; state < CLASSES; ++state)
     current[state] -= top;
 }
 
 int decoder_finish(Decoder *decoder, uint8_t *path) {
-  const Grammar *grammar = &decoder->grammar;
   if (decoder->position != decoder->length ||
-      !isfinite(decoder->scores[(decoder->length - 1) % 2][0]))
+      !isfinite(decoder->scores[(decoder->length - 1) % 2][INTERGENIC]))
     return ERANGE;
-  int state = 0;
+  int state = INTERGENIC;
   for (int64_t position = decoder->length - 1; position > 0; --position) {
     path[position] = state;
     int choice = (decoder->back[position - 1] >> (3 * state)) & 7;
-    if (choice >= grammar->backpointers[state])
+    if (choice >= gene_grammar.backpointers[state])
       return ERANGE;
-    state = grammar->from[state][choice];
+    state = gene_grammar.from[state][choice];
   }
   path[0] = state;
-  return state == 0 ? 0 : ERANGE;
+  return state == INTERGENIC ? 0 : ERANGE;
 }
 
 typedef struct {
@@ -251,39 +232,37 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     for (int64_t p = begin > 0 ? begin - 1 : 0;
          p < s->length && p <= end && !conflict; ++p)
       conflict = s->labels[p] != INTERGENIC;
-    if (conflict) {
-      free(t->parent);
-      free(t->exons.items);
-      continue;
-    }
+    if (conflict)
+      t->length = 0;
+    else
+      /* Reserve the entire span before internal exons become background. */
+      memset(s->labels + begin, t->strand == '+' ? PLUS_INTRON : MINUS_INTRON,
+             (size_t)(end - begin));
+  }
+  for (int i = 0; i < transcript_count; ++i) {
+    LabelTranscript *t = &transcripts[i];
+    Sequence *s = &sequences[t->sequence];
     int plus = t->strand == '+';
     int first = plus ? 0 : t->exons.count - 1;
     int last = plus ? t->exons.count - 1 : 0;
-    for (int e = 0; e < t->exons.count; ++e) {
+    for (int e = 0; t->length && e < t->exons.count; ++e) {
       Interval exon = t->exons.items[e];
       uint8_t class =
-          t->exons.count == 1 ? (plus ? PLUS_START_SINGLE_EXON : MINUS_END_EXON)
-          : e == first
-              ? (plus ? PLUS_START_SINGLE_EXON : MINUS_START_SINGLE_EXON)
+          e == first ? (plus ? PLUS_START_SINGLE_EXON : MINUS_START_SINGLE_EXON)
           : e == last ? (plus ? PLUS_END_EXON : MINUS_END_EXON)
-                      : (plus ? PLUS_INTERNAL_EXON : MINUS_INTERNAL_EXON);
+                      : INTERGENIC;
       for (int64_t p = exon.start; p < exon.end; ++p)
         s->labels[p] = class;
     }
-    uint8_t intron = plus ? PLUS_INTRON : MINUS_INTRON;
-    for (int e = 0; e + 1 < t->exons.count; ++e)
-      for (int64_t p = t->exons.items[e].end; p < t->exons.items[e + 1].start;
-           ++p)
-        s->labels[p] = intron;
     free(t->parent);
     free(t->exons.items);
   }
   free(transcripts);
 }
 static const char *const prediction_class_names[CLASSES] = {
-    "intergenic",   "plus_start_single_exon",  "plus_end_exon",
-    "plus_intron",  "minus_start_single_exon", "minus_end_exon",
-    "minus_intron", "plus_internal_exon",      "minus_internal_exon"};
+    "intergenic",  "plus_start_single_exon",  "plus_end_exon",
+    "plus_intron", "minus_start_single_exon", "minus_end_exon",
+    "minus_intron"};
 typedef struct {
   FILE *files[CLASSES];
   int value[CLASSES];

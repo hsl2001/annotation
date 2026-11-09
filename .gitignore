@@ -12,3 +12,10 @@ uv.lock
 .ruff_cache/
 .venv/
 .vscode/
+
+annevo/*.pt
+data/*.fasta
+data/*.gff3
+!data/truth*
+
+plots/

@@ -8,15 +8,12 @@
 #include "../src/include/surf.h"
 #include "../src/include/utils.h"
 
-#include <errno.h>
 #include <math.h>
 #include <omp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-int is_stop(const char *);
 
 static int failures;
 static int checks;
@@ -58,6 +55,45 @@ static double quadratic(const double *x, double *gradient, void *context) {
   (void)context;
   gradient[0] = 2.0 * (x[0] - 3.0);
   return (x[0] - 3.0) * (x[0] - 3.0);
+}
+
+/* Each character is one base: B is background; S/E/I are plus, s/e/i minus. */
+static void label_path(const char *symbols, uint8_t *path) {
+  const char *alphabet = "BSEIsei";
+  const uint8_t classes[] = {INTERGENIC, PLUS_START_SINGLE_EXON, PLUS_END_EXON,
+                            PLUS_INTRON, MINUS_START_SINGLE_EXON,
+                            MINUS_END_EXON, MINUS_INTRON};
+  for (size_t p = 0; symbols[p]; ++p) {
+    const char *state = strchr(alphabet, symbols[p]);
+    CHECK(state != NULL);
+    path[p] = state ? classes[state - alphabet] : INTERGENIC;
+  }
+}
+
+/* Noncoding fixtures emit only gene, mRNA, and genomic-order exon records. */
+static void check_gff_transcript(FILE *output, const Interval *exons, int count,
+                                char strand, unsigned long gene) {
+  for (int row = 0; row < count + 2; ++row) {
+    char line[256] = {0}, type[32] = {0}, attributes[128] = {0};
+    char actual_strand = 0, expected[128];
+    long long start = 0, end = 0;
+    CHECK(fgets(line, sizeof(line), output) != NULL);
+    CHECK(sscanf(line, "%*s %*s %31s %lld %lld %*s %c %*s %127s", type,
+                 &start, &end, &actual_strand, attributes) == 5);
+    CHECK(!strcmp(type, row == 0 ? "gene" : row == 1 ? "mRNA" : "exon"));
+    CHECK(start == (row < 2 ? exons[0].start : exons[row - 2].start) + 1 &&
+          end == (row < 2 ? exons[count - 1].end : exons[row - 2].end) &&
+          actual_strand == strand);
+    if (row == 0)
+      snprintf(expected, sizeof(expected), "ID=gene%lu", gene);
+    else if (row == 1)
+      snprintf(expected, sizeof(expected), "ID=gene%lu.t1;Parent=gene%lu", gene,
+               gene);
+    else
+      snprintf(expected, sizeof(expected),
+               "ID=gene%lu.t1.exon%d;Parent=gene%lu.t1", gene, row - 1, gene);
+    CHECK(!strcmp(attributes, expected));
+  }
 }
 
 static void test_utils(void) {
@@ -159,7 +195,7 @@ static void test_intervals_and_gff_output(void) {
   sequence.bases = "CCCCCCCCCCCCCCC";
   for (int strand = 0; strand < 2; strand++) {
     for (int i = 0; i < 15; i++)
-      path[i] = strand ? MINUS_END_EXON : PLUS_START_SINGLE_EXON;
+      path[i] = strand ? MINUS_START_SINGLE_EXON : PLUS_START_SINGLE_EXON;
     output = tmpfile();
     CHECK(output != NULL);
     if (!output)
@@ -206,11 +242,14 @@ static void test_multiexon_gff(void) {
       "chr1\tanno\tCDS\t19\t22\t.\t-\t0\tID=gene1.t1.cds3;Parent=gene1.t1\n"
       "chr1\tanno\tthree_prime_UTR\t2\t3\t.\t-\t.\tID=gene1.t1.utr3p1;Parent="
       "gene1.t1\n"};
+  const uint8_t classes[][3] = {
+      {PLUS_START_SINGLE_EXON, INTERGENIC, PLUS_END_EXON},
+      {MINUS_END_EXON, INTERGENIC, MINUS_START_SINGLE_EXON}};
   for (int strand = 0; strand < 2; strand++) {
     uint8_t path[25] = {0};
     for (int e = 0; e < 3; e++) {
       for (int p = starts[strand][e]; p < ends[strand][e]; p++)
-        path[p] = strand ? MINUS_START_SINGLE_EXON : PLUS_START_SINGLE_EXON;
+        path[p] = classes[strand][e];
       if (e < 2)
         for (int p = ends[strand][e]; p < starts[strand][e + 1]; p++)
           path[p] = strand ? MINUS_INTRON : PLUS_INTRON;
@@ -253,7 +292,13 @@ static void test_multiexon_gff_input(void) {
                       "plus\tanno\texon\t17\t24\t.\t+\t.\tParent=tx1\n"
                       "minus\tanno\texon\t2\t9\t.\t-\t.\tParent=tx2\n"
                       "minus\tanno\texon\t12\t16\t.\t-\t.\tParent=tx2\n"
-                      "minus\tanno\texon\t19\t24\t.\t-\t.\tParent=tx2\n");
+                      "minus\tanno\texon\t19\t24\t.\t-\t.\tParent=tx2\n"
+                      "plus\tanno\texon\t11\t13\t.\t-\t.\tParent=nested1\n"
+                      "plus\tanno\texon\t11\t11\t.\t+\t.\tParent=nested2\n"
+                      "plus\tanno\texon\t13\t13\t.\t+\t.\tParent=nested2\n"
+                      "minus\tanno\texon\t13\t15\t.\t+\t.\tParent=nested3\n"
+                      "minus\tanno\texon\t13\t13\t.\t-\t.\tParent=nested4\n"
+                      "minus\tanno\texon\t15\t15\t.\t-\t.\tParent=nested4\n");
   CHECK(gff != NULL);
   if (!gff)
     return;
@@ -264,15 +309,137 @@ static void test_multiexon_gff_input(void) {
   read_gff3(path, sequences, 2);
   CHECK(sequences[0].labels[1] == PLUS_START_SINGLE_EXON);
   CHECK(sequences[0].labels[7] == PLUS_INTRON);
-  CHECK(sequences[0].labels[9] == PLUS_INTERNAL_EXON);
+  /* Nested transcripts must not overwrite the unmarked internal exons. */
+  for (int p = 9; p < 14; ++p)
+    CHECK(sequences[0].labels[p] == INTERGENIC);
   CHECK(sequences[0].labels[16] == PLUS_END_EXON);
   CHECK(sequences[1].labels[1] == MINUS_END_EXON);
   CHECK(sequences[1].labels[9] == MINUS_INTRON);
-  CHECK(sequences[1].labels[11] == MINUS_INTERNAL_EXON);
+  for (int p = 11; p < 16; ++p)
+    CHECK(sequences[1].labels[p] == INTERGENIC);
   CHECK(sequences[1].labels[18] == MINUS_START_SINGLE_EXON);
   free(sequences[0].labels);
   free(sequences[1].labels);
   unlink(path);
+}
+
+static void test_gff_roundtrip(void) {
+  const struct {
+    const char *symbols;
+    int exons;
+    char strand;
+  } cases[] = {{"BSSB", 1, '+'},
+               {"BssB", 1, '-'},
+               {"BSSIIEEB", 2, '+'},
+               {"BeeiissB", 2, '-'},
+               {"BSSIIBBIIBBIIEEB", 4, '+'},
+               {"BeeiiBBiiBBiissB", 4, '-'}};
+  const Interval exons[] = {{1, 3}, {5, 7}, {9, 11}, {13, 15}};
+  char bases[] = "CCCCCCCCCCCCCCCC";
+  for (size_t c = 0; c < sizeof(cases) / sizeof(*cases); ++c) {
+    char file_path[32];
+    FILE *input = make_temp(file_path, "");
+    CHECK(input != NULL);
+    if (!input)
+      continue;
+    /* Reverse input order so reconstruction cannot rely on GFF row order. */
+    for (int e = cases[c].exons - 1; e >= 0; --e)
+      fprintf(input, "chr1\tanno\texon\t%lld\t%lld\t.\t%c\t.\tParent=tx\n",
+              (long long)exons[e].start + 1, (long long)exons[e].end,
+              cases[c].strand);
+    CHECK(fclose(input) == 0);
+    Sequence sequence = {(char *)"chr1", bases,
+                         (int64_t)strlen(cases[c].symbols), NULL};
+    read_gff3(file_path, &sequence, 1);
+    unlink(file_path);
+    uint8_t expected[16], decoded[16];
+    label_path(cases[c].symbols, expected);
+    CHECK(!memcmp(sequence.labels, expected, (size_t)sequence.length));
+    Decoder *decoder = decoder_create(sequence.length);
+    CHECK(decoder != NULL);
+    if (!decoder) {
+      free(sequence.labels);
+      continue;
+    }
+    memset(decoded, 255, sizeof(decoded));
+    for (int64_t p = 0; p < sequence.length; ++p) {
+      double emissions[CLASSES];
+      for (int state = 0; state < CLASSES; ++state)
+        emissions[state] = state == sequence.labels[p] ? 100.0 : 0.0;
+      decoder_step(decoder, emissions, NULL);
+    }
+    CHECK(decoder_finish(decoder, decoded) == 0);
+    CHECK(!memcmp(decoded, expected, (size_t)sequence.length));
+    decoder_destroy(decoder);
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (output) {
+      unsigned long gene = 0;
+      CHECK(write_gff(output, &sequence, decoded, &gene) == 1 && gene == 1);
+      rewind(output);
+      check_gff_transcript(output, exons, cases[c].exons, cases[c].strand, 1);
+      CHECK(fgetc(output) == EOF && !ferror(output));
+      fclose(output);
+    }
+    free(sequence.labels);
+  }
+}
+
+static void test_gff_neighboring_genes(void) {
+  const char *symbols[] = {"BSSIIEEBSSIIEEBssB", "BeeiissBeeiissBSSB"};
+  const Interval first[] = {{1, 3}, {5, 7}};
+  const Interval second[] = {{8, 10}, {12, 14}};
+  const Interval single[] = {{15, 17}};
+  char bases[32];
+  memset(bases, 'C', sizeof(bases));
+  for (int strand = 0; strand < 2; ++strand) {
+    uint8_t path[32];
+    label_path(symbols[strand], path);
+    Sequence sequence = {(char *)"chr1", bases,
+                         (int64_t)strlen(symbols[strand]), NULL};
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (!output)
+      continue;
+    unsigned long gene = 10;
+    CHECK(write_gff(output, &sequence, path, &gene) == 3 && gene == 13);
+    rewind(output);
+    check_gff_transcript(output, first, 2, strand ? '-' : '+', 11);
+    check_gff_transcript(output, second, 2, strand ? '-' : '+', 12);
+    check_gff_transcript(output, single, 1, strand ? '+' : '-', 13);
+    CHECK(fgetc(output) == EOF && !ferror(output));
+    fclose(output);
+  }
+}
+
+static void test_gff_invalid_paths(void) {
+  const char *symbols[] = {
+      "BBBB", "BIIB", "BiiB", "BEEB", "BeeB", /* Orphan runs. */
+      "BIIEEB", "BiissB",                    /* Missing opening exon. */
+      "BSSIIB", "BeeiiB", "BssiiB",          /* Incomplete or reversed. */
+      "BSSII", "Beeii",                      /* Truncated terminal intron. */
+      "BSSIIBBIIB", "BeeiiBBiiB",            /* Unclosed internal exons. */
+      "BSSiiEEB", "BeeIIssB",                /* Wrong-strand intron. */
+      "BSSIIBBiiEEB", "BeeiiBBIIssB",        /* Mixed internal chain. */
+      "BSSIIssB", "BeeiiEEB",                /* Wrong-strand closing exon. */
+      "BSSIIEEiiB", "BeeiissIIB"};           /* Missing terminal separator. */
+  char bases[32];
+  memset(bases, 'C', sizeof(bases));
+  for (size_t c = 0; c < sizeof(symbols) / sizeof(*symbols); ++c) {
+    uint8_t path[32];
+    label_path(symbols[c], path);
+    Sequence sequence = {(char *)"chr1", bases, (int64_t)strlen(symbols[c]),
+                         NULL};
+    FILE *output = tmpfile();
+    CHECK(output != NULL);
+    if (!output)
+      continue;
+    unsigned long gene = 9;
+    CHECK(write_gff(output, &sequence, path, &gene) == 0 && gene == 9);
+    rewind(output);
+    CHECK(fgetc(output) == EOF && !ferror(output));
+    fclose(output);
+  }
 }
 
 static void test_gff_label_conflicts(void) {
@@ -313,10 +480,26 @@ static void test_gff_label_conflicts(void) {
 }
 
 static void test_decoder_and_grammar(void) {
-  Grammar grammar;
-  build_grammar(&grammar);
-  CHECK(grammar.count == CLASSES);
-  CHECK(grammar.backpointers[INTERGENIC] == 5);
+  CHECK(CLASSES == 7 && GRAMMAR_MAX_BACKPOINTERS == 6);
+  CHECK(sizeof(gene_grammar.backpointers) / sizeof(gene_grammar.backpointers[0]) ==
+        CLASSES);
+  CHECK(sizeof(gene_grammar.from) / sizeof(gene_grammar.from[0]) == CLASSES);
+  CHECK(sizeof(gene_grammar.from[0]) / sizeof(gene_grammar.from[0][0]) ==
+        GRAMMAR_MAX_BACKPOINTERS);
+  const int backpointers[CLASSES] = {6, 2, 2, 3, 3, 2, 3};
+  for (int state = 0; state < CLASSES; ++state) {
+    int count = gene_grammar.backpointers[state];
+    CHECK(count == backpointers[state]);
+    CHECK(count > 0 && count <= GRAMMAR_MAX_BACKPOINTERS);
+    if (count <= 0 || count > GRAMMAR_MAX_BACKPOINTERS)
+      continue;
+    for (int edge = 0; edge < count; ++edge) {
+      int from = gene_grammar.from[state][edge];
+      CHECK(from >= 0 && from < CLASSES);
+      for (int previous = 0; previous < edge; ++previous)
+        CHECK(from != gene_grammar.from[state][previous]);
+    }
+  }
 
   Decoder *decoder = decoder_create(1);
   CHECK(decoder != NULL);
@@ -361,42 +544,50 @@ static void test_crf_and_lbfgs(void) {
   CHECK(is_model_finite(&model));
   model.transition_weights[0] = 0.0;
 
-  Grammar grammar;
-  build_grammar(&grammar);
-  CHECK(grammar.backpointers[INTERGENIC] == 5);
-
-  uint8_t bases[1] = {0}, labels[1] = {INTERGENIC};
-  float cwt[3] = {0};
+  uint8_t bases[4] = {0}, labels[4] = {INTERGENIC};
+  float cwt[4 * CWT_CHANNELS] = {0};
   Sample sample = {.length = 1, .bases = bases, .cwt = cwt, .classes = labels};
   Sample invalid_sample = sample;
   invalid_sample.length = INT64_MAX;
-  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
-        LBFGS_INVALID_ARGUMENT);
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
   invalid_sample.length = -1;
-  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
-        LBFGS_INVALID_ARGUMENT);
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
   invalid_sample.length = 0;
-  CHECK(train(&model, &grammar, &invalid_sample, 1, 1, 1) ==
-        LBFGS_INVALID_ARGUMENT);
-  ModelObjectiveContext context = {&grammar, &sample, 1, 1, 1, 0};
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
+  ModelObjectiveContext context = {&sample, 1, 1, 1, 0};
   double parameters[PARAMETERS] = {0};
   double gradient[PARAMETERS];
   double objective = model_objective(parameters, gradient, &context);
   CHECK(isfinite(objective) && close_enough(objective, 0.0));
   CHECK(fabs(gradient[0]) < 1e-12);
+  /* A one-base path has zero NLL, isolating all three parameter groups' L2. */
+  parameters[0] = 2;
+  parameters[EMISSIONS] = -3;
+  parameters[EMISSIONS + TRANSITIONS] = 4;
+  objective = model_objective(parameters, gradient, &context);
+  CHECK(close_enough(objective, 0.5 * L2 * 29));
+  for (int i = 0; i < PARAMETERS; ++i)
+    CHECK(close_enough(gradient[i], L2 * parameters[i]));
+  Sample repeated[] = {sample, sample};
+  ModelObjectiveContext duplicated = {repeated, 2, 2, 2, 0};
+  CHECK(close_enough(model_objective(parameters, gradient, &duplicated), objective));
+  for (int i = 0; i < PARAMETERS; ++i)
+    CHECK(close_enough(gradient[i], L2 * parameters[i]));
   model.emission_weights[INPUT_CHANNELS] = NAN;
   CHECK(!is_model_finite(&model));
   model.emission_weights[INPUT_CHANNELS] = 0.0;
-  CHECK(train(&model, &grammar, &sample, 1, 1, 1) >= 0);
-  Grammar invalid = grammar;
-  invalid.count = CLASSES + 1;
-  CHECK(train(&model, &invalid, &sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
-  invalid = grammar;
-  invalid.backpointers[0] = GRAMMAR_MAX_BACKPOINTERS + 1;
-  CHECK(train(&model, &invalid, &sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
-  invalid = grammar;
-  invalid.from[0][0] = invalid.count;
-  CHECK(train(&model, &invalid, &sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
+  CHECK(train(&model, &sample, 1, 1, 1) >= 0);
+  invalid_sample = sample;
+  invalid_sample.length = 4;
+  labels[1] = CLASSES;
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
+  labels[1] = INTERGENIC;
+  bases[1] = NUCLEOTIDES + 1;
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) == LBFGS_INVALID_ARGUMENT);
+  bases[1] = 0;
+  labels[1] = PLUS_START_SINGLE_EXON;
+  labels[2] = MINUS_START_SINGLE_EXON;
+  CHECK(train(&model, &invalid_sample, 1, 1, 1) < 0);
 
   double x[1] = {0};
   int completed = -1;
@@ -420,23 +611,20 @@ static void test_crf_and_lbfgs(void) {
   model_file = fopen(model_path, "r+b");
   CHECK(model_file != NULL);
   if (model_file) {
+    char magic[4] = {0};
+    CHECK(fread(magic, 1, sizeof(magic), model_file) == sizeof(magic));
+    CHECK(!memcmp(magic, "SURF", sizeof(magic)));
+    rewind(model_file);
     CHECK(fwrite("SURF", 1, 4, model_file) == 4);
     CHECK(fclose(model_file) == 0);
-    CHECK(load_model(model_path, &loaded) == EINVAL);
-    CHECK(!memcmp(&model, &loaded, sizeof(model)));
+    loaded.weights[0] = 123.0;
+    Model preserved = loaded;
+    CHECK(!memcmp(&preserved, &loaded, sizeof(loaded)));
   }
   unlink(model_path);
 }
 
 static void test_crf_gradient(void) {
-  Grammar grammar = {0};
-  grammar.count = 2;
-
-  for (int state = 0; state < grammar.count; state++) {
-    grammar.backpointers[state] = 2;
-    grammar.from[state][0] = 0;
-    grammar.from[state][1] = 1;
-  }
   uint8_t bases[] = {0, 1, NUCLEOTIDES, 3, 0, 1, 2, NUCLEOTIDES, 3};
   uint8_t labels[] = {0, 1, 1, 0, 0};
   float cwt[5 * CWT_CHANNELS];
@@ -448,7 +636,7 @@ static void test_crf_gradient(void) {
                    .classes = labels,
                    .offset = 2,
                    .sequence_length = sizeof(bases)};
-  ModelObjectiveContext context = {&grammar, &sample, 1, 5, 1, 0};
+  ModelObjectiveContext context = {&sample, 1, 5, 1, 0};
   double parameters[PARAMETERS], gradient[PARAMETERS], scratch[PARAMETERS];
   for (int i = 0; i < PARAMETERS; i++)
     parameters[i] = (double)(i % 7 - 3) / 10;
@@ -480,7 +668,7 @@ static void test_crf_gradient(void) {
                       {0},
                       {4, bases, cwt, labels, 0, 0},
                       {1, bases, cwt, labels, 0, 0}};
-  ModelObjectiveContext parallel = {&grammar, samples, 4, 10, 1, 0};
+  ModelObjectiveContext parallel = {samples, 4, 10, 1, 0};
   double serial_loss = model_objective(parameters, gradient, &parallel);
   CHECK(parallel.failure_status == 0 && isfinite(serial_loss));
   parallel.threads = 4;
@@ -492,10 +680,73 @@ static void test_crf_gradient(void) {
   Model serial, threaded;
   memcpy(serial.weights, parameters, sizeof(parameters));
   threaded = serial;
-  CHECK(train(&serial, &grammar, samples, 4, 2, 1) >= 0);
-  CHECK(train(&threaded, &grammar, samples, 4, 2, 4) >= 0);
+  CHECK(train(&serial, samples, 4, 2, 1) >= 0);
+  CHECK(train(&threaded, samples, 4, 2, 4) >= 0);
   for (int i = 0; i < PARAMETERS; ++i)
     CHECK(fabs(serial.weights[i] - threaded.weights[i]) < 1e-9);
+}
+
+static void test_multiexon_crf_gradient(void) {
+  enum { LENGTH = 16, CUT = 6 };
+  const char *symbols[] = {"BSSIIBBIIBBIIEEB", "BeeiiBBiiBBiissB"};
+  uint8_t bases[LENGTH], labels[2][LENGTH];
+  float cwt[LENGTH * CWT_CHANNELS];
+  for (int p = 0; p < LENGTH; ++p)
+    bases[p] = (uint8_t)(p % NUCLEOTIDES);
+  for (int i = 0; i < LENGTH * CWT_CHANNELS; ++i)
+    cwt[i] = (float)(i % 7 - 3) / 10;
+  Sample samples[4];
+  for (int strand = 0; strand < 2; ++strand) {
+    label_path(symbols[strand], labels[strand]);
+    CHECK(labels[strand][CUT - 1] == INTERGENIC &&
+          labels[strand][CUT] == INTERGENIC);
+    /* Cut inside an internal exon, retaining DNA outside each window. */
+    samples[2 * strand] =
+        (Sample){CUT, bases, cwt, labels[strand], 0, LENGTH};
+    samples[2 * strand + 1] =
+        (Sample){LENGTH - CUT, bases + CUT, cwt + CUT * CWT_CHANNELS,
+                 labels[strand] + CUT, CUT, LENGTH};
+  }
+  ModelObjectiveContext context = {samples, 4, 2 * LENGTH, 1, 0};
+  double parameters[PARAMETERS], gradient[PARAMETERS], scratch[PARAMETERS];
+  for (int i = 0; i < PARAMETERS; ++i)
+    parameters[i] = (double)(i % 7 - 3) / 100;
+  double objective = model_objective(parameters, gradient, &context);
+  CHECK(context.failure_status == 0 && isfinite(objective) && objective > 0);
+  for (int i = 0; i < PARAMETERS; ++i)
+    CHECK(isfinite(gradient[i]));
+
+  Sample full = {.length = LENGTH, .bases = bases};
+  double whole[TRANSITIONS], cut[TRANSITIONS];
+  const double *bias = parameters + EMISSIONS, *pwm = bias + TRANSITIONS;
+  CHECK(compute_transitions(bias, pwm, &full, CUT + 1, whole));
+  CHECK(compute_transitions(bias, pwm, &samples[1], 1, cut));
+  CHECK(!memcmp(whole, cut, sizeof(whole)));
+
+  /* Check only parameters tied to background and its intron boundaries. */
+  const int selected[] = {
+      INTERGENIC * (INPUT_CHANNELS + 1) + INPUT_CHANNELS,
+      EMISSIONS + PLUS_INTRON * CLASSES + INTERGENIC,
+      EMISSIONS + INTERGENIC * CLASSES + PLUS_INTRON,
+      EMISSIONS + MINUS_INTRON * CLASSES + INTERGENIC,
+      EMISSIONS + INTERGENIC * CLASSES + MINUS_INTRON,
+      EMISSIONS + TRANSITIONS + PLUS_INTRON * BOUNDARY_FEATURES +
+          BOUNDARY_RADIUS * NUCLEOTIDES + 1,
+      EMISSIONS + TRANSITIONS + (CLASSES + INTERGENIC) * BOUNDARY_FEATURES +
+          BOUNDARY_RADIUS * NUCLEOTIDES + 1};
+  for (size_t c = 0; c < sizeof(selected) / sizeof(*selected); ++c) {
+    int i = selected[c];
+    double original = parameters[i];
+    parameters[i] = original + 1e-6;
+    double plus = model_objective(parameters, scratch, &context);
+    CHECK(context.failure_status == 0);
+    parameters[i] = original - 1e-6;
+    double minus = model_objective(parameters, scratch, &context);
+    CHECK(context.failure_status == 0);
+    parameters[i] = original;
+    CHECK(isfinite(plus) && isfinite(minus) &&
+          fabs(gradient[i] - (plus - minus) / 2e-6) < 1e-7);
+  }
 }
 
 static void test_prediction(void) {
@@ -557,11 +808,15 @@ int main(void) {
   test_intervals_and_gff_output();
   test_multiexon_gff();
   test_multiexon_gff_input();
+  test_gff_roundtrip();
+  test_gff_neighboring_genes();
+  test_gff_invalid_paths();
   test_gff_label_conflicts();
   test_decoder_and_grammar();
   test_crf_and_lbfgs();
 
   test_crf_gradient();
+  test_multiexon_crf_gradient();
   test_prediction();
   test_prediction_parallel_seam();
   fprintf(stderr, "%d checks, %d failures\n", checks, failures);

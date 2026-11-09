@@ -33,13 +33,21 @@ static Sample *prepare_samples(const Sequence *sequences, int sequence_count,
       int base = base_index(sequence->bases[p]);
       bases[p] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
     }
-    /* Condition independent windows on observed intergenic endpoints. Every
-       base is retained, genes remain intact, and DNA context is not clipped. */
+    /* Condition windows on intergenic endpoints, not internal-exon background.
+       Every base is retained, genes remain intact, and DNA context is preserved. */
     for (size_t begin = 0, end; begin < length; begin = end) {
       end = begin + 16384 < length ? begin + 16384 : length;
+      size_t previous = end;
+      while (previous > begin && sequence->labels[previous - 1] == INTERGENIC)
+        --previous;
+      uint8_t last = previous > begin ? sequence->labels[previous - 1] : INTERGENIC;
       while (end < length && (sequence->labels[end - 1] != INTERGENIC ||
-                              sequence->labels[end] != INTERGENIC))
+                              sequence->labels[end] != INTERGENIC ||
+                              last == PLUS_INTRON || last == MINUS_INTRON)) {
+        if (sequence->labels[end] != INTERGENIC)
+          last = sequence->labels[end];
         ++end;
+      }
       if (*count == capacity) {
         capacity = capacity ? 2 * capacity : 64;
         samples = srealloc(samples, capacity, sizeof(*samples));
@@ -52,32 +60,15 @@ static Sample *prepare_samples(const Sequence *sequences, int sequence_count,
   return samples;
 }
 
-static int is_grammar_valid(const Grammar *grammar) {
-  if (!grammar || grammar->count <= 0 || grammar->count > CLASSES)
-    return 0;
-  for (int state = 0; state < grammar->count; ++state) {
-    if (grammar->backpointers[state] < 0 ||
-        grammar->backpointers[state] > GRAMMAR_MAX_BACKPOINTERS)
-      return 0;
-    for (int edge = 0; edge < grammar->backpointers[state]; ++edge) {
-      int predecessor = grammar->from[state][edge];
-      if (predecessor < 0 || predecessor >= grammar->count)
-        return 0;
-    }
-  }
-  return 1;
-}
-
-static size_t workspace_size(size_t length, size_t states) {
+static size_t workspace_size(size_t length) {
   const size_t max_cells = SIZE_MAX / sizeof(double);
-  if (!length || !states || states > max_cells / 2 ||
-      length > (max_cells - 2 * states) / (states + CLASSES + TRANSITIONS))
+  if (!length ||
+      length > (max_cells - 2 * CLASSES) / (2 * CLASSES + TRANSITIONS))
     return 0;
-  return (length * (states + CLASSES + TRANSITIONS) + 2 * states) *
-         sizeof(double);
+  return (length * (2 * CLASSES + TRANSITIONS) + 2 * CLASSES) * sizeof(double);
 }
 
-static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
+static int is_sample_valid(const Sample *sample) {
   if (sample->length < 0)
     return 0;
   if (sample->length == 0)
@@ -90,23 +81,23 @@ static int is_sample_valid(const Sample *sample, const Grammar *grammar) {
       (!sample->sequence_length && sample->offset) ||
       (uint64_t)sample->length > SIZE_MAX / sizeof(float) / CWT_CHANNELS)
     return 0;
-  if (!workspace_size((size_t)sample->length, (size_t)grammar->count))
+  if (!workspace_size((size_t)sample->length))
     return 0;
   for (int64_t position = 0; position < sample->length; ++position)
-    if (sample->classes[position] >= grammar->count ||
+    if (sample->classes[position] >= CLASSES ||
         sample->bases[position] > NUCLEOTIDES)
       return 0;
   return 1;
 }
 
-int train(Model *model, const Grammar *grammar, const Sample *samples,
-          size_t sample_count, int iterations, int threads) {
-  if (!model || !is_grammar_valid(grammar) || !samples || !sample_count ||
-      iterations < 1 || threads < 1 || !is_model_finite(model))
+int train(Model *model, const Sample *samples, size_t sample_count,
+          int iterations, int threads) {
+  if (!model || !samples || !sample_count || iterations < 1 || threads < 1 ||
+      !is_model_finite(model))
     return LBFGS_INVALID_ARGUMENT;
   uint64_t total_length = 0;
   for (size_t i = 0; i < sample_count; ++i) {
-    if (!is_sample_valid(&samples[i], grammar))
+    if (!is_sample_valid(&samples[i]))
       return LBFGS_INVALID_ARGUMENT;
     const uint64_t length = (uint64_t)samples[i].length;
     if (length > UINT64_MAX - total_length)
@@ -119,8 +110,7 @@ int train(Model *model, const Grammar *grammar, const Sample *samples,
   Model candidate = *model;
   if ((size_t)threads > sample_count)
     threads = (int)sample_count;
-  ModelObjectiveContext context = {grammar,      samples, sample_count,
-                                   total_length, threads, 0};
+  ModelObjectiveContext context = {samples, sample_count, total_length, threads, 0};
   int completed = 0;
   LbfgsStatus status =
       lbfgs_minimize(PARAMETERS, candidate.weights, model_objective, &context,
@@ -154,8 +144,7 @@ static int boundary_features(const Sample *sample, size_t position,
 Model *train_pipeline(const Sequence *sequences, int count, int iterations,
                       int threads) {
   double started = whattime();
-  Grammar grammar;
-  build_grammar(&grammar);
+
   size_t sample_count;
   Sample *sample = prepare_samples(sequences, count, &sample_count);
   Model *model = scalloc(1, sizeof(*model));
@@ -212,8 +201,7 @@ Model *train_pipeline(const Sequence *sequences, int count, int iterations,
   }
   cry("Training: %d sequences, %zu windows, %d threads, %d iterations", count,
       sample_count, threads, iterations);
-  int status =
-      train(model, &grammar, sample, sample_count, iterations, threads);
+  int status = train(model, sample, sample_count, iterations, threads);
   for (size_t i = 0; i < sample_count; ++i)
     if (!sample[i].offset) {
       free((void *)sample[i].bases);
@@ -240,14 +228,11 @@ static double logadd(double a, double b) {
   return a + log1p(exp(b - a));
 }
 
-static size_t emission_index(int class, int channel) {
-  return (size_t)class * (INPUT_CHANNELS + 1) + (size_t)channel;
-}
 
 static double sample_emission_scores(const double *weights,
                                      const Sample *sample, size_t t,
                                      int class) {
-  const size_t base = emission_index(class, 0);
+  const size_t base = (size_t)class * (INPUT_CHANNELS + 1);
   double score = weights[base + INPUT_CHANNELS];
   uint8_t nucleotide = sample->bases[t];
   if (nucleotide < NUCLEOTIDES)
@@ -263,7 +248,7 @@ void compute_emissions(const Model *model, const float *features,
   if (!model || !features || !scores)
     return;
   for (int c = 0; c < CLASSES; ++c) {
-    const double *weights = model->emission_weights + emission_index(c, 0);
+    const double *weights = model->emission_weights + c * (INPUT_CHANNELS + 1);
     scores[c] = weights[INPUT_CHANNELS];
     for (int k = 0; k < INPUT_CHANNELS; ++k)
       scores[c] += weights[k] * features[k];
@@ -290,15 +275,14 @@ int compute_transitions(const double *bias, const double *pwm,
   return 1;
 }
 
-static int forward_row(const Grammar *grammar, const double *emission,
-                       const double *transition, const double *previous,
-                       double *row) {
+static int forward_row(const double *emission, const double *transition,
+                       const double *previous, double *row) {
   double top = -INFINITY;
-  for (int s = 0; s < grammar->count; ++s) {
+  for (int s = 0; s < CLASSES; ++s) {
     double value = !previous && s == INTERGENIC ? 0 : -INFINITY;
     if (previous)
-      for (int k = 0; k < grammar->backpointers[s]; ++k) {
-        int p = grammar->from[s][k];
+      for (int k = 0; k < gene_grammar.backpointers[s]; ++k) {
+        int p = gene_grammar.from[s][k];
         value = logadd(value, previous[p] + transition[p * CLASSES + s]);
       }
     value += emission[s];
@@ -311,21 +295,20 @@ static int forward_row(const Grammar *grammar, const double *emission,
   return isfinite(top);
 }
 
-static int sample_objective(const double *parameters, const Grammar *grammar,
-                            const Sample *sample, double *gradient,
-                            double *objective) {
-  size_t states = (size_t)grammar->count, length = (size_t)sample->length;
-  size_t bytes = workspace_size(length, states);
+static int sample_objective(const double *parameters, const Sample *sample,
+                            double *gradient, double *objective) {
+  size_t length = (size_t)sample->length;
+  size_t bytes = workspace_size(length);
   if (!bytes || sample->classes[0] != INTERGENIC ||
       sample->classes[length - 1] != INTERGENIC)
     return 0;
   double *work = malloc(bytes);
   if (!work)
     return -1;
-  double *alpha = work, *emissions = alpha + length * states;
+  double *alpha = work, *emissions = alpha + length * CLASSES;
   double *transitions = emissions + length * CLASSES;
   double *beta = transitions + length * TRANSITIONS;
-  double *previous_beta = beta + states;
+  double *previous_beta = beta + CLASSES;
   double gold = 0;
   for (size_t t = 0; t < length; ++t) {
     double *emission = emissions + t * CLASSES;
@@ -338,55 +321,52 @@ static int sample_objective(const double *parameters, const Grammar *grammar,
     if (!compute_transitions(parameters + EMISSIONS,
                              parameters + EMISSIONS + TRANSITIONS, sample, t,
                              transition) ||
-        !forward_row(grammar, emission, transition,
-                     t ? alpha + (t - 1) * states : NULL, alpha + t * states))
+        !forward_row(emission, transition,
+                     t ? alpha + (t - 1) * CLASSES : NULL, alpha + t * CLASSES))
       goto nonfinite;
     int to = sample->classes[t];
-    if ((size_t)to >= states)
+    if (to >= CLASSES)
       goto nonfinite;
     gold += emission[to];
     if (t) {
-      int from = sample->classes[t - 1], copies = 0;
-      for (int k = 0; k < grammar->backpointers[to]; ++k)
-        copies += grammar->from[to][k] == from;
-      if (!copies)
+      int from = sample->classes[t - 1], allowed = 0;
+      for (int k = 0; k < gene_grammar.backpointers[to]; ++k)
+        allowed |= gene_grammar.from[to][k] == from;
+      if (!allowed)
         goto nonfinite;
       gold += transition[from * CLASSES + to];
-      if (copies > 1)
-        gold += log(copies); // Parallel edges retain their path multiplicity.
     }
   }
-  double log_z = alpha[(length - 1) * states];
+  double log_z = alpha[(length - 1) * CLASSES + INTERGENIC];
   if (!isfinite(log_z) || !isfinite(gold))
     goto nonfinite;
   *objective = log_z - gold;
-  for (size_t s = 0; s < states; ++s)
-    beta[s] = s == 0 ? -log_z : -INFINITY;
+  for (int s = 0; s < CLASSES; ++s)
+    beta[s] = s == INTERGENIC ? -log_z : -INFINITY;
 
   for (size_t t = length; t-- > 0;) {
     const double *emission = emissions + t * CLASSES;
     const double *transition = transitions + t * TRANSITIONS;
-    double mass[CLASSES] = {0}, edges[TRANSITIONS] = {0};
-    for (size_t s = 0; s < states; ++s)
+    double mass[CLASSES], edges[TRANSITIONS] = {0};
+    for (int s = 0; s < CLASSES; ++s)
       previous_beta[s] = -INFINITY;
-    for (size_t s = 0; s < states; ++s) {
-      int class = (int)s;
-      mass[class] += exp(alpha[t * states + s] + beta[s]);
+    for (int s = 0; s < CLASSES; ++s) {
+      mass[s] = exp(alpha[t * CLASSES + s] + beta[s]);
       if (!t)
         continue;
-      double suffix = emission[class] + beta[s];
-      for (int k = 0; k < grammar->backpointers[s]; ++k) {
-        int p = grammar->from[s][k], from = p;
-        size_t pair = (size_t)from * CLASSES + (size_t)class;
+      double suffix = emission[s] + beta[s];
+      for (int k = 0; k < gene_grammar.backpointers[s]; ++k) {
+        int from = gene_grammar.from[s][k];
+        int pair = from * CLASSES + s;
         double value = transition[pair] + suffix;
-        previous_beta[p] = logadd(previous_beta[p], value);
-        if (from != class)
-          edges[pair] += exp(alpha[(t - 1) * states + (size_t)p] + value);
+        previous_beta[from] = logadd(previous_beta[from], value);
+        if (from != s)
+          edges[pair] += exp(alpha[(t - 1) * CLASSES + from] + value);
       }
     }
     for (int c = 0; c < CLASSES; ++c) {
       double residual = mass[c] - (sample->classes[t] == c);
-      size_t base = emission_index(c, 0);
+      size_t base = (size_t)c * (INPUT_CHANNELS + 1);
       if (sample->bases[t] < NUCLEOTIDES)
         gradient[base + sample->bases[t]] += residual;
       for (int k = 0; k < CWT_CHANNELS; ++k)
@@ -460,8 +440,7 @@ double model_objective(const double *x, double *gradient, void *opaque) {
     if (!sample->length)
       continue;
     double value;
-    int status =
-        sample_objective(x, context->grammar, sample, worker->gradient, &value);
+    int status = sample_objective(x, sample, worker->gradient, &value);
     if (status > 0)
       worker->objective += value;
     else
@@ -472,13 +451,16 @@ double model_objective(const double *x, double *gradient, void *opaque) {
     if (workers[thread].status)
       context->failure_status = workers[thread].status;
     objective += workers[thread].objective * inverse_length;
-    for (size_t i = 0; i < PARAMETERS; ++i) {
+    for (size_t i = 0; i < PARAMETERS; ++i)
       gradient[i] += workers[thread].gradient[i] * inverse_length;
-      if (!isfinite(gradient[i]))
-        context->failure_status = LBFGS_NONFINITE;
-    }
   }
   free(workers);
+  for (size_t i = 0; i < PARAMETERS; ++i) {
+    objective += 0.5 * L2 * x[i] * x[i];
+    gradient[i] += L2 * x[i];
+    if (!isfinite(gradient[i]))
+      context->failure_status = LBFGS_NONFINITE;
+  }
   if (!isfinite(objective))
     context->failure_status = LBFGS_NONFINITE;
   return context->failure_status ? NAN : objective;
@@ -493,7 +475,7 @@ int is_model_finite(const Model *model) {
   return 1;
 }
 
-static const char model_magic[4] = {'S', 'U', 'R', '5'};
+static const char model_magic[4] = {'S', 'U', 'R', 'F'};
 
 int save_model(const char *path, const Model *model) {
   if (!path || !model || !is_model_finite(model))

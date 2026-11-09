@@ -4,15 +4,16 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
-
 from collections import Counter, defaultdict, deque
+from collections.abc import Hashable
 from dataclasses import dataclass, field
-from pathlib import Path
+from typing import TypeVar
 from urllib.parse import unquote
 
 Span = tuple[int, int]
 Loc = tuple[str, str]
 IntervalKey = tuple[str, str, int, int]
+Key = TypeVar("Key", bound=Hashable)
 
 
 FEATURE_TYPES = {
@@ -254,12 +255,14 @@ def segment_keys(transcripts: list[Transcript], kind: str) -> set[IntervalKey]:
             for a, b in t.spans[kind]}
 
 
-def exact_counts(ref: set | Counter, pred: set | Counter) -> Counts:
-    if isinstance(ref, set):
+def exact_counts(ref: set[Key] | Counter[Key], pred: set[Key] | Counter[Key]) -> Counts:
+    if isinstance(ref, set) and isinstance(pred, set):
         tp = len(ref & pred)
         return Counts(tp, len(pred) - tp, len(ref) - tp)
-    tp = sum((ref & pred).values())
-    return Counts(tp, sum(pred.values()) - tp, sum(ref.values()) - tp)
+    if isinstance(ref, Counter) and isinstance(pred, Counter):
+        tp = sum((ref & pred).values())
+        return Counts(tp, sum(pred.values()) - tp, sum(ref.values()) - tp)
+    raise TypeError("ref and pred must both be sets or both be Counters")
 
 
 def union_coverage(transcripts: list[Transcript], kind: str) -> dict[Loc, list[Span]]:
@@ -459,9 +462,6 @@ def main(argv: list[str] | None = None) -> int:
         result = calculate(ref, pred, args.min_reciprocal_overlap)
     except (ValueError, OSError, RecursionError) as exc:
         parser.error(str(exc))
-
-    ref_seqids = {t.seqid for t in ref}
-    pred_seqids = {t.seqid for t in pred}
 
     if args.format == "json":
         print(json.dumps({"settings": {"utr_source": args.utr_source,

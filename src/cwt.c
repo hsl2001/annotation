@@ -18,8 +18,8 @@ static const int cwt_scales[CWT_CHANNELS] = {3, 4, CWT_MAX_SCALE};
 
 void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
                float *out) {
-  static const double complex signal[NUCLEOTIDES] = {1.0 + I, -1.0 + I,
-                                                     -1.0 - I, 1.0 - I};
+  static const double complex signal[NUCLEOTIDES] = {1.0 + I, -1.0 - I,
+                                                     -1.0 + I, 1.0 - I};
   static const double nodes[8] = {0.09501250983763744, 0.2816035507792589,
                                   0.4580167776572274,  0.6178762444026438,
                                   0.7554044083550030,  0.8656312023878318,

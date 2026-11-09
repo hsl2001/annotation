@@ -6,21 +6,11 @@
 #include "include/surf.h"
 #include <stdlib.h>
 
-static char strand_of_class(uint8_t class) {
-  switch (class) {
-  case PLUS_START_SINGLE_EXON:
-  case PLUS_END_EXON:
-  case PLUS_INTRON:
-  case PLUS_INTERNAL_EXON:
-    return '+';
-  case MINUS_START_SINGLE_EXON:
-  case MINUS_END_EXON:
-  case MINUS_INTRON:
-  case MINUS_INTERNAL_EXON:
-    return '-';
-  default:
-    return 0;
-  }
+static int64_t run_end(const uint8_t *path, int64_t start, int64_t length) {
+  int64_t end = start + 1;
+  while (end < length && path[end] == path[start])
+    ++end;
+  return end;
 }
 
 int is_stop(const char *c) {
@@ -138,24 +128,42 @@ long write_gff(FILE *output, const Sequence *sequence, const uint8_t *path,
                unsigned long *gene_counter) {
   long written = 0;
   for (int64_t p = 0; p < sequence->length;) {
-    char strand = strand_of_class(path[p]);
-    if (!strand) {
-      p++;
+    int64_t start = p;
+    uint8_t opening = path[p];
+    p = run_end(path, p, sequence->length);
+    if ((opening != PLUS_START_SINGLE_EXON &&
+         opening != MINUS_START_SINGLE_EXON && opening != MINUS_END_EXON) ||
+        (start && path[start - 1] != INTERGENIC))
       continue;
-    }
+    char strand = opening == PLUS_START_SINGLE_EXON ? '+' : '-';
+    uint8_t intron = strand == '+' ? PLUS_INTRON : MINUS_INTRON;
+    uint8_t closing = strand == '+' ? PLUS_END_EXON : MINUS_START_SINGLE_EXON;
     IntervalList exons = {0};
-    while (p < sequence->length && strand_of_class(path[p]) == strand) {
-      int intron = path[p] == PLUS_INTRON || path[p] == MINUS_INTRON;
-      int64_t start = p;
-      while (p < sequence->length && strand_of_class(path[p]) == strand &&
-             (path[p] == PLUS_INTRON || path[p] == MINUS_INTRON) == intron)
-        p++;
-      if (!intron)
+    push_interval(&exons, start, p);
+    int complete = opening != MINUS_END_EXON &&
+                   (p == sequence->length || path[p] == INTERGENIC);
+    if (opening != MINUS_START_SINGLE_EXON)
+      while (p < sequence->length && path[p] == intron) {
+        p = run_end(path, p, sequence->length);
+        if (p == sequence->length ||
+            (path[p] != INTERGENIC && path[p] != closing))
+          break;
+        start = p;
+        uint8_t exon = path[p];
+        p = run_end(path, p, sequence->length);
+        if (exon == closing) {
+          push_interval(&exons, start, p);
+          complete = p == sequence->length || path[p] == INTERGENIC;
+          break;
+        }
+        /* Only same-strand introns inside a complete gene bound internal exons. */
+        if (p == sequence->length || path[p] != intron)
+          break;
         push_interval(&exons, start, p);
-    }
-    int result = exons.count ? write_one_transcript(output, sequence, &exons,
-                                                    strand, *gene_counter + 1)
-                             : 0;
+      }
+    int result = complete ? write_one_transcript(output, sequence, &exons,
+                                                 strand, *gene_counter + 1)
+                          : 0;
     free(exons.items);
     if (result < 0)
       return -1;

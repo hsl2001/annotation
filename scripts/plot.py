@@ -3,7 +3,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["numpy", "lets-plot>=4.9,<5", "pillow>=10.1"]
 # ///
-"""Generate CWT plots with `uv run --no-project scripts/plot.py`."""
+"""Run `uv run --no-project scripts/plot.py`."""
 
 from __future__ import annotations
 
