@@ -299,7 +299,7 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
                       FILE *gff, const char *prefix) {
   enum { TILE = 16384 };
   struct {
-    float power[TILE * CWT_CHANNELS];
+    float power[(TILE + 2 * BOUNDARY_RADIUS) * CWT_CHANNELS];
     double emission[TILE][CLASSES], transition[TILE][TRANSITIONS];
   } *tile = scalloc(1, sizeof(*tile));
   PredictionBedgraph b = {0};
@@ -329,12 +329,19 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
       b.value[c] = -1;
     for (int64_t start = 0; start < s->length; start += TILE) {
       int64_t length = s->length - start < TILE ? s->length - start : TILE;
-      cwt_power(s->bases, s->length, start, start + length, tile->power);
+      int64_t begin = start > BOUNDARY_RADIUS ? start - BOUNDARY_RADIUS : 0;
+      int64_t end = start + length + BOUNDARY_RADIUS;
+      if (end > s->length)
+        end = s->length;
+      cwt_power(s->bases, s->length, begin, end, tile->power);
+      sample.context_cwt = tile->power;
+      sample.cwt_origin = begin;
 #pragma omp parallel for schedule(static)
       for (int64_t i = 0; i < length; ++i) {
         int64_t p = start + i;
         float row[INPUT_CHANNELS];
-        compute_features(s->bases[p], tile->power + i * CWT_CHANNELS, row);
+        compute_features(s->bases[p],
+                         tile->power + (p - begin) * CWT_CHANNELS, row);
         compute_emissions(model, row, tile->emission[i]);
         if (!compute_transitions(model->transition_weights,
                                  model->boundary_weights, &sample, (size_t)p,

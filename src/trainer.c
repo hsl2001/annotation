@@ -54,7 +54,7 @@ static Sample *prepare_samples(const Sequence *sequences, int sequence_count,
       }
       samples[(*count)++] = (Sample){
           (int64_t)(end - begin),   bases + begin,  cwt + begin * CWT_CHANNELS,
-          sequence->labels + begin, (int64_t)begin, sequence->length};
+          sequence->labels + begin, (int64_t)begin, sequence->length, NULL, 0};
     }
   }
   return samples;
@@ -137,8 +137,35 @@ static int boundary_features(const Sample *sample, size_t position,
   for (size_t p = begin; p < end; ++p)
     if (bases[p] < NUCLEOTIDES)
       indices[count++] =
-          (p + BOUNDARY_RADIUS - position) * NUCLEOTIDES + bases[p];
+          (p + BOUNDARY_RADIUS - position) * INPUT_CHANNELS + bases[p];
   return count;
+}
+
+static int cwt_boundary_slot(int slot) {
+  int incoming = slot >= CLASSES, c = slot % CLASSES;
+  return c == PLUS_INTRON || c == MINUS_INTRON ||
+         (incoming ? c == PLUS_START_SINGLE_EXON || c == MINUS_END_EXON
+                   : c == PLUS_END_EXON || c == MINUS_START_SINGLE_EXON);
+}
+
+static void boundary_cwt(const Sample *sample, size_t position,
+                         float profile[BOUNDARY_FEATURES]) {
+  memset(profile, 0, BOUNDARY_FEATURES * sizeof(*profile));
+  position += sample->offset;
+  size_t length = sample->sequence_length ? (size_t)sample->sequence_length
+                                          : (size_t)sample->length;
+  size_t begin = position > BOUNDARY_RADIUS ? position - BOUNDARY_RADIUS : 0;
+  size_t end = position + BOUNDARY_RADIUS + 1;
+  if (end > length)
+    end = length;
+  const float *power = sample->context_cwt
+                           ? sample->context_cwt
+                           : sample->cwt - sample->offset * CWT_CHANNELS;
+  int64_t origin = sample->context_cwt ? sample->cwt_origin : 0;
+  for (size_t p = begin; p < end; ++p)
+    for (int k = 0; k < CWT_CHANNELS; ++k)
+      profile[(p + BOUNDARY_RADIUS - position) * INPUT_CHANNELS +
+              NUCLEOTIDES + k] = power[(p - origin) * CWT_CHANNELS + k];
 }
 
 Model *train_pipeline(const Sequence *sequences, int count, int iterations,
@@ -191,7 +218,7 @@ Model *train_pipeline(const Sequence *sequences, int count, int iterations,
     for (int to = 0; to < CLASSES; ++to)
       model->transition_weights[from * CLASSES + to] -=
           model->emission_weights[to * (INPUT_CHANNELS + 1) + INPUT_CHANNELS];
-  for (size_t i = 0; i < BOUNDARY_WEIGHTS; i += NUCLEOTIDES) {
+  for (size_t i = 0; i < BOUNDARY_WEIGHTS; i += INPUT_CHANNELS) {
     double total = NUCLEOTIDES;
     for (int b = 0; b < NUCLEOTIDES; ++b)
       total += model->boundary_weights[i + b];
@@ -260,10 +287,19 @@ int compute_transitions(const double *bias, const double *pwm,
                         double scores[TRANSITIONS]) {
   size_t indices[2 * BOUNDARY_RADIUS + 1];
   int count = boundary_features(sample, position, indices);
+  float profile[BOUNDARY_FEATURES];
+  boundary_cwt(sample, position, profile);
   double context[2 * CLASSES] = {0};
-  for (int c = 0; c < 2 * CLASSES; ++c)
+  for (int c = 0; c < 2 * CLASSES; ++c) {
     for (int i = 0; i < count; ++i)
       context[c] += pwm[c * BOUNDARY_FEATURES + indices[i]];
+    if (cwt_boundary_slot(c))
+      for (int p = 0; p < 2 * BOUNDARY_RADIUS + 1; ++p)
+        for (int k = 0; k < CWT_CHANNELS; ++k) {
+          int f = p * INPUT_CHANNELS + NUCLEOTIDES + k;
+          context[c] += pwm[c * BOUNDARY_FEATURES + f] * profile[f];
+        }
+  }
   for (int from = 0; from < CLASSES; ++from)
     for (int to = 0; to < CLASSES; ++to) {
       int pair = from * CLASSES + to;
@@ -386,11 +422,20 @@ static int sample_objective(const double *parameters, const Sample *sample,
         changes[pair / CLASSES] += edges[pair];
         changes[CLASSES + pair % CLASSES] += edges[pair];
       }
+      float profile[BOUNDARY_FEATURES];
+      boundary_cwt(sample, t, profile);
       for (int c = 0; c < 2 * CLASSES; ++c)
-        if (changes[c] != 0)
+        if (changes[c] != 0) {
+          double *g = gradient + EMISSIONS + TRANSITIONS + c * BOUNDARY_FEATURES;
           for (int i = 0; i < count; ++i)
-            gradient[EMISSIONS + TRANSITIONS + c * BOUNDARY_FEATURES +
-                     indices[i]] += changes[c];
+            g[indices[i]] += changes[c];
+          if (cwt_boundary_slot(c))
+            for (int p = 0; p < 2 * BOUNDARY_RADIUS + 1; ++p)
+              for (int k = 0; k < CWT_CHANNELS; ++k) {
+                int f = p * INPUT_CHANNELS + NUCLEOTIDES + k;
+                g[f] += changes[c] * profile[f];
+              }
+        }
     }
     double *swap = beta;
     beta = previous_beta;

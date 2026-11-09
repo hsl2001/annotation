@@ -16,7 +16,7 @@
 #define EMISSIONS (CLASSES * (INPUT_CHANNELS + 1))
 #define TRANSITIONS (CLASSES * CLASSES)
 #define BOUNDARY_RADIUS 64
-#define BOUNDARY_FEATURES ((2 * BOUNDARY_RADIUS + 1) * NUCLEOTIDES)
+#define BOUNDARY_FEATURES ((2 * BOUNDARY_RADIUS + 1) * INPUT_CHANNELS)
 #define BOUNDARY_WEIGHTS (2 * CLASSES * BOUNDARY_FEATURES)
 #define PARAMETERS (EMISSIONS + TRANSITIONS + BOUNDARY_WEIGHTS)
 #define L2 1e-5
@@ -38,6 +38,8 @@ typedef struct {
   const float *cwt;     // Position-major CWT power array
   const uint8_t *classes;          // Observed class labels per position
   int64_t offset, sequence_length; // Preserve DNA context across training cuts.
+  const float *context_cwt;        // Optional CWT halo for tiled prediction.
+  int64_t cwt_origin;              // Sequence coordinate of context_cwt[0].
 } Sample;
 
 /** Fixed seven-state gene grammar shared by training and decoding. */
@@ -53,7 +55,7 @@ typedef struct Decoder Decoder;
 void compute_emissions(const Model *model, const float *features,
                        double scores[CLASSES]);
 
-/** Score class transitions at the boundary before position, using DNA only. */
+/** Score transitions before position using DNA and boundary CWT profiles. */
 int compute_transitions(const double *bias, const double *pwm,
                         const Sample *sample, size_t position,
                         double scores[TRANSITIONS]);

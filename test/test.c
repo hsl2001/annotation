@@ -627,12 +627,12 @@ static void test_crf_and_lbfgs(void) {
 static void test_crf_gradient(void) {
   uint8_t bases[] = {0, 1, NUCLEOTIDES, 3, 0, 1, 2, NUCLEOTIDES, 3};
   uint8_t labels[] = {0, 1, 1, 0, 0};
-  float cwt[5 * CWT_CHANNELS];
-  for (int i = 0; i < 5 * CWT_CHANNELS; i++)
+  float cwt[9 * CWT_CHANNELS];
+  for (int i = 0; i < 9 * CWT_CHANNELS; i++)
     cwt[i] = (float)(i - 7) / 10;
   Sample sample = {.length = 5,
                    .bases = bases + 2,
-                   .cwt = cwt,
+                   .cwt = cwt + 2 * CWT_CHANNELS,
                    .classes = labels,
                    .offset = 2,
                    .sequence_length = sizeof(bases)};
@@ -641,12 +641,13 @@ static void test_crf_gradient(void) {
   for (int i = 0; i < PARAMETERS; i++)
     parameters[i] = (double)(i % 7 - 3) / 10;
   CHECK(isfinite(model_objective(parameters, gradient, &context)));
-  Sample full = {.length = sizeof(bases), .bases = bases};
+  Sample full = {.length = sizeof(bases), .bases = bases, .cwt = cwt};
   double whole[TRANSITIONS], cut[TRANSITIONS];
   const double *bias = parameters + EMISSIONS, *pwm = bias + TRANSITIONS;
   for (int offset = 0; offset <= 4; offset += 2) {
     Sample window = sample;
     window.bases = bases + offset;
+    window.cwt = cwt + offset * CWT_CHANNELS;
     window.offset = offset;
     for (int p = 0; p < 5; p += 4) {
       CHECK(compute_transitions(bias, pwm, &full, offset + p, whole));
@@ -666,8 +667,8 @@ static void test_crf_gradient(void) {
   }
   Sample samples[] = {sample,
                       {0},
-                      {4, bases, cwt, labels, 0, 0},
-                      {1, bases, cwt, labels, 0, 0}};
+                      {4, bases, cwt, labels, 0, 0, NULL, 0},
+                      {1, bases, cwt, labels, 0, 0, NULL, 0}};
   ModelObjectiveContext parallel = {samples, 4, 10, 1, 0};
   double serial_loss = model_objective(parameters, gradient, &parallel);
   CHECK(parallel.failure_status == 0 && isfinite(serial_loss));
@@ -702,10 +703,10 @@ static void test_multiexon_crf_gradient(void) {
           labels[strand][CUT] == INTERGENIC);
     /* Cut inside an internal exon, retaining DNA outside each window. */
     samples[2 * strand] =
-        (Sample){CUT, bases, cwt, labels[strand], 0, LENGTH};
+        (Sample){CUT, bases, cwt, labels[strand], 0, LENGTH, NULL, 0};
     samples[2 * strand + 1] =
         (Sample){LENGTH - CUT, bases + CUT, cwt + CUT * CWT_CHANNELS,
-                 labels[strand] + CUT, CUT, LENGTH};
+                 labels[strand] + CUT, CUT, LENGTH, NULL, 0};
   }
   ModelObjectiveContext context = {samples, 4, 2 * LENGTH, 1, 0};
   double parameters[PARAMETERS], gradient[PARAMETERS], scratch[PARAMETERS];
@@ -716,7 +717,7 @@ static void test_multiexon_crf_gradient(void) {
   for (int i = 0; i < PARAMETERS; ++i)
     CHECK(isfinite(gradient[i]));
 
-  Sample full = {.length = LENGTH, .bases = bases};
+  Sample full = {.length = LENGTH, .bases = bases, .cwt = cwt};
   double whole[TRANSITIONS], cut[TRANSITIONS];
   const double *bias = parameters + EMISSIONS, *pwm = bias + TRANSITIONS;
   CHECK(compute_transitions(bias, pwm, &full, CUT + 1, whole));
@@ -731,9 +732,13 @@ static void test_multiexon_crf_gradient(void) {
       EMISSIONS + MINUS_INTRON * CLASSES + INTERGENIC,
       EMISSIONS + INTERGENIC * CLASSES + MINUS_INTRON,
       EMISSIONS + TRANSITIONS + PLUS_INTRON * BOUNDARY_FEATURES +
-          BOUNDARY_RADIUS * NUCLEOTIDES + 1,
+          BOUNDARY_RADIUS * INPUT_CHANNELS + 1,
       EMISSIONS + TRANSITIONS + (CLASSES + INTERGENIC) * BOUNDARY_FEATURES +
-          BOUNDARY_RADIUS * NUCLEOTIDES + 1};
+          BOUNDARY_RADIUS * INPUT_CHANNELS + 1,
+      EMISSIONS + TRANSITIONS + PLUS_INTRON * BOUNDARY_FEATURES +
+          BOUNDARY_RADIUS * INPUT_CHANNELS + NUCLEOTIDES,
+      EMISSIONS + TRANSITIONS + (CLASSES + MINUS_INTRON) * BOUNDARY_FEATURES +
+          (BOUNDARY_RADIUS - 3) * INPUT_CHANNELS + NUCLEOTIDES + 2};
   for (size_t c = 0; c < sizeof(selected) / sizeof(*selected); ++c) {
     int i = selected[c];
     double original = parameters[i];
@@ -746,6 +751,38 @@ static void test_multiexon_crf_gradient(void) {
     parameters[i] = original;
     CHECK(isfinite(plus) && isfinite(minus) &&
           fabs(gradient[i] - (plus - minus) / 2e-6) < 1e-7);
+  }
+}
+
+static void test_boundary_cwt_profiles(void) {
+  enum { LENGTH = 256, ORIGIN = 32, POSITION = 96 };
+  uint8_t bases[LENGTH] = {0};
+  float power[LENGTH * CWT_CHANNELS];
+  for (int i = 0; i < LENGTH * CWT_CHANNELS; ++i)
+    power[i] = (float)(i + 1) / 100;
+  Sample full = {.length = LENGTH, .bases = bases, .cwt = power};
+  Sample tile = full;
+  tile.context_cwt = power + ORIGIN * CWT_CHANNELS;
+  tile.cwt_origin = ORIGIN;
+  const int enabled[2 * CLASSES] = {0, 0, 1, 1, 1, 0, 1,
+                                  0, 1, 0, 1, 0, 1, 1};
+  int feature = (BOUNDARY_RADIUS - 10) * INPUT_CHANNELS + NUCLEOTIDES + 2;
+  double expected = power[(POSITION - 10) * CWT_CHANNELS + 2];
+  for (int slot = 0; slot < 2 * CLASSES; ++slot) {
+    Model model = {0};
+    double whole[TRANSITIONS], cut[TRANSITIONS];
+    model.boundary_weights[slot * BOUNDARY_FEATURES + feature] = 1;
+    CHECK(compute_transitions(model.transition_weights, model.boundary_weights,
+                              &full, POSITION, whole));
+    CHECK(compute_transitions(model.transition_weights, model.boundary_weights,
+                              &tile, POSITION, cut));
+    CHECK(!memcmp(whole, cut, sizeof(whole)));
+    for (int from = 0; from < CLASSES; ++from)
+      for (int to = 0; to < CLASSES; ++to) {
+        int active = from != to && enabled[slot] &&
+                     (slot < CLASSES ? from == slot : to == slot - CLASSES);
+        CHECK(close_enough(whole[from * CLASSES + to], active ? expected : 0));
+      }
   }
 }
 
@@ -773,7 +810,10 @@ static void test_prediction_parallel_seam(void) {
   model.transition_weights[PLUS_START_SINGLE_EXON * CLASSES] = -1;
   model
       .boundary_weights[(CLASSES + PLUS_START_SINGLE_EXON) * BOUNDARY_FEATURES +
-                        BOUNDARY_RADIUS * NUCLEOTIDES + 1] = 0.1;
+                        BOUNDARY_RADIUS * INPUT_CHANNELS + 1] = 0.1;
+  model.boundary_weights[(CLASSES + PLUS_START_SINGLE_EXON) * BOUNDARY_FEATURES +
+                         (BOUNDARY_RADIUS - 10) * INPUT_CHANNELS + NUCLEOTIDES] =
+      0.01;
   for (int pass = 0; pass < 2; ++pass) {
     omp_set_num_threads(pass ? 4 : 1);
     FILE *output = tmpfile();
@@ -817,6 +857,7 @@ int main(void) {
 
   test_crf_gradient();
   test_multiexon_crf_gradient();
+  test_boundary_cwt_profiles();
   test_prediction();
   test_prediction_parallel_seam();
   fprintf(stderr, "%d checks, %d failures\n", checks, failures);
