@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["numpy", "lets-plot>=4.9,<5", "pillow>=10.1"]
-# ///
-"""Run `uv run --no-project scripts/plot.py`."""
-
 from __future__ import annotations
 
 import argparse
@@ -23,10 +17,21 @@ from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 
+import matplotlib
+import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.font_manager import FontProperties
+from matplotlib.patches import PathPatch
+from matplotlib.textpath import TextPath
+from matplotlib.transforms import Affine2D
 from numpy.typing import DTypeLike, NDArray
+
+matplotlib.use("Agg")
+
+plt.rcParams["svg.fonttype"] = "none"
+
 
 Interval = tuple[str, int, int, str]
 KmerHit = tuple[str, str]
@@ -63,7 +68,6 @@ REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
 BOUNDARIES: tuple[str, str] = ("start", "end")
 CONTROL_REPLICATES = 2
 ABS_RADIUS = 600
-HEATMAP_COLORS = ("#440154", "#3b528b", "#21918c", "#5ec962", "#fde725")
 KMER_FLANK = 100
 KMER_RADIUS = 10
 KMER_WIDTH = 2 * KMER_RADIUS + 1
@@ -1089,84 +1093,56 @@ class GenomeData:
 
 def _render_abs_task(task: AbsRenderTask) -> None:
     boundary, image_values, profile, widths, interval_count, output = task
-    from lets_plot import (
-        aes,
-        geom_line,
-        geom_raster,
-        gggrid,
-        ggplot,
-        ggsave,
-        labs,
-        scale_fill_gradientn,
-        scale_x_continuous,
-        scale_y_continuous,
-        theme_minimal,
+    positions = np.arange(-ABS_RADIUS, ABS_RADIUS + 1)
+    extent = (-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5, 0, interval_count)
+    figure, axes = plt.subplots(
+        2,
+        len(widths),
+        figsize=(4.1 * len(widths), 6),
+        gridspec_kw={"height_ratios": (4, 1.2)},
+        layout="constrained",
+        squeeze=False,
     )
 
-    positions = np.arange(-ABS_RADIUS, ABS_RADIUS + 1)
-    images, profiles = [], []
     for scale_index in range(len(widths)):
+        image_axis, energy_axis = axes[:, scale_index]
         panel = image_values[:, scale_index]
-        finite = panel[np.isfinite(panel)]
-        maximum = max(float(np.quantile(finite, 0.995)), 1e-6) if finite.size else 1e-6
-        rows, columns = panel.shape
-        data = {
-            "position": np.tile(positions, rows),
-            "rank": np.repeat(np.arange(rows) + 0.5, columns),
-            "energy": np.clip(panel, 0, maximum).ravel(),
-        }
-        x_scale = scale_x_continuous(
-            breaks=[-ABS_RADIUS, 0, ABS_RADIUS],
-            labels=[f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"],
-            limits=[-ABS_RADIUS - 0.5, ABS_RADIUS + 0.5],
-            expand=[0, 0],
+        finite_values = panel[np.isfinite(panel)]
+        maximum = max(float(np.quantile(finite_values, 0.995)), 1e-6)
+        image = image_axis.imshow(
+            panel,
+            aspect="auto",
+            origin="lower",
+            interpolation="nearest",
+            extent=extent,
+            cmap="viridis",
+            vmin=0,
+            vmax=maximum,
         )
-        images.append(
-            ggplot(data, aes("position", "rank", fill="energy"))
-            + geom_raster()
-            + scale_fill_gradientn(
-                list(HEATMAP_COLORS),
-                limits=[0, maximum]
-                if finite.size and np.min(finite) < np.max(finite)
-                else None,
-            )
-            + x_scale
-            + scale_y_continuous(
-                breaks=np.linspace(0, rows, 5).tolist(),
-                labels=[f"{value:,.0f}" for value in np.linspace(0, interval_count, 5)],
-                limits=[0, rows],
-                expand=[0, 0],
-            )
-            + labs(
-                x="",
-                y="Interval rank" if scale_index == 0 else "",
-                fill="",
-            )
-            + theme_minimal()
+        figure.colorbar(image, ax=image_axis, pad=0.01)
+        image_axis.set(
+            title="Surf CWT energy",
+            ylabel="Interval rank" if scale_index == 0 else "",
+            ylim=extent[2:],
         )
-        profiles.append(
-            ggplot(
-                {"position": positions, "energy": profile[scale_index]},
-                aes("position", "energy"),
-            )
-            + geom_line(color="#256c87", size=0.7)
-            + x_scale
-            + labs(
-                x=f"Position from {boundary} boundary (bp)",
-                y="Mean energy" if scale_index == 0 else "",
-            )
-            + theme_minimal()
+
+        energy_axis.plot(
+            positions, profile[scale_index], color="#256c87", linewidth=1.1
         )
+        energy_axis.set_ylabel("Mean energy" if scale_index == 0 else "")
+        energy_axis.set_xlabel(f"Position from {boundary} boundary (bp)")
+        energy_axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
+        for axis in (image_axis, energy_axis):
+            axis.set_xticks(
+                (-ABS_RADIUS, 0, ABS_RADIUS),
+                (f"-{ABS_RADIUS}", "0", f"+{ABS_RADIUS}"),
+                fontsize=8,
+            )
+            axis.set_xlim(extent[:2])
+
     output.mkdir(parents=True, exist_ok=True)
-    ggsave(
-        gggrid(images + profiles, ncol=len(widths), heights=[4, 1.2]),
-        f"{boundary}.png",
-        path=str(output),
-        w=4.1 * len(widths),
-        h=6,
-        unit="in",
-        dpi=300,
-    )
+    figure.savefig(output / f"{boundary}.png", dpi=160)
+    plt.close(figure)
 
 
 class CwtPlotter:
@@ -1250,94 +1226,64 @@ class CwtPlotter:
         return motifs
 
     @staticmethod
-    def render_meme_logo(motif: dict[str, Any], title: str) -> Any:
-        from lets_plot import (
-            aes,
-            coord_cartesian,
-            geom_rect,
-            ggplot,
-            labs,
-            scale_fill_manual,
-            scale_x_continuous,
-            scale_y_continuous,
-            theme_minimal,
-        )
-        from PIL import ImageFont
-
+    def render_meme_logo(axis: Any, motif: dict[str, Any], title: str) -> None:
         probabilities = motif["probabilities"]
+        positions = np.arange(1, len(probabilities) + 1)
         with np.errstate(divide="ignore", invalid="ignore"):
             entropy = -np.sum(
                 np.where(
-                    probabilities > 0, probabilities * np.log2(probabilities), 0.0
+                    probabilities > 0,
+                    probabilities * np.log2(probabilities),
+                    0.0,
                 ),
                 axis=1,
                 keepdims=True,
             )
         heights = probabilities * np.clip(2.0 - entropy, 0.0, 2.0)
-        font = ImageFont.load_default(size=40)
-        glyphs = {}
-        for base in "ACGT":
-            mask = font.getmask(base, mode="L")
-            bitmap = (
-                np.asarray(mask, dtype=np.uint8).reshape(mask.size[1], mask.size[0])
-                >= 128
-            )
-            ys, xs = np.nonzero(bitmap)
-            bitmap = bitmap[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1]
-            runs = []
-            for y, row in enumerate(bitmap):
-                edges = np.diff(np.r_[False, row, False].astype(np.int8))
-                runs.extend(
-                    (left, right, y)
-                    for left, right in zip(
-                        np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        colors = ("#2ca25f", "#3182bd", "#f28e2b", "#d73027")
+        font = FontProperties(weight="bold")
+        glyphs = {base: TextPath((0, 0), base, size=1, prop=font) for base in "ACGT"}
+        glyph_bounds = {base: glyph.get_extents() for base, glyph in glyphs.items()}
+
+        for column, position in enumerate(positions):
+            bottom = 0.0
+            for base_index in np.argsort(heights[column]):
+                height = float(heights[column, base_index])
+                if not height > 0:
+                    continue
+
+                base = "ACGT"[base_index]
+                bounds = glyph_bounds[base]
+                transform = (
+                    Affine2D()
+                    .translate(-bounds.x0, -bounds.y0)
+                    .scale(0.82 / bounds.width, height / bounds.height)
+                    .translate(position - 0.41, bottom)
+                    + axis.transData
+                )
+                axis.add_patch(
+                    PathPatch(
+                        glyphs[base],
+                        transform=transform,
+                        color=colors[base_index],
                     )
                 )
-            glyphs[base] = (bitmap.shape, runs)
-
-        data: dict[str, list[Any]] = {
-            key: [] for key in ("xmin", "xmax", "ymin", "ymax", "base")
-        }
-        for column, column_heights in enumerate(heights):
-            bottom = 0.0
-            for base_index in np.argsort(column_heights):
-                height = float(column_heights[base_index])
-                if height <= 0:
-                    continue
-                base = "ACGT"[base_index]
-                (glyph_height, glyph_width), runs = glyphs[base]
-                for left, right, y in runs:
-                    data["xmin"].append(column + 1 - 0.41 + 0.82 * left / glyph_width)
-                    data["xmax"].append(column + 1 - 0.41 + 0.82 * right / glyph_width)
-                    data["ymin"].append(
-                        bottom + height * (glyph_height - y - 1) / glyph_height
-                    )
-                    data["ymax"].append(
-                        bottom + height * (glyph_height - y) / glyph_height
-                    )
-                    data["base"].append(base)
                 bottom += height
-        positions = np.arange(1, len(probabilities) + 1)
-        ticks = positions[:: max(1, len(positions) // 8)].tolist()
+
+        ticks = positions[:: max(1, len(positions) // 8)]
         if ticks[-1] != positions[-1]:
-            ticks.append(int(positions[-1]))
-        return (
-            ggplot(
-                data,
-                aes(xmin="xmin", xmax="xmax", ymin="ymin", ymax="ymax", fill="base"),
-            )
-            + geom_rect(show_legend=False)
-            + scale_fill_manual(
-                values={"A": "#2ca25f", "C": "#3182bd", "G": "#f28e2b", "T": "#d73027"}
-            )
-            + scale_x_continuous(
-                breaks=ticks, limits=[0.5, len(positions) + 0.5], expand=[0, 0]
-            )
-            + scale_y_continuous(breaks=[0, 1, 2], expand=[0, 0])
-            + coord_cartesian(ylim=[0, 2.04])
-            + labs(title=title, x="Motif position", y="Information (bits)")
-            + theme_minimal()
+            ticks = np.append(ticks, positions[-1])
+        axis.set(
+            ylabel="Information (bits)",
+            ylim=(0, 2.04),
+            yticks=(0, 1, 2),
+            xlim=(0.5, len(positions) + 0.5),
+            xlabel="Motif position",
         )
+        axis.set_xticks(ticks)
+        axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
+        axis.set_axisbelow(True)
+        axis.set_title(title, fontsize=9)
 
     @classmethod
     def render_exon_kmer(
@@ -1395,8 +1341,13 @@ class CwtPlotter:
                     for header, _ in windows[boundary]
                 )
 
-        from lets_plot import aes, geom_text, gggrid, ggplot, ggsave, theme_void
-
+        figure, axes = plt.subplots(
+            MEME_MOTIFS,
+            2,
+            figsize=(17, 4.2 * MEME_MOTIFS),
+            layout="constrained",
+            squeeze=False,
+        )
         titles = {
             "start": (
                 f"Exon start upstream (peak {peaks['start']:+d} bp, "
@@ -1407,9 +1358,9 @@ class CwtPlotter:
                 f"n={len(windows['end']):,})"
             ),
         }
-        plots = []
-        for row in range(MEME_MOTIFS):
-            for boundary in BOUNDARIES:
+        for column, boundary in enumerate(BOUNDARIES):
+            for row in range(MEME_MOTIFS):
+                axis = axes[row, column]
                 if row < len(results[boundary]):
                     motif = results[boundary][row]
                     motif_title = (
@@ -1418,29 +1369,19 @@ class CwtPlotter:
                         f"width={motif['width']}, sites={motif['sites']:,}, "
                         f"E={motif['e_value']}"
                     )
-                    plots.append(cls.render_meme_logo(motif, motif_title))
+                    cls.render_meme_logo(axis, motif, motif_title)
                 else:
-                    plots.append(
-                        ggplot(
-                            {
-                                "x": [0],
-                                "y": [0],
-                                "label": [f"{titles[boundary]}\nNo additional motif"],
-                            },
-                            aes("x", "y", label="label"),
-                        )
-                        + geom_text()
-                        + theme_void()
+                    axis.axis("off")
+                    axis.text(
+                        0.5,
+                        0.5,
+                        f"{titles[boundary]}\nNo additional motif",
+                        ha="center",
+                        va="center",
+                        transform=axis.transAxes,
                     )
-        ggsave(
-            gggrid(plots, ncol=2),
-            "motifs.png",
-            path=str(output),
-            w=17,
-            h=4.2 * MEME_MOTIFS,
-            unit="in",
-            dpi=300,
-        )
+        figure.savefig(output / "motifs.png", dpi=180)
+        plt.close(figure)
 
     @staticmethod
     def resample_mean(values: Arr, bins: int) -> Arr:
@@ -1494,19 +1435,26 @@ class CwtPlotter:
             panel = np.log1p(
                 cls.resample_mean(cwt.power_at(start_index, end_index), bin_count)
             ).T
-            from lets_plot import (
-                aes,
-                geom_raster,
-                ggplot,
-                ggsave,
-                labs,
-                scale_fill_gradientn,
-                scale_x_continuous,
-                scale_y_continuous,
-                theme_minimal,
-            )
-
+            figure, axis = plt.subplots(figsize=(13, 4), layout="constrained")
             maximum = max(float(np.nanmax(panel)), 1e-6)
+            image = axis.imshow(
+                panel,
+                aspect="auto",
+                origin="lower",
+                interpolation="nearest",
+                extent=(0, len(values), -0.5, len(cwt.widths) - 0.5),
+                cmap="viridis",
+                vmin=0,
+                vmax=maximum,
+            )
+            figure.colorbar(image, ax=axis, pad=0.01)
+            axis.set_yticks(
+                range(len(cwt.widths)),
+                [str(width) for width in cwt.widths],
+            )
+            axis.set_ylabel("Surf CWT energy\n(mean over periods)")
+            axis.set_title("log(1 + mean Surf CWT energy)", loc="left", fontsize=11)
+
             if strand == "+":
                 left_boundary = ("start", start)
                 right_boundary = ("end", end)
@@ -1514,62 +1462,40 @@ class CwtPlotter:
                 left_boundary = ("end", end)
                 right_boundary = ("start", start)
 
-            ticks = []
+            ticks: list[tuple[int, str, Literal["left", "right"]]] = []
             if upstream_flank:
-                ticks.append((0, f"5' flank\n{upstream_flank} bp"))
+                ticks.append((0, f"5' flank\n{upstream_flank} bp", "left"))
             ticks.extend(
                 (
-                    (upstream_flank, f"{left_boundary[0]}\n{left_boundary[1]:,}"),
-                    (body_end, f"{right_boundary[0]}\n{right_boundary[1]:,}"),
+                    (
+                        upstream_flank,
+                        f"{left_boundary[0]}\n{left_boundary[1]:,}",
+                        "right",
+                    ),
+                    (
+                        body_end,
+                        f"{right_boundary[0]}\n{right_boundary[1]:,}",
+                        "left",
+                    ),
                 )
             )
             if downstream_flank:
-                ticks.append((len(values), f"3' flank\n{downstream_flank} bp"))
-            data = {
-                "position": np.tile(
-                    (np.arange(bin_count) + 0.5) * len(values) / bin_count,
-                    len(cwt.widths),
-                ),
-                "scale": np.repeat(np.arange(len(cwt.widths)), bin_count),
-                "energy": panel.ravel(),
-            }
-            plot = (
-                ggplot(data, aes("position", "scale", fill="energy"))
-                + geom_raster()
-                + scale_fill_gradientn(
-                    list(HEATMAP_COLORS),
-                    limits=[0, maximum] if np.nanmin(panel) < maximum else None,
-                )
-                + scale_x_continuous(
-                    breaks=[position for position, _ in ticks],
-                    labels=[label for _, label in ticks],
-                    limits=[0, len(values)],
-                    expand=[0, 0],
-                )
-                + scale_y_continuous(
-                    breaks=list(range(len(cwt.widths))),
-                    labels=[str(width) for width in cwt.widths],
-                    expand=[0, 0],
-                )
-                + labs(
-                    title=f"{name}:{start:,}-{end:,} ({strand}) | CWT",
-                    subtitle="log(1 + mean CWT energy)",
-                    x="5' to 3' position; start/end mark genomic exon boundaries",
-                    y="CWT energy\n(mean over periods)",
-                    fill="",
-                )
-                + theme_minimal()
+                ticks.append((len(values), f"3' flank\n{downstream_flank} bp", "right"))
+            axis.set_xticks(
+                [position for position, _, _ in ticks],
+                [label for _, label, _ in ticks],
             )
+            for label, (_, _, alignment) in zip(axis.get_xticklabels(), ticks):
+                label.set_horizontalalignment(alignment)
+            axis.tick_params(axis="x", labelsize=8, pad=6)
+            axis.set_xlabel("5' to 3' position; start/end mark genomic exon boundaries")
+            figure.suptitle(f"{name}:{start:,}-{end:,} ({strand}) | Surf CWT")
             strand_name = "plus" if strand == "+" else "minus"
-            ggsave(
-                plot,
-                f"{name}_{start:06d}_{end:06d}_{strand_name}.png",
-                path=str(output),
-                w=13,
-                h=4,
-                unit="in",
-                dpi=300,
+            figure.savefig(
+                output / f"{name}_{start:06d}_{end:06d}_{strand_name}.png",
+                dpi=160,
             )
+            plt.close(figure)
 
     @classmethod
     def render_group(

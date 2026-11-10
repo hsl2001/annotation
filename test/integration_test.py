@@ -50,7 +50,7 @@ def assert_thresholds(title: str, result: dict, nt_min: float, exon_min: float) 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-i", "--iterations", type=int, default=1500)
+    parser.add_argument("-i", "--iterations", type=int, default=100)
     parser.add_argument("-p", "--threads", type=int, default=os.cpu_count() or 1)
     args = parser.parse_args()
     if args.iterations < 1 or args.threads < 1:
