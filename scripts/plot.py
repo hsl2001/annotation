@@ -22,6 +22,7 @@ from typing import Any, Literal, TextIO
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.collections import LineCollection
 from matplotlib.font_manager import FontProperties
 from matplotlib.patches import PathPatch
 from matplotlib.textpath import TextPath
@@ -41,7 +42,10 @@ ExclusionSpans = dict[tuple[bool, bool], ArrayPair]
 ExonSets = dict[str, list[Interval]]
 KmerBounds = dict[Interval, tuple[int, int]]
 SpliceSites = dict[str, list[int]]
-ParsedAnnotations = tuple[ExonSets, KmerBounds, bool, ExclusionSpans, SpliceSites]
+TranscriptFeatures = tuple[list[Interval], list[Interval]]
+ParsedAnnotations = tuple[
+    ExonSets, KmerBounds, bool, ExclusionSpans, SpliceSites, list[TranscriptFeatures]
+]
 MotifTables = tuple[list[ArrayPair], list[Arr]]
 AbsRenderTask = tuple[str, Arr, Arr, list[int], int, Path]
 
@@ -57,6 +61,7 @@ PLOT_NAMES: tuple[str, ...] = (
     "first-exons",
     "last-exons",
     "first-last-exons",
+    "details",
     "control-no-repeat",
     "control-aggt-no-repeat",
     "control-aggt-p1-no-repeat",
@@ -68,6 +73,7 @@ REPEAT_TYPES: frozenset[str] = frozenset(("repeat_region", "mobile_element"))
 BOUNDARIES: tuple[str, str] = ("start", "end")
 CONTROL_REPLICATES = 2
 ABS_RADIUS = 600
+WINDOW_RADIUS = 15
 KMER_FLANK = 100
 KMER_RADIUS = 10
 KMER_WIDTH = 2 * KMER_RADIUS + 1
@@ -659,6 +665,7 @@ class GenomeData:
             self.has_repeats,
             self._excl_spans,
             self.splice_sites,
+            self.transcript_features,
         ) = self._parse_gff()
         self.sequences = sequences or {}
         self._motif_cache: dict[bool, MotifTables] = {}
@@ -672,6 +679,7 @@ class GenomeData:
         rrna_ids: set[str] = set()
         parents_by_id: dict[str, list[str]] = {}
         exon_rows: list[tuple[list[str], list[str]]] = []
+        cds_rows: list[tuple[list[str], list[str]]] = []
         rep_spans: list[tuple[int, int]] = []
         for row in gff_records(self.gff):
             ftype = row[2]
@@ -701,6 +709,8 @@ class GenomeData:
                     rrna_ids.add(ident)
             if ftype == "exon" and not is_rrna:
                 exon_rows.append((row, parents))
+            elif ftype == "CDS" and not is_rrna:
+                cds_rows.append((row, parents))
 
         def resolve_ancestors(parent: str) -> tuple[list[str], bool]:
             if parent not in anc_cache:
@@ -719,6 +729,7 @@ class GenomeData:
 
         anc_cache: dict[str, tuple[list[str], bool]] = {}
         tx_exons: dict[str, list[Interval]] = defaultdict(list)
+        tx_cds: dict[str, list[Interval]] = defaultdict(list)
         for row, parents in exon_rows:
             resolved = [resolve_ancestors(p) for p in parents]
             if any(rrna for _, rrna in resolved):
@@ -736,6 +747,18 @@ class GenomeData:
             raise ValueError(
                 "No exon features found; CDS is not silently substituted for exon"
             )
+        for row, parents in cds_rows:
+            resolved = [resolve_ancestors(parent) for parent in parents]
+            if any(rrna for _, rrna in resolved):
+                continue
+            name, start, end, strand = row[0], int(row[3]), int(row[4]), row[6]
+            if name not in self.contigs:
+                raise ValueError(f"CDS contig absent from CWT matrix: {name}")
+            self.contigs[name].bounds(start, end, strand)
+            interval: Interval = (name, start, end, strand)
+            for parent, (genes, _) in zip(parents, resolved):
+                if genes:
+                    tx_cds[parent].append(interval)
 
         sites: dict[str, set[int]] = defaultdict(set)
         single_exons: set[Interval] = set()
@@ -830,6 +853,13 @@ class GenomeData:
             bool(rep_spans),
             excl,
             {name: sorted(pos) for name, pos in sites.items()},
+            [
+                (
+                    sort_intervals(set(exons)),
+                    sort_intervals(set(tx_cds.get(parent, ()))),
+                )
+                for parent, exons in tx_exons.items()
+            ],
         )
 
     def load_sequences(self, fasta: Path) -> dict[str, str]:
@@ -1498,6 +1528,168 @@ class CwtPlotter:
             plt.close(figure)
 
     @classmethod
+    def render_details(
+        cls,
+        transcripts: Sequence[TranscriptFeatures],
+        cwt: CwtMatrix,
+        output: Path,
+    ) -> None:
+        window_radius = 10
+        window_offsets = np.arange(-window_radius, window_radius + 1)
+        window_size = len(window_offsets)
+        landmark_labels = ("TSS", "Start", "IS", "Bp", "IE", "Stop", "TTS")
+        window_count = len(landmark_labels)
+        window_gap = 8
+        window_x = np.array(
+            [
+                window_offsets + index * (window_size + window_gap)
+                for index in range(window_count)
+            ],
+            dtype=np.float64,
+        )
+        profiles: list[NDArray[np.float64]] = []
+
+        for exons, cds in transcripts:
+            if not exons:
+                continue
+            name, _, _, strand = exons[0]
+            contig = cwt.contigs[name]
+            ordered = sorted(
+                set(exons),
+                key=lambda exon: contig.bounds(exon[1], exon[2], strand)[0],
+            )
+            exon_bounds = [
+                contig.bounds(start, end, exon_strand)
+                for _, start, end, exon_strand in ordered
+            ]
+            landmarks: list[int | None] = [None] * window_count
+            landmarks[0] = exon_bounds[0][0]
+            landmarks[6] = exon_bounds[-1][1] - 1
+            if len(exon_bounds) > 1:
+                first_intron_start = exon_bounds[0][1]
+                last_intron_end = exon_bounds[-1][0] - 1
+                if first_intron_start < exon_bounds[1][0]:
+                    landmarks[2] = first_intron_start
+                if exon_bounds[-2][1] <= last_intron_end:
+                    landmarks[4] = last_intron_end
+                    landmarks[3] = last_intron_end - 26
+
+            if cds:
+                ordered_cds = sorted(
+                    set(cds),
+                    key=lambda interval: contig.bounds(
+                        interval[1], interval[2], strand
+                    )[0],
+                )
+                cds_bounds = [
+                    contig.bounds(start, end, cds_strand)
+                    for _, start, end, cds_strand in ordered_cds
+                ]
+                landmarks[1] = cds_bounds[0][0]
+                landmarks[5] = cds_bounds[-1][1] - 1
+
+            profile = np.full(
+                (3, window_count, window_size), np.nan, dtype=np.float64
+            )
+            offset = contig.offset(strand)
+            for window_index, landmark in enumerate(landmarks):
+                if landmark is None:
+                    continue
+                positions = landmark + window_offsets
+                valid = (positions >= 0) & (positions < contig.length)
+                valid_positions = positions[valid]
+                matrix_positions = offset + valid_positions
+                power = cwt.matrix[matrix_positions].astype(np.float64)
+                if contig.length == 1:
+                    derivative = np.zeros_like(power)
+                else:
+                    left = np.maximum(valid_positions - 1, 0)
+                    right = np.minimum(valid_positions + 1, contig.length - 1)
+                    derivative = (
+                        cwt.matrix[offset + right] - cwt.matrix[offset + left]
+                    ) / (right - left)
+                profile[0, window_index, valid] = power
+                profile[1, window_index, valid] = derivative
+                profile[2, window_index, valid] = power / (1e-5 + derivative**2)
+
+            profiles.append(profile)
+
+        if not profiles:
+            raise ValueError("No transcript features found for details plot")
+
+        values = np.stack(profiles)
+        valid_counts = np.isfinite(values).sum(axis=0)
+        mean_values = np.divide(
+            np.nansum(values, axis=0),
+            valid_counts,
+            out=np.full(values.shape[1:], np.nan, dtype=np.float64),
+            where=valid_counts > 0,
+        )
+        figure, axes = plt.subplots(
+            3, 1, figsize=(19, 9), sharex=True, layout="constrained"
+        )
+        row_labels = (
+            "Mean CWT energy power",
+            "Derivative of mean power (per bp)",
+            "Mean power / (1e-5 + derivative²)",
+        )
+        for row, axis in enumerate(axes):
+            gene_lines = LineCollection(
+                [
+                    np.column_stack((window_x[window], profile[window]))
+                    for profile in values[:, row, :]
+                    for window in range(window_count)
+                ],
+                colors="#b8b8b8",
+                linewidths=0.65,
+                alpha=0.35,
+                zorder=1,
+            )
+            axis.add_collection(gene_lines)
+            for window in range(window_count):
+                axis.plot(
+                    window_x[window],
+                    mean_values[row, window],
+                    color="#245b78",
+                    linewidth=2.0,
+                    marker="o",
+                    markersize=2.5,
+                    label="Mean" if window == 0 else None,
+                    zorder=3,
+                )
+            axis.set_ylabel(row_labels[row])
+            axis.grid(axis="y", color="#888888", alpha=0.2, linewidth=0.6)
+            axis.set_xlim(window_x[0, 0] - 2, window_x[-1, -1] + 2)
+            for window in range(window_count - 1):
+                break_position = (window_x[window, -1] + window_x[window + 1, 0]) / 2
+                for offset in (-0.035, 0.035):
+                    axis.plot(
+                        (
+                            break_position + offset - 0.035,
+                            break_position + offset + 0.035,
+                        ),
+                        (-0.025, 0.025),
+                        transform=axis.get_xaxis_transform(),
+                        color="#333333",
+                        linewidth=0.9,
+                        clip_on=False,
+                    )
+        axes[0].legend(frameon=False, loc="best")
+        ticks = np.concatenate(
+            [window[[0, window_radius, -1]] for window in window_x]
+        )
+        tick_labels = [
+            label
+            for landmark in landmark_labels
+            for label in (f"{-window_radius}", f"{landmark}\n0", f"+{window_radius}")
+        ]
+        axes[-1].set_xticks(ticks, tick_labels)
+        axes[-1].set_xlabel("Position relative to landmark (bp)")
+        output.mkdir(parents=True, exist_ok=True)
+        figure.savefig(output / "details.png", dpi=180)
+        plt.close(figure)
+
+    @classmethod
     def render_group(
         cls,
         names: list[str],
@@ -1566,6 +1758,9 @@ class CwtPlotter:
 
         for plot_name in names:
             output = args.out / plot_name
+            if plot_name == "details":
+                cls.render_details(genome.transcript_features, cwt, output)
+                continue
             if plot_name == "exon-kmer":
                 assert kmer_cache is not None
                 cls.render_exon_kmer(*kmer_cache, output)
