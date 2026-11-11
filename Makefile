@@ -1,32 +1,41 @@
-CC = cc
-CFLAGS = -O3 -std=c11 -Wall -Wextra -pthread
-LIBS = -lz -lm
+CC ?= cc
+CFLAGS += -O3 -Wall -Wextra -Isrc
+LDLIBS += -lz -lm
 
-PROGRAMS = anno
-TEST_PROGRAM = test-runner
-HEADERS = anno.h crf.h cwt.h kseq.h ketopt.h lbfgs.h rfft.h
+OS := $(shell uname -s)
 
-.PHONY: all clean test
+ifeq ($(OS),Darwin)
+LIBOMP_PREFIX ?= $(shell brew --prefix libomp 2>/dev/null)
+CFLAGS += -Xpreprocessor -fopenmp -I$(LIBOMP_PREFIX)/include
+LDFLAGS += -L$(LIBOMP_PREFIX)/lib
+LDLIBS += -lomp
+else
+CFLAGS += -fopenmp
+LDLIBS += -fopenmp
+endif
 
-all: $(PROGRAMS) anno_cwt_general anno_cwt_intron_low_energy anno_cwt_branchpoint
+SRC_DIR = src
+INCLUDE_DIR = $(SRC_DIR)/include
 
-$(PROGRAMS): %: %.c $(HEADERS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+APP_SOURCES = $(SRC_DIR)/surf.c
+LIB_SOURCES = $(SRC_DIR)/sequence.c $(SRC_DIR)/cwt.c \
+              $(SRC_DIR)/trainer.c $(SRC_DIR)/decoder.c $(SRC_DIR)/gff.c \
+              $(SRC_DIR)/intervals.c $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
+HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 
-anno_cwt_general: anno.c $(HEADERS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+.PHONY: all clean test itest
 
-anno_cwt_intron_low_energy: anno.c $(HEADERS)
-	$(CC) $(CFLAGS) -DCWT_MAPPING_INTRON_LOW_ENERGY $(LDFLAGS) -o $@ $< $(LIBS)
+all: surf
 
-anno_cwt_branchpoint: anno.c $(HEADERS)
-	$(CC) $(CFLAGS) -DCWT_MAPPING_BRANCHPOINT $(LDFLAGS) -o $@ $< $(LIBS)
+test: surf
+	$(CC) $(CFLAGS) $(LDFLAGS) -o surf-test test/test.c $(LIB_SOURCES) $(LDLIBS)
+	./surf-test; rm -f surf-test
 
-$(TEST_PROGRAM): test.c $(HEADERS)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+itest: surf
+	python3 test/integration_test.py
 
-test: $(TEST_PROGRAM)
-	ulimit -s unlimited && ./$(TEST_PROGRAM)
+surf: $(APP_SOURCES) $(LIB_SOURCES) $(HEADERS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(APP_SOURCES) $(LIB_SOURCES) $(LDLIBS)
 
 clean:
-	rm -f *.o $(PROGRAMS) anno_cwt_general anno_cwt_intron_low_energy anno_cwt_branchpoint $(TEST_PROGRAM)
+	rm -f surf surf-test
