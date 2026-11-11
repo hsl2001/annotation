@@ -168,14 +168,18 @@ int site_candidate(const char *b, int64_t length, int64_t p, int type) {
                     (b[p - 2] == 'G' && b[p - 1] == 'T'));
 }
 
+static uint8_t nucleotide(const Sequence *s, int64_t p) {
+  int base = p >= 0 && p < s->length ? base_index(s->bases[p]) : -1;
+  return (uint8_t)(base < 0 ? NUCLEOTIDES : base);
+}
+
 void sample_site(const Sequence *s, const float *power, int64_t origin,
                  int64_t p, int type, Sample *sample) {
   sample->type = (uint8_t)type;
   sample->target = 0;
   for (int k = 0; k < SITE_WIDTH; ++k) {
     int64_t at = p + k - SITE_RADIUS;
-    int base = at >= 0 && at < s->length ? base_index(s->bases[at]) : -1;
-    sample->bases[k] = (uint8_t)(base < 0 ? NUCLEOTIDES : base);
+    sample->bases[k] = nucleotide(s, at);
 
     double value = 0;
     if (at >= 0 && at < s->length)
@@ -195,11 +199,8 @@ void sample_junction(const Sequence *s, int64_t donor, int64_t acceptor,
   sample->type = JUNCTION;
   sample->target = 0;
   for (int k = 0; k < SITE_WIDTH; ++k) {
-    int64_t a = donor + k - SITE_RADIUS, b = acceptor + k - SITE_RADIUS;
-    int x = a >= 0 && a < s->length ? base_index(s->bases[a]) : -1;
-    int y = b >= 0 && b < s->length ? base_index(s->bases[b]) : -1;
-    sample->donor[k] = (uint8_t)(x < 0 ? NUCLEOTIDES : x);
-    sample->acceptor[k] = (uint8_t)(y < 0 ? NUCLEOTIDES : y);
+    sample->donor[k] = nucleotide(s, donor + k - SITE_RADIUS);
+    sample->acceptor[k] = nucleotide(s, acceptor + k - SITE_RADIUS);
   }
   sample->distance[0] = (float)(log1p(acceptor - donor) / 10);
   sample->distance[1] = sample->distance[0] * sample->distance[0];
@@ -342,9 +343,7 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
   for (int s = 0; s < count; ++s)
     if (sequences[s].max_intron > model->max_intron)
       model->max_intron = sequences[s].max_intron;
-  model->max_intron = model->max_intron > 200000 ? 1000000
-                      : model->max_intron < 2000 ? 10000
-                                                 : 5 * model->max_intron;
+  model->max_intron = (int64_t)fmin(1000000, 5 * fmax(2000, model->max_intron));
   for (int s = 0; s < count; ++s) {
     const Sequence *sequence = &sequences[s];
     char *reverse = scalloc((size_t)sequence->length + 1, 1);
