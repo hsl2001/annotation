@@ -11,17 +11,18 @@
 #endif
 
 static void usage(void) {
-  fprintf(stderr,
-          "Usage: surf [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
-          "  with an annotation: train point and splice-junction models\n"
-          "  without:            assemble coding isoforms (GFF3 on stdout)\n"
-          "Options:\n"
-          "  -p N       threads [1]\n"
-          "  -i N       training iterations [%d]\n"
-          "  -m FILE    point model file [surf.crf]\n"
-          "  -o PREFIX  write GFF3 and strand-specific point bedGraphs\n"
-          "  -h         this help\n",
-          DEFAULT_ITERATIONS);
+  fprintf(
+      stderr,
+      "Usage: surf [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
+      "  with an annotation: train TSS, TTS, IS, IE and IS-IE pair models\n"
+      "  without:            assemble transcripts and longest spliced ORFs\n"
+      "Options:\n"
+      "  -p N       threads [1]\n"
+      "  -i N       training iterations [%d]\n"
+      "  -m FILE    point model file [surf.model]\n"
+      "  -o PREFIX  write GFF3 and strand-specific point bedGraphs\n"
+      "  -h         this help\n",
+      DEFAULT_ITERATIONS);
 }
 
 static int positive(const char *text) {
@@ -35,7 +36,7 @@ static int positive(const char *text) {
 
 int main(int argc, char **argv) {
   int threads = 1, iterations = DEFAULT_ITERATIONS, opt;
-  const char *model_path = "surf.crf", *prefix = NULL;
+  const char *model_path = "surf.model", *prefix = NULL;
   opterr = 0;
   while ((opt = getopt(argc, argv, "hp:i:m:o:")) != -1) {
     if (opt == 'h' || opt == '?') {

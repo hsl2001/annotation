@@ -4,7 +4,8 @@
 #include "cwt.h"
 #include "surf.h"
 
-enum { START, IS, IE, STOP, SITES, JUNCTION = SITES, CLASSIFIERS };
+enum { TSS, IS, IE, TTS, SITES, JUNCTION = SITES, CLASSIFIERS };
+extern const char *const classifier_names[CLASSIFIERS];
 #ifndef SITE_RADIUS
 #define SITE_RADIUS 15
 #endif
@@ -12,12 +13,9 @@ enum { START, IS, IE, STOP, SITES, JUNCTION = SITES, CLASSIFIERS };
 #error "SITE_RADIUS must be nonnegative"
 #endif
 #define SITE_WIDTH (2 * SITE_RADIUS + 1)
-#define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1) + 1)
+#define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1 + 64) + 1)
 #define JUNCTION_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES + 1) + 3)
-#define MODEL_FEATURES JUNCTION_FEATURES
-#ifndef CDS_RECIPROCAL_OVERLAP
-#define CDS_RECIPROCAL_OVERLAP 0.5
-#endif
+#define MODEL_FEATURES SITE_FEATURES
 
 typedef struct {
   union {
@@ -31,11 +29,12 @@ typedef struct {
     };
   };
   uint8_t type, target;
+  float weight;
 } Sample;
 
 typedef struct {
   double weights[CLASSIFIERS][MODEL_FEATURES];
-  int64_t max_intron;
+  int64_t max_intron, max_exon;
 } Model;
 
 int site_candidate(const char *bases, int64_t length, int64_t p, int type);

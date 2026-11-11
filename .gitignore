@@ -1,4 +1,4 @@
-*.crf
+*.model
 *bam
 *.bedgraph
 
@@ -19,3 +19,4 @@ data/*.gff3
 !data/truth*
 
 plots/
+.surf-check/

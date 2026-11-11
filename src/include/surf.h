@@ -21,7 +21,7 @@ typedef struct {
   char *name, *bases;
   int64_t length;
   uint8_t *labels;
-  int64_t max_intron;
+  int64_t max_intron, max_exon;
   IntervalList introns[2];
 } Sequence;
 
@@ -32,5 +32,9 @@ void read_fasta(const char *path, int *count, Sequence **out);
 void free_sequences(Sequence *sequences, int count);
 void read_gff3(const char *path, Sequence *sequences, int count);
 int is_stop(const char *codon);
+/* NULL output probes complete-ORF feasibility without emitting records. */
+int write_isoform(FILE *output, const Sequence *sequence,
+                  const IntervalList *form, char strand,
+                  unsigned long gene_number, size_t number);
 
 #endif

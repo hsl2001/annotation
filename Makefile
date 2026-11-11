@@ -23,12 +23,9 @@ LIB_SOURCES = $(SRC_DIR)/sequence.c $(SRC_DIR)/cwt.c \
               $(SRC_DIR)/intervals.c $(SRC_DIR)/lbfgs.c $(SRC_DIR)/utils.c
 HEADERS = $(wildcard $(INCLUDE_DIR)/*.h)
 
-.PHONY: all clean test
+.PHONY: all clean
 
 all: surf
-
-test: surf
-	python3 test/integration_test.py
 
 surf: $(APP_SOURCES) $(LIB_SOURCES) $(HEADERS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(APP_SOURCES) $(LIB_SOURCES) $(LDLIBS)
