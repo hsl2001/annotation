@@ -54,7 +54,8 @@ void read_fasta(const char *path, int *count_out, Sequence **out) {
         if (!length)
           bye("empty FASTA sequence %s", name);
         sequences = srealloc(sequences, (size_t)count + 1, sizeof(*sequences));
-        sequences[count++] = (Sequence){name, bases, (int64_t)length, NULL};
+        sequences[count++] =
+            (Sequence){.name = name, .bases = bases, .length = (int64_t)length};
         name = NULL;
         bases = NULL;
         length = capacity = 0;
@@ -90,7 +91,8 @@ void read_fasta(const char *path, int *count_out, Sequence **out) {
     if (!length)
       bye("empty FASTA sequence %s", name);
     sequences = srealloc(sequences, (size_t)count + 1, sizeof(*sequences));
-    sequences[count++] = (Sequence){name, bases, (int64_t)length, NULL};
+    sequences[count++] =
+        (Sequence){.name = name, .bases = bases, .length = (int64_t)length};
   }
   if (gzclose(input) != Z_OK)
     bye("cannot read FASTA %s", path);
@@ -105,6 +107,8 @@ void free_sequences(Sequence *sequences, int count) {
     free(sequences[i].name);
     free(sequences[i].bases);
     free(sequences[i].labels);
+    for (int strand = 0; strand < 2; ++strand)
+      free(sequences[i].introns[strand].items);
   }
   free(sequences);
 }

@@ -10,11 +10,9 @@
 #include <complex.h>
 #include <math.h>
 
-#include <string.h>
-
 /** Morlet scales of the CWT channels. */
-enum { CWT_MAX_SCALE = 5 };
-static const int cwt_scales[CWT_CHANNELS] = {3, 4, CWT_MAX_SCALE};
+enum { CWT_MAX_SCALE = 4 };
+static const int cwt_scales[CWT_CHANNELS] = {2, 3, CWT_MAX_SCALE};
 
 void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
                float *out) {
@@ -47,7 +45,7 @@ void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
       double lower = fmax(((double)(tap - radius) - 0.5) / scale, -support);
       double upper = fmin(((double)(tap - radius) + 0.5) / scale, support);
       double complex integral = 0.0;
-      /* Every scale is at least 3, so each bin needs only one segment. */
+
       if (lower < upper) {
         double half = (upper - lower) / 2.0, middle = (upper + lower) / 2.0;
         for (int node = 0; node < 8; node++) {
@@ -80,12 +78,4 @@ void cwt_power(const char *bases, int64_t length, int64_t start, int64_t end,
       out[index] = real * real + imag * imag;
     }
   }
-}
-
-void compute_features(char base, const float *power, float *features) {
-  memset(features, 0, NUCLEOTIDES * sizeof(*features));
-  int index = base_index(base);
-  if (index >= 0)
-    features[index] = 1.0f;
-  memcpy(features + NUCLEOTIDES, power, CWT_CHANNELS * sizeof(*power));
 }

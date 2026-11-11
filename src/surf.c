@@ -1,14 +1,8 @@
-/**
- * @file anno.c
- * @brief CLI entry-point for CRF training and genome prediction.
- */
-#include "include/surf.h"
-#include "include/crf.h"
+#include "include/model.h"
 #include "include/utils.h"
 
 #include <errno.h>
 #include <limits.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,102 +10,74 @@
 #include <omp.h>
 #endif
 
-/* ------------------------------------------------------------------------ */
-/* Command line                                                             */
-/* ------------------------------------------------------------------------ */
-
-/**
- * @brief Print command-line usage to standard error.
- * @return None.
- */
 static void usage(void) {
   fprintf(stderr,
           "Usage: surf [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
-          "  with an annotation: train a CRF with L-BFGS and write it to -m\n"
-          "  without:            predict genes (GFF3 on stdout unless -o)\n"
+          "  with an annotation: train point and splice-junction models\n"
+          "  without:            assemble coding isoforms (GFF3 on stdout)\n"
           "Options:\n"
           "  -p N       threads [1]\n"
           "  -i N       training iterations [%d]\n"
-          "  -m FILE    CRF model file [surf.crf]\n"
-          "  -o PREFIX  write PREFIX.gff3 and PREFIX.{class}.bedgraph\n"
+          "  -m FILE    point model file [surf.crf]\n"
+          "  -o PREFIX  write GFF3 and strand-specific point bedGraphs\n"
           "  -h         this help\n",
           DEFAULT_ITERATIONS);
 }
 
-/**
- * @brief Parse a positive integer option value.
- * @param[in] text: Numeric option text.
- * @param[in] name: Option name used in diagnostics.
- * @return Parsed positive integer.
- */
-static int parse_positive(const char *text, const char *name) {
-  char *end = NULL;
+static int positive(const char *text) {
+  char *end;
   errno = 0;
   long value = strtol(text, &end, 10);
   if (errno || end == text || *end || value < 1 || value > INT_MAX)
-    bye("invalid %s: %s", name, text);
+    bye("invalid positive integer: %s", text);
   return (int)value;
 }
 
-/**
- * @brief Run the surf command-line application.
- * @param[in] argc Number of command-line arguments.
- * @param[in] argv Command-line argument vector.
- * @return EXIT_SUCCESS on success, otherwise EXIT_FAILURE.
- */
 int main(int argc, char **argv) {
-  int threads = 1, iterations = DEFAULT_ITERATIONS;
+  int threads = 1, iterations = DEFAULT_ITERATIONS, opt;
   const char *model_path = "surf.crf", *prefix = NULL;
-  int opt;
   opterr = 0;
   while ((opt = getopt(argc, argv, "hp:i:m:o:")) != -1) {
-    if (opt == 'h') {
+    if (opt == 'h' || opt == '?') {
       usage();
-      return EXIT_SUCCESS;
-    }
-    if (opt == '?') {
-      usage();
-      return EXIT_FAILURE;
+      return opt == 'h' ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (opt == 'p')
-      threads = parse_positive(optarg, "thread count");
+      threads = positive(optarg);
     if (opt == 'i')
-      iterations = parse_positive(optarg, "iteration count");
+      iterations = positive(optarg);
     if (opt == 'm')
       model_path = optarg;
     if (opt == 'o')
       prefix = optarg;
   }
-#ifdef _OPENMP
-  omp_set_num_threads(threads);
-#endif
-  int a = optind;
-  if (argc - a < 1 || argc - a > 2) {
+  if (argc - optind < 1 || argc - optind > 2) {
     usage();
     return EXIT_FAILURE;
   }
-  int count = 0;
-  Sequence *sequences = 0;
-  read_fasta(argv[a], &count, &sequences);
-  if (argc - a == 2) {
+#ifdef _OPENMP
+  omp_set_num_threads(threads);
+#endif
+  int count;
+  Sequence *sequences;
+  read_fasta(argv[optind], &count, &sequences);
+  Model *model;
+  if (argc - optind == 2) {
     double started = whattime();
-    read_gff3(argv[a + 1], sequences, count);
-    Model *model = train_pipeline(sequences, count, iterations, threads);
+    read_gff3(argv[optind + 1], sequences, count);
+    model = train_model(sequences, count, iterations, threads);
     int status = save_model(model_path, model);
     if (status)
-      bye("cannot write CRF model %s: %s", model_path, strerror(status));
-    cry("trained in %.1fs; CRF model written to %s", whattime() - started,
+      bye("cannot write model %s: %s", model_path, strerror(status));
+    cry("trained in %.2fs; model written to %s", whattime() - started,
         model_path);
-    free(model);
   } else {
-    Model *model = scalloc(1, sizeof(*model));
+    model = scalloc(1, sizeof(*model));
     int status = load_model(model_path, model);
     if (status == EINVAL)
-      bye("invalid or incompatible CRF model %s; retrain with this version of "
-          "surf",
-          model_path);
+      bye("incompatible point model %s; retrain with this version", model_path);
     if (status)
-      bye("cannot read CRF model %s: %s", model_path, strerror(status));
+      bye("cannot read model %s: %s", model_path, strerror(status));
     FILE *gff = stdout;
     if (prefix) {
       char path[PATH_BUFFER];
@@ -125,8 +91,8 @@ int main(int argc, char **argv) {
     if (fflush(gff) || ferror(gff) || (gff != stdout && fclose(gff)))
       bye("cannot write GFF3");
     cry("predicted %lu genes", genes);
-    free(model);
   }
+  free(model);
   free_sequences(sequences, count);
   return EXIT_SUCCESS;
 }

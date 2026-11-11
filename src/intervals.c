@@ -35,20 +35,3 @@ int compare_interval(const void *a, const void *b) {
          : x->end < y->end     ? -1
                                : x->end > y->end;
 }
-
-char *splice_sequence(const Sequence *sequence, const IntervalList *exons,
-                      char strand, int64_t *length) {
-  *length = 0;
-  for (int i = 0; i < exons->count; i++)
-    *length += exons->items[i].end - exons->items[i].start;
-  char *transcript = scalloc((size_t)*length + 1, 1);
-  int64_t at = 0;
-  for (int i = 0; i < exons->count; i++) {
-    const Interval *e = &exons->items[strand == '+' ? i : exons->count - 1 - i];
-    for (int64_t p = 0; p < e->end - e->start; p++)
-      transcript[at++] = strand == '+'
-                             ? sequence->bases[e->start + p]
-                             : complement(sequence->bases[e->end - 1 - p]);
-  }
-  return transcript;
-}

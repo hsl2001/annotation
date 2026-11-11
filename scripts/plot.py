@@ -1534,10 +1534,10 @@ class CwtPlotter:
         cwt: CwtMatrix,
         output: Path,
     ) -> None:
-        window_radius = 10
+        window_radius = WINDOW_RADIUS
         window_offsets = np.arange(-window_radius, window_radius + 1)
         window_size = len(window_offsets)
-        landmark_labels = ("TSS", "Start", "IS", "Bp", "IE", "Stop", "TTS")
+        landmark_labels = ("Start", "IS", "IE", "Stop")
         window_count = len(landmark_labels)
         window_gap = 8
         window_x = np.array(
@@ -1563,16 +1563,13 @@ class CwtPlotter:
                 for _, start, end, exon_strand in ordered
             ]
             landmarks: list[int | None] = [None] * window_count
-            landmarks[0] = exon_bounds[0][0]
-            landmarks[6] = exon_bounds[-1][1] - 1
             if len(exon_bounds) > 1:
                 first_intron_start = exon_bounds[0][1]
                 last_intron_end = exon_bounds[-1][0] - 1
                 if first_intron_start < exon_bounds[1][0]:
-                    landmarks[2] = first_intron_start
+                    landmarks[1] = first_intron_start
                 if exon_bounds[-2][1] <= last_intron_end:
-                    landmarks[4] = last_intron_end
-                    landmarks[3] = last_intron_end - 26
+                    landmarks[2] = last_intron_end
 
             if cds:
                 ordered_cds = sorted(
@@ -1585,11 +1582,11 @@ class CwtPlotter:
                     contig.bounds(start, end, cds_strand)
                     for _, start, end, cds_strand in ordered_cds
                 ]
-                landmarks[1] = cds_bounds[0][0]
-                landmarks[5] = cds_bounds[-1][1] - 1
+                landmarks[0] = cds_bounds[0][0]
+                landmarks[3] = cds_bounds[-1][1] - 1
 
             profile = np.full(
-                (3, window_count, window_size), np.nan, dtype=np.float64
+                (2, window_count, window_size), np.nan, dtype=np.float64
             )
             offset = contig.offset(strand)
             for window_index, landmark in enumerate(landmarks):
@@ -1610,7 +1607,6 @@ class CwtPlotter:
                     ) / (right - left)
                 profile[0, window_index, valid] = power
                 profile[1, window_index, valid] = derivative
-                profile[2, window_index, valid] = power / (1e-5 + derivative**2)
 
             profiles.append(profile)
 
@@ -1626,12 +1622,11 @@ class CwtPlotter:
             where=valid_counts > 0,
         )
         figure, axes = plt.subplots(
-            3, 1, figsize=(19, 9), sharex=True, layout="constrained"
+            2, 1, figsize=(19, 6), sharex=True, layout="constrained"
         )
         row_labels = (
             "Mean CWT energy power",
             "Derivative of mean power (per bp)",
-            "Mean power / (1e-5 + derivative²)",
         )
         for row, axis in enumerate(axes):
             gene_lines = LineCollection(
