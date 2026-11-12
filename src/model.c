@@ -177,15 +177,6 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     }
 }
 
-static int valid_boundary_candidate(const char *b, int64_t length, int64_t p,
-                                    int type) {
-  if (p < 0 || p > length)
-    return 0;
-  if (type == GS)
-    return p < length && base_index(b[p]) >= 0;
-  return type == GE && p > 0 && base_index(b[p - 1]) >= 0;
-}
-
 static uint8_t nucleotide(const Sequence *s, int64_t p) {
   int base = p >= 0 && p < s->length ? base_index(s->bases[p]) : -1;
   return (uint8_t)(base < 0 ? NUCLEOTIDES : base);
@@ -364,7 +355,7 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
   for (int s = 0; s < count; ++s)
     length += sequences[s].length;
   // Bound negative storage, preserving its population weight and all positives.
-  while (2 * length / stride > 1000000)
+  while (2 * length / stride > STRIDE)
     stride *= 2;
   cry("site negative sampling stride: %d; all positives retained", stride);
   Model *model = scalloc(1, sizeof(*model));
@@ -372,8 +363,8 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
     model->max_intron = fmax(model->max_intron, sequences[s].max_intron);
     model->max_span = fmax(model->max_span, sequences[s].max_span);
   }
-  model->max_intron = (int64_t)fmin(1000000, 5 * fmax(2000, model->max_intron));
-  model->max_span = (int64_t)fmin(1000000, 5 * fmax(2000, model->max_span));
+  model->max_intron = (int64_t)fmin(STRIDE, fmax(2000, model->max_intron));
+  model->max_span = (int64_t)fmin(STRIDE, fmax(2000, model->max_span));
   for (int s = 0; s < count; ++s) {
     const Sequence *sequence = &sequences[s];
     char *reverse = scalloc((size_t)sequence->length + 1, 1);
@@ -405,12 +396,6 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
                            (strand * SITES);
           for (int type = 0; type < SITES; ++type) {
             int target = !!(label & (1U << type));
-            // Splice negatives are not restricted to donor/acceptor motifs.
-            int candidate_type = type == IS ? GS : type == IE ? GE : type;
-            if (!target &&
-                !valid_boundary_candidate(oriented.bases, oriented.length, p,
-                                          candidate_type))
-              continue;
             uint64_t key = (uint64_t)p + (uint64_t)s * 0x9e3779b97f4a7c15ULL +
                            (unsigned)(strand * SITES + type);
             key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;

@@ -32,7 +32,7 @@ static Candidates detect_sites(const Model *model, const Sequence *s,
     int64_t limit =
         stop + SITE_RADIUS < s->length ? stop + SITE_RADIUS : s->length;
     cwt_power(s->bases, s->length, origin, limit, power);
-#pragma omp parallel for schedule(static) 
+#pragma omp parallel for schedule(static)
     for (int i = 0; i < stop - begin; ++i)
       for (int type = 0; type < SITES; ++type) {
         double z = -INFINITY;
@@ -133,6 +133,7 @@ static int reciprocal(const IntervalList *a, const IntervalList *b) {
     else
       ++j;
   }
+  // Reciprocal 75%
   return shared >= length[0] - length[0] / 4 &&
          shared >= length[1] - length[1] / 4;
 }
@@ -144,7 +145,6 @@ static int emit_forms(FILE *output, const Sequence *s, char strand,
   int *next = scalloc((size_t)introns->count + 1, sizeof(*next));
   int64_t longest = 0;
   size_t number = 0;
-  // Two exhaustive walks: choose the longest CDS, then stream its alternatives.
   for (int pass = 0; pass < 2; ++pass) {
     if (pass) {
       if (!longest)
@@ -172,7 +172,7 @@ static int emit_forms(FILE *output, const Sequence *s, char strand,
           bye("cannot write transcript for %s", s->name);
         number += status;
       }
-      // Iterative DFS avoids recursion and stores only the current splice path.
+      // Iterative DFS
       while (form.count) {
         int depth = form.count - 1;
         if (next[depth] == introns->count) {

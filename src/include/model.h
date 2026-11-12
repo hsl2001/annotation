@@ -7,10 +7,16 @@
 enum { GS, IS, IE, GE, SITES, JUNCTION = SITES, SPAN, CLASSIFIERS };
 extern const char *const classifier_names[CLASSIFIERS];
 #ifndef SITE_RADIUS
-#define SITE_RADIUS 15
+#define SITE_RADIUS 64
 #endif
 #if SITE_RADIUS < 0
 #error "SITE_RADIUS must be nonnegative"
+#endif
+#ifndef STRIDE
+#define STRIDE 10000
+#endif
+#if STRIDE < 0
+#error "STRIDE must be nonnegative"
 #endif
 #define SITE_WIDTH (2 * SITE_RADIUS + 1)
 #define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1 + 64) + 1)
