@@ -4,7 +4,7 @@
 #include "cwt.h"
 #include "surf.h"
 
-enum { TSS, IS, IE, TTS, SITES, JUNCTION = SITES, CLASSIFIERS };
+enum { GS, IS, IE, GE, SITES, JUNCTION = SITES, CLASSIFIERS };
 extern const char *const classifier_names[CLASSIFIERS];
 #ifndef SITE_RADIUS
 #define SITE_RADIUS 15
@@ -15,7 +15,8 @@ extern const char *const classifier_names[CLASSIFIERS];
 #define SITE_WIDTH (2 * SITE_RADIUS + 1)
 #define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1 + 64) + 1)
 #define JUNCTION_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES + 1) + 3)
-#define MODEL_FEATURES SITE_FEATURES
+#define MODEL_FEATURES                                                         \
+  (SITE_FEATURES > JUNCTION_FEATURES ? SITE_FEATURES : JUNCTION_FEATURES)
 
 typedef struct {
   union {

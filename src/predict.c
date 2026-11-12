@@ -5,7 +5,13 @@
 #include <math.h>
 #include <stdlib.h>
 
-enum { TILE = 16384, PATHS = 8, SCORE_DROP = 8 };
+enum { TILE = 16384 };
+#ifndef MAX_PATHS
+#define MAX_PATHS 8
+#endif
+#ifndef PATH_SCORE_THRESHOLD
+#define PATH_SCORE_THRESHOLD 0.0
+#endif
 
 typedef struct {
   int64_t position;
@@ -37,8 +43,8 @@ static int point_compare(const void *a, const void *b) {
   if (x->position != y->position)
     return x->position < y->position ? -1 : 1;
   // Complete half-open envelopes before opening adjacent transcripts.
-  int x_order = x->kind == TTS ? -1 : (int)x->kind;
-  int y_order = y->kind == TTS ? -1 : (int)y->kind;
+  int x_order = x->kind == GE ? -1 : (int)x->kind;
+  int y_order = y->kind == GE ? -1 : (int)y->kind;
   return x_order < y_order ? -1 : x_order > y_order;
 }
 
@@ -93,19 +99,16 @@ static void reverse_intervals(IntervalList *form) {
 }
 
 static double transition_score(const Model *model, const Sequence *s,
-                               Point from, Point to, int rescue) {
+                               Point from, Point to) {
   int64_t length = to.position - from.position;
   if (length <= 0)
     return -INFINITY;
   if (from.kind == IS && to.kind == IE && length <= model->max_intron) {
     double pair = junction_logit(model, s, from.position, to.position);
-    // Weak pair negatives need strong boundary sites and a selected envelope.
-    int supported =
-        rescue && pair >= -0.5 && from.logit >= log(19) && to.logit >= log(19);
-    return pair >= 0 || supported ? to.logit + pair : -INFINITY;
+    return isfinite(pair) ? to.logit + pair : -INFINITY;
   }
-  return (from.kind == TSS || from.kind == IE) &&
-                 (to.kind == IS || to.kind == TTS) && length <= model->max_exon
+  return (from.kind == GS || from.kind == IE) &&
+                 (to.kind == IS || to.kind == GE) && length <= model->max_exon
              ? to.logit
              : -INFINITY;
 }
@@ -115,14 +118,14 @@ static int emit_forms(const Model *model, const Sequence *s,
                       int first, int last, FILE *output, unsigned long *genes) {
   int count = last - first + 1;
   // A per-point beam bounds exponential splice-path growth in dense graphs.
-  Node(*paths)[PATHS] = scalloc(count, sizeof(*paths));
+  Node(*paths)[MAX_PATHS] = scalloc(count, sizeof(*paths));
   for (int p = 0; p < count; ++p)
-    for (int k = 0; k < PATHS; ++k)
+    for (int k = 0; k < MAX_PATHS; ++k)
       paths[p][k] = (Node){-INFINITY, -1, 0};
   paths[0][0] = (Node){c->points[first].logit, -1, 0};
   for (int p = 1; p < count; ++p) {
     Point point = c->points[first + p];
-    if (point.kind == TSS || (point.kind == TTS && p != count - 1))
+    if (point.kind == GS || (point.kind == GE && p != count - 1))
       continue;
     int64_t limit = point.kind == IE ? model->max_intron : model->max_exon;
     for (int j = p - 1;
@@ -130,12 +133,12 @@ static int emit_forms(const Model *model, const Sequence *s,
          --j) {
       if (!isfinite(paths[j][0].score))
         continue;
-      double edge = transition_score(model, s, c->points[first + j], point, 1);
+      double edge = transition_score(model, s, c->points[first + j], point);
       if (!isfinite(edge))
         continue;
-      for (int k = 0; k < PATHS && isfinite(paths[j][k].score); ++k) {
+      for (int k = 0; k < MAX_PATHS && isfinite(paths[j][k].score); ++k) {
         double score = paths[j][k].score + edge;
-        int rank = PATHS - 1;
+        int rank = MAX_PATHS - 1;
         if (score <= paths[p][rank].score)
           continue;
         while (rank && score > paths[p][rank - 1].score) {
@@ -148,16 +151,15 @@ static int emit_forms(const Model *model, const Sequence *s,
   }
   IntervalList form = {0};
   size_t number = 0;
-  for (int k = 0;
-       k < PATHS && isfinite(paths[count - 1][k].score) &&
-       paths[count - 1][k].score >= paths[count - 1][0].score - SCORE_DROP;
+  for (int k = 0; k < MAX_PATHS && isfinite(paths[count - 1][k].score) &&
+                  paths[count - 1][k].score >= PATH_SCORE_THRESHOLD;
        ++k) {
     form.count = 0;
     int rank = k;
     for (int p = count - 1; p > 0;) {
       Node node = paths[p][rank];
       Point opening = c->points[first + node.from];
-      if (opening.kind == TSS || opening.kind == IE)
+      if (opening.kind == GS || opening.kind == IE)
         push_interval(&form, opening.position, c->points[first + p].position);
       p = node.from;
       rank = node.rank;
@@ -180,10 +182,10 @@ static int emit_forms(const Model *model, const Sequence *s,
 
 static void retain_start(Node *paths, Node node) {
   int rank = 0;
-  while (rank < PATHS && paths[rank].from != node.from)
+  while (rank < MAX_PATHS && paths[rank].from != node.from)
     ++rank;
-  if (rank == PATHS)
-    rank = PATHS - 1;
+  if (rank == MAX_PATHS)
+    rank = MAX_PATHS - 1;
   if (node.score <= paths[rank].score)
     return;
   while (rank && node.score > paths[rank - 1].score) {
@@ -197,15 +199,16 @@ static void assemble(const Model *model, const Sequence *s,
                      const Sequence *genomic, char strand, const Candidates *c,
                      FILE *output, unsigned long *genes) {
   // Keep distinct starts, not competing splice paths from the same start.
-  // Only PATHS origins survive per point; lower-ranked origins may be pruned.
-  // Here from is the TSS index and rank is the preceding completed terminal.
-  Node(*nodes)[PATHS] = scalloc(c->count, sizeof(*nodes));
+  // Only MAX_PATHS origins survive per point; lower-ranked origins may be
+  // pruned. Here from is the GS index and rank is the preceding completed
+  // terminal.
+  Node(*nodes)[MAX_PATHS] = scalloc(c->count, sizeof(*nodes));
   int best = -1;
   for (int p = 0; p < c->count; ++p) {
     Point point = c->points[p];
-    for (int k = 0; k < PATHS; ++k)
+    for (int k = 0; k < MAX_PATHS; ++k)
       nodes[p][k] = (Node){-INFINITY, -1, -1};
-    if (point.kind == TSS) {
+    if (point.kind == GS) {
       nodes[p][0] =
           (Node){(best < 0 ? 0 : nodes[best][0].score) + point.logit, p, best};
       continue;
@@ -215,17 +218,17 @@ static void assemble(const Model *model, const Sequence *s,
          j >= 0 && point.position - c->points[j].position <= limit; --j) {
       if (!isfinite(nodes[j][0].score))
         continue;
-      double edge = transition_score(model, s, c->points[j], point, 0);
+      double edge = transition_score(model, s, c->points[j], point);
       if (!isfinite(edge))
         continue;
-      for (int k = 0; k < PATHS && isfinite(nodes[j][k].score); ++k) {
+      for (int k = 0; k < MAX_PATHS && isfinite(nodes[j][k].score); ++k) {
         Node node = nodes[j][k];
         node.score += edge;
         retain_start(nodes[p], node);
       }
     }
-    if (point.kind == TTS)
-      for (int k = 0; k < PATHS && isfinite(nodes[p][k].score) &&
+    if (point.kind == GE)
+      for (int k = 0; k < MAX_PATHS && isfinite(nodes[p][k].score) &&
                       (best < 0 || nodes[p][k].score > nodes[best][0].score);
            ++k)
         if (emit_forms(model, s, genomic, strand, c, nodes[p][k].from, p, NULL,
@@ -252,7 +255,7 @@ static void write_points(FILE *const *files, const Sequence *s,
     int type = (int)point.kind;
     if (!files[type])
       continue;
-    int64_t p = point.position - (type == TTS);
+    int64_t p = point.position - (type == GE);
     if (reverse)
       p = s->length - 1 - p;
     if (p >= 0 && p < s->length &&
@@ -292,7 +295,7 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
       free(c.points);
     }
     free(reverse);
-    cry("%s: %lu TSS/TTS transcripts", s->name, genes - previous);
+    cry("%s: %lu GS/GE transcripts", s->name, genes - previous);
   }
   for (int i = 0; i < 2 * SITES; ++i)
     if (files[i] && fclose(files[i]))

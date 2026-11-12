@@ -8,7 +8,7 @@
 #include <string.h>
 #include <zlib.h>
 
-const char *const classifier_names[CLASSIFIERS] = {"TSS", "IS", "IE", "TTS",
+const char *const classifier_names[CLASSIFIERS] = {"GS", "IS", "IE", "GE",
                                                    "IS-IE pair"};
 
 typedef struct {
@@ -144,12 +144,12 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
         s->max_exon = exons.items[e].end - exons.items[e].start;
     int reverse = f->strand == '-';
     int shift = reverse * SITES;
-    int64_t tss =
+    int64_t gs =
         reverse ? exons.items[exons.count - 1].end : exons.items[0].start;
-    int64_t tts =
+    int64_t ge =
         reverse ? exons.items[0].start : exons.items[exons.count - 1].end;
-    s->labels[tss] |= 1U << (shift + TSS);
-    s->labels[tts] |= 1U << (shift + TTS);
+    s->labels[gs] |= 1U << (shift + GS);
+    s->labels[ge] |= 1U << (shift + GE);
     for (int e = 1; e < exons.count; ++e) {
       int64_t a = exons.items[e - 1].end, b = exons.items[e].start;
       s->labels[reverse ? b : a] |= 1U << (shift + IS);
@@ -173,9 +173,9 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
 int site_candidate(const char *b, int64_t length, int64_t p, int type) {
   if (p < 0 || p > length)
     return 0;
-  if (type == TSS || type == TTS)
-    return type == TSS ? p < length && base_index(b[p]) >= 0
-                       : p > 0 && base_index(b[p - 1]) >= 0;
+  if (type == GS || type == GE)
+    return type == GS ? p < length && base_index(b[p]) >= 0
+                      : p > 0 && base_index(b[p - 1]) >= 0;
   if (type == IS)
     return p + 2 <= length &&
            ((b[p] == 'G' && (b[p + 1] == 'T' || b[p + 1] == 'C')) ||
@@ -244,10 +244,12 @@ static double sample_logit(const double *weights, const Sample *sample,
                                      sample->donor[k] == sample->acceptor[k]
                                : sample->power[k];
   }
+
   if (!junction)
     for (int k = 0; k + 2 < SITE_WIDTH; ++k)
-      if (sample->bases[k] < 4 && sample->bases[k + 1] < 4 &&
-          sample->bases[k + 2] < 4) {
+      if (sample->bases[k] < NUCLEOTIDES &&
+          sample->bases[k + 1] < NUCLEOTIDES &&
+          sample->bases[k + 2] < NUCLEOTIDES) {
         indices[count] = SITE_WIDTH * (NUCLEOTIDES + 1) + k * 64 +
                          sample->bases[k] * 16 + sample->bases[k + 1] * 4 +
                          sample->bases[k + 2];
@@ -295,6 +297,7 @@ double junction_logit(const Model *model, const Sequence *s, int64_t donor,
 typedef struct {
   Sample *items;
   size_t count, capacity;
+  double population;
 } Samples;
 
 static Sample *append_sample(Samples *samples) {
@@ -324,10 +327,8 @@ static void collect_junctions(Samples *samples, const Sequence *s,
       propose_junction(&pairs, s, pair.start, observed->items[j].end,
                        max_intron);
     for (int offset = -SITE_RADIUS; offset <= SITE_RADIUS; ++offset) {
-      if (site_candidate(s->bases, s->length, pair.start + offset, IS))
-        propose_junction(&pairs, s, pair.start + offset, pair.end, max_intron);
-      if (site_candidate(s->bases, s->length, pair.end + offset, IE))
-        propose_junction(&pairs, s, pair.start, pair.end + offset, max_intron);
+      propose_junction(&pairs, s, pair.start + offset, pair.end, max_intron);
+      propose_junction(&pairs, s, pair.start, pair.end + offset, max_intron);
     }
   }
   unique_intervals(&pairs);
@@ -357,8 +358,8 @@ static double objective(const double *weights, double *gradient,
   }
   double lambda = type == JUNCTION ? 1e-4 : 1e-5;
   for (int k = 0; k < features - 1; ++k) {
-    loss += 0.5 * lambda * samples->count * weights[k] * weights[k];
-    gradient[k] += lambda * samples->count * weights[k];
+    loss += 0.5 * lambda * samples->population * weights[k] * weights[k];
+    gradient[k] += lambda * samples->population * weights[k];
   }
   return loss;
 }
@@ -366,6 +367,16 @@ static double objective(const double *weights, double *gradient,
 Model *train_model(const Sequence *sequences, int count, int iterations,
                    int threads) {
   Samples samples[CLASSIFIERS] = {0};
+  int stride[SITES] = {1, 1, 1, 1};
+  double length = 0;
+  for (int s = 0; s < count; ++s)
+    length += sequences[s].length;
+  // Bound negative storage, preserving its population weight and all positives.
+  for (int type = 0; type < SITES; ++type)
+    while (2 * length / stride[type] > 1000000)
+      stride[type] *= 2;
+  cry("negative sampling stride: GS/GE %d, IS/IE %d; all positives retained",
+      stride[GS], stride[IS]);
   Model *model = scalloc(1, sizeof(*model));
   for (int s = 0; s < count; ++s)
     if (sequences[s].max_intron > model->max_intron)
@@ -403,12 +414,22 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
                            (strand * SITES);
           for (int type = 0; type < SITES; ++type) {
             int target = !!(label & (1U << type));
-            if (!target &&
-                !site_candidate(oriented.bases, oriented.length, p, type))
+            // Splice negatives are not restricted to donor/acceptor motifs.
+            int candidate_type = type == IS ? GS : type == IE ? GE : type;
+            if (!target && !site_candidate(oriented.bases, oriented.length, p,
+                                           candidate_type))
+              continue;
+            uint64_t key = (uint64_t)p + (uint64_t)s * 0x9e3779b97f4a7c15ULL +
+                           (unsigned)(strand * SITES + type);
+            key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ULL;
+            key = (key ^ (key >> 27)) * 0x94d049bb133111ebULL;
+            key ^= key >> 31;
+            if (!target && (key & (unsigned)(stride[type] - 1)))
               continue;
             Sample *sample = append_sample(&samples[type]);
             sample_site(&oriented, power, origin, p, type, sample);
             sample->target = (uint8_t)target;
+            sample->weight = target ? 1 : (float)stride[type];
           }
         }
         if (end == oriented.length)
@@ -423,29 +444,29 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
         threads < CLASSIFIERS ? threads : CLASSIFIERS) schedule(static)
   for (int type = 0; type < CLASSIFIERS; ++type) {
     size_t positives = 0;
-    for (size_t i = 0; i < samples[type].count; ++i)
+    for (size_t i = 0; i < samples[type].count; ++i) {
       positives += samples[type].items[i].target;
+      samples[type].population += samples[type].items[i].weight;
+    }
+    double negatives = samples[type].population - positives;
     if (!positives || positives == samples[type].count)
       bye("training annotation lacks positive or negative %s examples",
           classifier_names[type]);
     // Sublinear balancing improves rare-site recall without equalizing priors.
-    double positive_weight =
-        type == JUNCTION
-            ? 1
-            : sqrt((double)(samples[type].count - positives) / positives);
+    double positive_weight = type == JUNCTION ? 1 : sqrt(negatives / positives);
     for (size_t i = 0; i < samples[type].count; ++i)
       if (samples[type].items[i].target)
         samples[type].items[i].weight = (float)positive_weight;
     int features = type == JUNCTION ? JUNCTION_FEATURES : SITE_FEATURES;
-    model->weights[type][features - 1] =
-        log((double)positives / (samples[type].count - positives));
+    model->weights[type][features - 1] = log((double)positives / negatives);
     int completed;
     int status = lbfgs_minimize(features, model->weights[type], objective,
                                 &samples[type], iterations, &completed);
     if (status < 0)
       bye("%s optimization failed: status %d", classifier_names[type], status);
-    cry("%s: %zu positive, %zu negative, %d iterations", classifier_names[type],
-        positives, samples[type].count - positives, completed);
+    cry("%s: %zu positive, %zu sampled negative (weighted %.0f), %d iterations",
+        classifier_names[type], positives, samples[type].count - positives,
+        negatives, completed);
     free(samples[type].items);
   }
   return model;

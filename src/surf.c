@@ -14,7 +14,7 @@ static void usage(void) {
   fprintf(
       stderr,
       "Usage: surf [options] genome.fasta[.gz] [annotation.gff3[.gz]]\n"
-      "  with an annotation: train TSS, TTS, IS, IE and IS-IE pair models\n"
+      "  with an annotation: train GS, IS, IE, GE and IS-IE pair models\n"
       "  without:            assemble transcripts and longest spliced ORFs\n"
       "Options:\n"
       "  -p N       threads [1]\n"
