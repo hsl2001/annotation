@@ -32,12 +32,11 @@ static Candidates detect_sites(const Model *model, const Sequence *s,
     int64_t limit =
         stop + SITE_RADIUS < s->length ? stop + SITE_RADIUS : s->length;
     cwt_power(s->bases, s->length, origin, limit, power);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) 
     for (int i = 0; i < stop - begin; ++i)
       for (int type = 0; type < SITES; ++type) {
         double z = -INFINITY;
-        if ((mask & (1U << type)) &&
-            site_candidate(s->bases, s->length, begin + i, type)) {
+        if (mask & (1U << type)) {
           Sample sample;
           sample_site(s, power, origin, begin + i, type, &sample);
           z = site_logit(model, &sample);

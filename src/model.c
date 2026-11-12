@@ -85,7 +85,9 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     }
     if (columns != 9 || cursor)
       bye("%s:%ld: expected 9 columns", path, line_number);
-    if (strcmp(fields[2], "exon") && strcmp(fields[2], "CDS"))
+    if (strcmp(fields[2], "exon") && strcmp(fields[2], "CDS") &&
+        strcmp(fields[2], "five_prime_UTR") &&
+        strcmp(fields[2], "three_prime_UTR"))
       continue;
     int sequence = -1;
     for (int i = 0; i < count; ++i)
@@ -114,15 +116,17 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
       bye("%s:%ld: exon/CDS without Parent", path, line_number);
     for (char *id = strtok_r(parent, ",", &save); id;
          id = strtok_r(NULL, ",", &save)) {
+      int type = fields[2][0];
       if (used == capacity) {
         capacity = capacity ? capacity * 2 : 256;
         features = srealloc(features, capacity, sizeof(*features));
       }
-      features[used++] = (Feature){sstrdup(id),
-                                   sequence,
-                                   !strcmp(fields[2], "exon"),
-                                   strand,
-                                   {a - 1, b}};
+      features[used++] =
+          (Feature){sstrdup(id),
+                    sequence,
+                    (type == 'e') | (type == 'f') * 2 | (type == 't') * 4,
+                    strand,
+                    {a - 1, b}};
     }
   }
   if (gzclose(input) != Z_OK)
@@ -140,11 +144,11 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
       ;
     Sequence *s = &sequences[f->sequence];
     IntervalList exons = {0};
-    int has_exons = 0;
+    int flags = 0;
     for (size_t i = first; i < last; ++i)
-      has_exons |= features[i].exon;
+      flags |= features[i].exon;
     for (size_t i = first; i < last; ++i) {
-      if (has_exons && !features[i].exon)
+      if (flags & 1 ? !(features[i].exon & 1) : features[i].exon & 6)
         continue;
       Interval span = features[i].span;
       if (exons.count && span.start <= exons.items[exons.count - 1].end) {
@@ -154,8 +158,9 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
         push_interval(&exons, span.start, span.end);
     }
     int reverse = f->strand == '-';
-    observe_pair(s, reverse, SPAN, exons.items[0].start,
-                 exons.items[exons.count - 1].end);
+    if ((flags & 6) == 6)
+      observe_pair(s, reverse, SPAN, exons.items[0].start,
+                   exons.items[exons.count - 1].end);
     for (int e = 1; e < exons.count; ++e)
       observe_pair(s, reverse, JUNCTION, exons.items[e - 1].end,
                    exons.items[e].start);
@@ -172,18 +177,13 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
     }
 }
 
-int site_candidate(const char *b, int64_t length, int64_t p, int type) {
+static int valid_boundary_candidate(const char *b, int64_t length, int64_t p,
+                                    int type) {
   if (p < 0 || p > length)
     return 0;
-  if (type == GS || type == GE)
-    return type == GS ? p < length && base_index(b[p]) >= 0
-                      : p > 0 && base_index(b[p - 1]) >= 0;
-  if (type == IS)
-    return p + 2 <= length &&
-           ((b[p] == 'G' && (b[p + 1] == 'T' || b[p + 1] == 'C')) ||
-            ((b[p] == 'A' || b[p] == 'T') && b[p + 1] == 'T'));
-  return p >= 2 && ((b[p - 2] == 'A' && (b[p - 1] == 'G' || b[p - 1] == 'C')) ||
-                    (b[p - 2] == 'G' && b[p - 1] == 'T'));
+  if (type == GS)
+    return p < length && base_index(b[p]) >= 0;
+  return type == GE && p > 0 && base_index(b[p - 1]) >= 0;
 }
 
 static uint8_t nucleotide(const Sequence *s, int64_t p) {
@@ -347,7 +347,8 @@ static double objective(const double *weights, double *gradient,
     loss += sample->weight * (fmax(score, 0) - sample->target * score +
                               log1p(exp(-fabs(score))));
   }
-  double lambda = type < SITES ? 1e-5 : 1e-4;
+  // L2 regularization to prevent overfitting.
+  double lambda = 1e-5;
   for (int k = 0; k < features - 1; ++k) {
     loss += 0.5 * lambda * samples->population * weights[k] * weights[k];
     gradient[k] += lambda * samples->population * weights[k];
@@ -406,8 +407,9 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
             int target = !!(label & (1U << type));
             // Splice negatives are not restricted to donor/acceptor motifs.
             int candidate_type = type == IS ? GS : type == IE ? GE : type;
-            if (!target && !site_candidate(oriented.bases, oriented.length, p,
-                                           candidate_type))
+            if (!target &&
+                !valid_boundary_candidate(oriented.bases, oriented.length, p,
+                                          candidate_type))
               continue;
             uint64_t key = (uint64_t)p + (uint64_t)s * 0x9e3779b97f4a7c15ULL +
                            (unsigned)(strand * SITES + type);
@@ -442,13 +444,14 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
     if (!positives || positives == samples[type].count)
       bye("training annotation lacks positive or negative %s examples",
           classifier_names[type]);
-    // Sublinear balancing improves rare-site recall without equalizing priors.
-    double positive_weight = type < SITES ? sqrt(negatives / positives) : 1;
+    // Equalize effective positive and negative weight for site classifiers.
+    double positive_weight = type < SITES ? negatives / positives : 1;
     for (size_t i = 0; i < samples[type].count; ++i)
       if (samples[type].items[i].target)
         samples[type].items[i].weight = (float)positive_weight;
     int features = type < SITES ? SITE_FEATURES : PAIR_FEATURES;
-    model->weights[type][features - 1] = log((double)positives / negatives);
+    model->weights[type][features - 1] =
+        type < SITES ? 0 : log((double)positives / negatives);
     int completed;
     int status = lbfgs_minimize(features, model->weights[type], objective,
                                 &samples[type], iterations, &completed);
@@ -462,18 +465,7 @@ Model *train_model(const Sequence *sequences, int count, int iterations,
   return model;
 }
 
-static int model_valid(const Model *model) {
-  for (int t = 0; t < CLASSIFIERS; ++t)
-    for (int k = 0; k < MODEL_FEATURES; ++k)
-      if (!isfinite(model->weights[t][k]))
-        return 0;
-  return model->max_intron >= 20 && model->max_intron <= 1000000 &&
-         model->max_span >= 1 && model->max_span <= 1000000;
-}
-
 int save_model(const char *path, const Model *model) {
-  if (!model_valid(model))
-    return EINVAL;
   FILE *output = fopen(path, "wb");
   if (!output)
     return errno;
@@ -496,7 +488,7 @@ int load_model(const char *path, Model *model) {
            fread(features, sizeof(features), 1, input) == 1 &&
            features[0] == SITE_FEATURES && features[1] == PAIR_FEATURES &&
            fread(&candidate, sizeof(candidate), 1, input) == 1 &&
-           model_valid(&candidate) && fgetc(input) == EOF && !ferror(input);
+           fgetc(input) == EOF && !ferror(input);
   int closed = fclose(input) == 0;
   if (!ok || !closed)
     return EINVAL;

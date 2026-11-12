@@ -35,10 +35,9 @@ typedef struct {
 
 typedef struct {
   double weights[CLASSIFIERS][MODEL_FEATURES];
-  int64_t max_intron, max_span;
+  int64_t max_intron, max_exon, max_span;
 } Model;
 
-int site_candidate(const char *bases, int64_t length, int64_t p, int type);
 void sample_site(const Sequence *sequence, const float *power, int64_t origin,
                  int64_t p, int type, Sample *sample);
 void sample_pair(const Sequence *sequence, int64_t start, int64_t end, int type,
