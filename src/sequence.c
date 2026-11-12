@@ -107,8 +107,10 @@ void free_sequences(Sequence *sequences, int count) {
     free(sequences[i].name);
     free(sequences[i].bases);
     free(sequences[i].labels);
-    for (int strand = 0; strand < 2; ++strand)
+    for (int strand = 0; strand < 2; ++strand) {
       free(sequences[i].introns[strand].items);
+      free(sequences[i].spans[strand].items);
+    }
   }
   free(sequences);
 }

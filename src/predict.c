@@ -4,14 +4,9 @@
 #include <limits.h>
 #include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 enum { TILE = 16384 };
-#ifndef MAX_PATHS
-#define MAX_PATHS 8
-#endif
-#ifndef PATH_SCORE_THRESHOLD
-#define PATH_SCORE_THRESHOLD 0.0
-#endif
 
 typedef struct {
   int64_t position;
@@ -24,50 +19,27 @@ typedef struct {
   int count;
 } Candidates;
 
-typedef struct {
-  double score;
-  int from, rank;
-} Node;
-
-static void *grow(void *items, int *capacity, size_t size, int index) {
-  if (index < *capacity)
-    return items;
-  if (*capacity > INT_MAX / 2)
-    bye("point graph allocation exceeds addressable entries");
-  *capacity = *capacity ? 2 * *capacity : 256;
-  return srealloc(items, (size_t)*capacity, size);
-}
-
-static int point_compare(const void *a, const void *b) {
-  const Point *x = a, *y = b;
-  if (x->position != y->position)
-    return x->position < y->position ? -1 : 1;
-  // Complete half-open envelopes before opening adjacent transcripts.
-  int x_order = x->kind == GE ? -1 : (int)x->kind;
-  int y_order = y->kind == GE ? -1 : (int)y->kind;
-  return x_order < y_order ? -1 : x_order > y_order;
-}
-
-static Candidates detect_sites(const Model *model, const Sequence *s) {
+static Candidates detect_sites(const Model *model, const Sequence *s,
+                               int64_t begin, int64_t end, unsigned mask) {
   Candidates c = {0};
   int capacity = 0;
   float *power =
-      scalloc((TILE + 2 * SITE_RADIUS + 1) * CWT_CHANNELS, sizeof(float));
-  float (*logits)[SITES] = scalloc(TILE + 1, sizeof(*logits));
-  for (int64_t start = 0; start < s->length; start += TILE) {
-    int64_t end = start + TILE < s->length ? start + TILE : s->length;
-    int rows = (int)(end - start) + (end == s->length);
-    int64_t origin = start > SITE_RADIUS ? start - SITE_RADIUS : 0;
+      scalloc((TILE + 2 * SITE_RADIUS) * CWT_CHANNELS, sizeof(float));
+  float (*logits)[SITES] = scalloc(TILE, sizeof(*logits));
+  for (; begin <= end; begin += TILE) {
+    int64_t stop = begin + TILE < end + 1 ? begin + TILE : end + 1;
+    int64_t origin = begin > SITE_RADIUS ? begin - SITE_RADIUS : 0;
     int64_t limit =
-        end + SITE_RADIUS < s->length ? end + SITE_RADIUS : s->length;
+        stop + SITE_RADIUS < s->length ? stop + SITE_RADIUS : s->length;
     cwt_power(s->bases, s->length, origin, limit, power);
 #pragma omp parallel for schedule(static)
-    for (int i = 0; i < rows; ++i)
+    for (int i = 0; i < stop - begin; ++i)
       for (int type = 0; type < SITES; ++type) {
         double z = -INFINITY;
-        if (site_candidate(s->bases, s->length, start + i, type)) {
+        if ((mask & (1U << type)) &&
+            site_candidate(s->bases, s->length, begin + i, type)) {
           Sample sample;
-          sample_site(s, power, origin, start + i, type, &sample);
+          sample_site(s, power, origin, begin + i, type, &sample);
           z = site_logit(model, &sample);
           if (!isfinite(z))
             bye("non-finite %s prediction for %s", classifier_names[type],
@@ -75,177 +47,156 @@ static Candidates detect_sites(const Model *model, const Sequence *s) {
         }
         logits[i][type] = (float)z;
       }
-    for (int i = 0; i < rows; ++i)
-      for (int type = 0; type < SITES; ++type)
+    for (int i = 0; i < stop - begin; ++i)
+      // GE precedes GS at shared boundaries, allowing adjacent spans.
+      for (int type = SITES - 1; type >= 0; --type)
         if (logits[i][type] >= 0) {
-          c.points = grow(c.points, &capacity, sizeof(*c.points), c.count);
+          if (c.count == capacity) {
+            if (capacity > INT_MAX / 2)
+              bye("point graph allocation exceeds addressable entries");
+            capacity = capacity ? capacity * 2 : 256;
+            c.points = srealloc(c.points, capacity, sizeof(*c.points));
+          }
           c.points[c.count++] =
-              (Point){start + i, logits[i][type], (unsigned)type};
+              (Point){begin + i, logits[i][type], (unsigned)type};
         }
   }
   free(logits);
   free(power);
-  if (c.count > 1)
-    qsort(c.points, c.count, sizeof(*c.points), point_compare);
   return c;
 }
 
-static void reverse_intervals(IntervalList *form) {
-  for (int i = 0; i < form->count / 2; ++i) {
-    Interval swap = form->items[i];
-    form->items[i] = form->items[form->count - 1 - i];
-    form->items[form->count - 1 - i] = swap;
-  }
-}
-
-static double transition_score(const Model *model, const Sequence *s,
-                               Point from, Point to) {
-  int64_t length = to.position - from.position;
-  if (length <= 0)
-    return -INFINITY;
-  if (from.kind == IS && to.kind == IE && length <= model->max_intron) {
-    double pair = junction_logit(model, s, from.position, to.position);
-    return isfinite(pair) ? to.logit + pair : -INFINITY;
-  }
-  return (from.kind == GS || from.kind == IE) &&
-                 (to.kind == IS || to.kind == GE) && length <= model->max_exon
-             ? to.logit
-             : -INFINITY;
-}
-
-static int emit_forms(const Model *model, const Sequence *s,
-                      const Sequence *genomic, char strand, const Candidates *c,
-                      int first, int last, FILE *output, unsigned long *genes) {
-  int count = last - first + 1;
-  // A per-point beam bounds exponential splice-path growth in dense graphs.
-  Node(*paths)[MAX_PATHS] = scalloc(count, sizeof(*paths));
-  for (int p = 0; p < count; ++p)
-    for (int k = 0; k < MAX_PATHS; ++k)
-      paths[p][k] = (Node){-INFINITY, -1, 0};
-  paths[0][0] = (Node){c->points[first].logit, -1, 0};
-  for (int p = 1; p < count; ++p) {
-    Point point = c->points[first + p];
-    if (point.kind == GS || (point.kind == GE && p != count - 1))
-      continue;
-    int64_t limit = point.kind == IE ? model->max_intron : model->max_exon;
-    for (int j = p - 1;
-         j >= 0 && point.position - c->points[first + j].position <= limit;
-         --j) {
-      if (!isfinite(paths[j][0].score))
-        continue;
-      double edge = transition_score(model, s, c->points[first + j], point);
-      if (!isfinite(edge))
-        continue;
-      for (int k = 0; k < MAX_PATHS && isfinite(paths[j][k].score); ++k) {
-        double score = paths[j][k].score + edge;
-        int rank = MAX_PATHS - 1;
-        if (score <= paths[p][rank].score)
-          continue;
-        while (rank && score > paths[p][rank - 1].score) {
-          paths[p][rank] = paths[p][rank - 1];
-          --rank;
-        }
-        paths[p][rank] = (Node){score, j, k};
-      }
-    }
-  }
-  IntervalList form = {0};
-  size_t number = 0;
-  for (int k = 0; k < MAX_PATHS && isfinite(paths[count - 1][k].score) &&
-                  paths[count - 1][k].score >= PATH_SCORE_THRESHOLD;
-       ++k) {
-    form.count = 0;
-    int rank = k;
-    for (int p = count - 1; p > 0;) {
-      Node node = paths[p][rank];
-      Point opening = c->points[first + node.from];
-      if (opening.kind == GS || opening.kind == IE)
-        push_interval(&form, opening.position, c->points[first + p].position);
-      p = node.from;
-      rank = node.rank;
-    }
-    reverse_intervals(&form);
-    int status = write_isoform(output, genomic, &form, strand,
-                               output ? *genes + 1 : 1, number + 1);
-    if (status < 0)
-      bye("cannot write transcript for %s", genomic->name);
-    number += status;
-    if (!output && number)
-      break;
-  }
-  if (output)
-    *genes += number != 0;
-  free(form.items);
-  free(paths);
-  return number != 0;
-}
-
-static void retain_start(Node *paths, Node node) {
-  int rank = 0;
-  while (rank < MAX_PATHS && paths[rank].from != node.from)
-    ++rank;
-  if (rank == MAX_PATHS)
-    rank = MAX_PATHS - 1;
-  if (node.score <= paths[rank].score)
-    return;
-  while (rank && node.score > paths[rank - 1].score) {
-    paths[rank] = paths[rank - 1];
-    --rank;
-  }
-  paths[rank] = node;
-}
-
-static void assemble(const Model *model, const Sequence *s,
-                     const Sequence *genomic, char strand, const Candidates *c,
-                     FILE *output, unsigned long *genes) {
-  // Keep distinct starts, not competing splice paths from the same start.
-  // Only MAX_PATHS origins survive per point; lower-ranked origins may be
-  // pruned. Here from is the GS index and rank is the preceding completed
-  // terminal.
-  Node(*nodes)[MAX_PATHS] = scalloc(c->count, sizeof(*nodes));
+static IntervalList find_spans(const Model *model, const Sequence *s,
+                               const Candidates *c) {
+  typedef struct {
+    double score;
+    int start, previous;
+  } Node;
+  Node *nodes = scalloc(c->count, sizeof(*nodes));
   int best = -1;
   for (int p = 0; p < c->count; ++p) {
-    Point point = c->points[p];
-    for (int k = 0; k < MAX_PATHS; ++k)
-      nodes[p][k] = (Node){-INFINITY, -1, -1};
-    if (point.kind == GS) {
-      nodes[p][0] =
-          (Node){(best < 0 ? 0 : nodes[best][0].score) + point.logit, p, best};
+    Point end = c->points[p];
+    nodes[p] = (Node){best < 0 ? 0 : nodes[best].score, -1, best};
+    if (end.kind != GE)
       continue;
-    }
-    int64_t limit = point.kind == IE ? model->max_intron : model->max_exon;
     for (int j = p - 1;
-         j >= 0 && point.position - c->points[j].position <= limit; --j) {
-      if (!isfinite(nodes[j][0].score))
+         j >= 0 && end.position - c->points[j].position <= model->max_span;
+         --j) {
+      Point start = c->points[j];
+      if (start.kind != GS)
         continue;
-      double edge = transition_score(model, s, c->points[j], point);
-      if (!isfinite(edge))
-        continue;
-      for (int k = 0; k < MAX_PATHS && isfinite(nodes[j][k].score); ++k) {
-        Node node = nodes[j][k];
-        node.score += edge;
-        retain_start(nodes[p], node);
+      double pair = pair_logit(model, s, start.position, end.position, SPAN);
+      double score = nodes[j].score + start.logit + end.logit + pair;
+      if (isfinite(pair) && pair >= 0 && score > nodes[p].score)
+        nodes[p] = (Node){score, j, nodes[j].previous};
+    }
+    if (nodes[p].start >= 0)
+      best = p;
+  }
+  IntervalList spans = {0};
+  for (int p = best; p >= 0; p = nodes[p].previous)
+    push_interval(&spans, c->points[nodes[p].start].position,
+                  c->points[p].position);
+  free(nodes);
+  return spans;
+}
+
+static IntervalList find_introns(const Model *model, const Sequence *s,
+                                 const Candidates *c) {
+  IntervalList introns = {0};
+  for (int i = 0; i < c->count; ++i)
+    if (c->points[i].kind == IS)
+      for (int j = i + 1;
+           j < c->count &&
+           c->points[j].position - c->points[i].position <= model->max_intron;
+           ++j)
+        if (c->points[j].kind == IE &&
+            pair_logit(model, s, c->points[i].position, c->points[j].position,
+                       JUNCTION) >= 0)
+          push_interval(&introns, c->points[i].position, c->points[j].position);
+  return introns;
+}
+
+static int reciprocal(const IntervalList *a, const IntervalList *b) {
+  int64_t length[2] = {0}, shared = 0;
+  const IntervalList *forms[] = {a, b};
+  for (int k = 0; k < 2; ++k)
+    for (int i = 0; i < forms[k]->count; ++i)
+      length[k] += forms[k]->items[i].end - forms[k]->items[i].start;
+  for (int i = 0, j = 0; i < a->count && j < b->count;) {
+    Interval x = a->items[i], y = b->items[j];
+    int64_t lo = x.start > y.start ? x.start : y.start;
+    int64_t hi = x.end < y.end ? x.end : y.end;
+    if (hi > lo)
+      shared += hi - lo;
+    if (x.end <= y.end)
+      ++i;
+    else
+      ++j;
+  }
+  return shared >= length[0] - length[0] / 4 &&
+         shared >= length[1] - length[1] / 4;
+}
+
+static int emit_forms(FILE *output, const Sequence *s, char strand,
+                      Interval span, const IntervalList *introns,
+                      unsigned long gene) {
+  IntervalList form = {0}, best = {0};
+  int *next = scalloc((size_t)introns->count + 1, sizeof(*next));
+  int64_t longest = 0;
+  size_t number = 0;
+  // Two exhaustive walks: choose the longest CDS, then stream its alternatives.
+  for (int pass = 0; pass < 2; ++pass) {
+    if (pass) {
+      if (!longest)
+        break;
+      if (write_isoform(output, s, &best, strand, gene, ++number) < 0)
+        bye("cannot write transcript for %s", s->name);
+    }
+    push_interval(&form, span.start, span.end);
+    next[0] = 0;
+    while (form.count) {
+      if (!pass) {
+        Interval cds = longest_orf(s, &form, strand);
+        if (cds.end - cds.start > longest) {
+          longest = cds.end - cds.start;
+          best.items = srealloc(best.items, form.count, sizeof(*best.items));
+          memcpy(best.items, form.items, form.count * sizeof(*best.items));
+          best.count = form.count;
+        }
+      } else if ((form.count != best.count ||
+                  memcmp(form.items, best.items,
+                         form.count * sizeof(*form.items))) &&
+                 reciprocal(&form, &best)) {
+        int status = write_isoform(output, s, &form, strand, gene, number + 1);
+        if (status < 0)
+          bye("cannot write transcript for %s", s->name);
+        number += status;
+      }
+      // Iterative DFS avoids recursion and stores only the current splice path.
+      while (form.count) {
+        int depth = form.count - 1;
+        if (next[depth] == introns->count) {
+          --form.count;
+          if (form.count)
+            form.items[form.count - 1].end = span.end;
+          continue;
+        }
+        int j = next[depth]++;
+        Interval intron = introns->items[j];
+        if (intron.start <= form.items[depth].start)
+          continue;
+        form.items[depth].end = intron.start;
+        push_interval(&form, intron.end, span.end);
+        next[depth + 1] = j + 1;
+        break;
       }
     }
-    if (point.kind == GE)
-      for (int k = 0; k < MAX_PATHS && isfinite(nodes[p][k].score) &&
-                      (best < 0 || nodes[p][k].score > nodes[best][0].score);
-           ++k)
-        if (emit_forms(model, s, genomic, strand, c, nodes[p][k].from, p, NULL,
-                       NULL)) {
-          nodes[p][0] = nodes[p][k];
-          best = p;
-          break;
-        }
   }
-  IntervalList terminals = {0};
-  for (int p = best; p >= 0; p = nodes[p][0].rank)
-    push_interval(&terminals, nodes[p][0].from, p);
-  for (int i = terminals.count - 1; i >= 0; --i)
-    emit_forms(model, s, genomic, strand, c, (int)terminals.items[i].start,
-               (int)terminals.items[i].end, output, genes);
-  free(terminals.items);
-  free(nodes);
+  free(next);
+  free(form.items);
+  free(best.items);
+  return number != 0;
 }
 
 static void write_points(FILE *const *files, const Sequence *s,
@@ -253,12 +204,10 @@ static void write_points(FILE *const *files, const Sequence *s,
   for (int i = 0; i < c->count; ++i) {
     Point point = c->points[reverse ? c->count - 1 - i : i];
     int type = (int)point.kind;
-    if (!files[type])
-      continue;
     int64_t p = point.position - (type == GE);
     if (reverse)
       p = s->length - 1 - p;
-    if (p >= 0 && p < s->length &&
+    if (files[type] && p >= 0 && p < s->length &&
         fprintf(files[type], "%s\t%lld\t%lld\t%.6g\n", s->name, (long long)p,
                 (long long)p + 1, 1 / (1 + exp(-point.logit))) < 0)
       bye("cannot write %s bedGraph", classifier_names[type]);
@@ -289,10 +238,23 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
     for (int strand = 0; strand < 2; ++strand) {
       Sequence oriented = *s;
       oriented.bases = strand ? reverse : s->bases;
-      Candidates c = detect_sites(model, &oriented);
-      write_points(files + strand * SITES, s, &c, strand);
-      assemble(model, &oriented, s, strand ? '-' : '+', &c, gff, &genes);
-      free(c.points);
+      Candidates ends =
+          detect_sites(model, &oriented, 0, s->length, (1U << GS) | (1U << GE));
+      write_points(files + strand * SITES, s, &ends, strand);
+      IntervalList spans = find_spans(model, &oriented, &ends);
+      free(ends.points);
+      for (int j = 0; j < spans.count; ++j) {
+        Interval span = spans.items[strand ? j : spans.count - 1 - j];
+        Candidates sites = detect_sites(model, &oriented, span.start + 1,
+                                        span.end - 1, (1U << IS) | (1U << IE));
+        write_points(files + strand * SITES, s, &sites, strand);
+        IntervalList introns = find_introns(model, &oriented, &sites);
+        genes +=
+            emit_forms(gff, s, strand ? '-' : '+', span, &introns, genes + 1);
+        free(introns.items);
+        free(sites.points);
+      }
+      free(spans.items);
     }
     free(reverse);
     cry("%s: %lu GS/GE transcripts", s->name, genes - previous);

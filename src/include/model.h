@@ -4,7 +4,7 @@
 #include "cwt.h"
 #include "surf.h"
 
-enum { GS, IS, IE, GE, SITES, JUNCTION = SITES, CLASSIFIERS };
+enum { GS, IS, IE, GE, SITES, JUNCTION = SITES, SPAN, CLASSIFIERS };
 extern const char *const classifier_names[CLASSIFIERS];
 #ifndef SITE_RADIUS
 #define SITE_RADIUS 15
@@ -14,9 +14,9 @@ extern const char *const classifier_names[CLASSIFIERS];
 #endif
 #define SITE_WIDTH (2 * SITE_RADIUS + 1)
 #define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1 + 64) + 1)
-#define JUNCTION_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES + 1) + 3)
+#define PAIR_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES + 1) + 3)
 #define MODEL_FEATURES                                                         \
-  (SITE_FEATURES > JUNCTION_FEATURES ? SITE_FEATURES : JUNCTION_FEATURES)
+  (SITE_FEATURES > PAIR_FEATURES ? SITE_FEATURES : PAIR_FEATURES)
 
 typedef struct {
   union {
@@ -25,7 +25,7 @@ typedef struct {
       float power[SITE_WIDTH];
     };
     struct {
-      uint8_t donor[SITE_WIDTH], acceptor[SITE_WIDTH];
+      uint8_t ends[2][SITE_WIDTH];
       float distance[2];
     };
   };
@@ -35,17 +35,17 @@ typedef struct {
 
 typedef struct {
   double weights[CLASSIFIERS][MODEL_FEATURES];
-  int64_t max_intron, max_exon;
+  int64_t max_intron, max_span;
 } Model;
 
 int site_candidate(const char *bases, int64_t length, int64_t p, int type);
 void sample_site(const Sequence *sequence, const float *power, int64_t origin,
                  int64_t p, int type, Sample *sample);
-void sample_junction(const Sequence *sequence, int64_t donor, int64_t acceptor,
-                     Sample *sample);
+void sample_pair(const Sequence *sequence, int64_t start, int64_t end, int type,
+                 Sample *sample);
 double site_logit(const Model *model, const Sample *sample);
-double junction_logit(const Model *model, const Sequence *sequence,
-                      int64_t donor, int64_t acceptor);
+double pair_logit(const Model *model, const Sequence *sequence, int64_t start,
+                  int64_t end, int type);
 Model *train_model(const Sequence *sequences, int count, int iterations,
                    int threads);
 unsigned long predict(const Model *model, const Sequence *sequences, int count,

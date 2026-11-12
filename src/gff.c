@@ -16,7 +16,7 @@ static int write_record(FILE *output, const Sequence *sequence,
   int64_t a = strand == '+' ? start : sequence->length - end;
   int64_t b = strand == '+' ? end : sequence->length - start;
   char phase_text[2] = {phase < 0 ? '.' : (char)('0' + phase), '\0'};
-  return fprintf(output, "%s\tanno\t%s\t%lld\t%lld\t.\t%c\t%s\tID=%s%s%s\n",
+  return fprintf(output, "%s\tsurf\t%s\t%lld\t%lld\t.\t%c\t%s\tID=%s%s%s\n",
                  sequence->name, type, (long long)a + 1, (long long)b, strand,
                  phase_text, id, *parent ? ";Parent=" : "", parent) > 0;
 }
@@ -26,8 +26,8 @@ static char coding_base(const Sequence *sequence, int64_t p, char strand) {
                        : complement(sequence->bases[sequence->length - 1 - p]);
 }
 
-static Interval longest_orf(const Sequence *sequence, const IntervalList *form,
-                            char strand) {
+Interval longest_orf(const Sequence *sequence, const IntervalList *form,
+                     char strand) {
   Interval best = {0, 0};
   int64_t at = 0, starts[3] = {-1, -1, -1};
   char codon[3] = {0};
@@ -71,7 +71,8 @@ int write_isoform(FILE *output, const Sequence *sequence,
   if (!number || (strand != '+' && strand != '-'))
     return 0;
   Interval cds = longest_orf(sequence, form, strand);
-  if (cds.start == cds.end)
+  // Only the representative requires an ORF; alternatives use exon overlap.
+  if (cds.start == cds.end && number == 1)
     return 0;
   if (!output)
     return 1;
@@ -94,6 +95,8 @@ int write_isoform(FILE *output, const Sequence *sequence,
     if (!write_record(output, sequence, "exon", exon->start, exon->end, strand,
                       -1, id, mrna))
       return -1;
+    if (cds.start == cds.end)
+      continue;
     int64_t length = exon->end - exon->start;
     int64_t cuts[] = {0, cds.start - offset, cds.end - offset, length};
     for (int t = 0; t < 3; ++t) {
