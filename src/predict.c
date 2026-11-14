@@ -100,102 +100,125 @@ static IntervalList find_spans(const Model *model, const Sequence *s,
   return spans;
 }
 
-static IntervalList find_introns(const Model *model, const Sequence *s,
-                                 const Candidates *c) {
-  IntervalList introns = {0};
+typedef struct {
+  Interval span;
+  double score;
+} Intron;
+
+typedef struct {
+  Intron *items;
+  int count, capacity;
+} Introns;
+
+static void push_intron(Introns *list, Interval span, double score) {
+  if (list->count == list->capacity) {
+    list->capacity = list->capacity ? list->capacity * 2 : 8;
+    list->items =
+        srealloc(list->items, (size_t)list->capacity, sizeof(*list->items));
+  }
+  list->items[list->count++] = (Intron){span, score};
+}
+
+static Introns find_introns(const Model *model, const Sequence *s,
+                            const Candidates *c) {
+  Introns introns = {0};
   for (int i = 0; i < c->count; ++i)
     if (c->points[i].kind == IS)
       for (int j = i + 1;
            j < c->count &&
            c->points[j].position - c->points[i].position <= model->max_intron;
            ++j)
-        if (c->points[j].kind == IE &&
-            pair_logit(model, s, c->points[i].position, c->points[j].position,
-                       JUNCTION) >= 0)
-          push_interval(&introns, c->points[i].position, c->points[j].position);
+        if (c->points[j].kind == IE) {
+          double pair = pair_logit(model, s, c->points[i].position,
+                                   c->points[j].position, JUNCTION);
+          double score = c->points[i].logit + c->points[j].logit + pair;
+          if (score > 0)
+            push_intron(
+                &introns,
+                (Interval){c->points[i].position, c->points[j].position},
+                score);
+        }
   return introns;
 }
 
-static int reciprocal(const IntervalList *a, const IntervalList *b) {
-  int64_t length[2] = {0}, shared = 0;
-  const IntervalList *forms[] = {a, b};
-  for (int k = 0; k < 2; ++k)
-    for (int i = 0; i < forms[k]->count; ++i)
-      length[k] += forms[k]->items[i].end - forms[k]->items[i].start;
-  for (int i = 0, j = 0; i < a->count && j < b->count;) {
-    Interval x = a->items[i], y = b->items[j];
-    int64_t lo = x.start > y.start ? x.start : y.start;
-    int64_t hi = x.end < y.end ? x.end : y.end;
-    if (hi > lo)
-      shared += hi - lo;
-    if (x.end <= y.end)
-      ++i;
-    else
-      ++j;
+static IntervalList refine_chain(const Sequence *s, char strand,
+                                 IntervalList exons) {
+  for (;;) {
+    Interval best = longest_orf(s, &exons, strand);
+    int64_t length = best.end - best.start;
+    int remove = -1;
+    for (int i = 0; i + 1 < exons.count; ++i) {
+      IntervalList merged = {0};
+      for (int j = 0; j < exons.count; ++j) {
+        if (j == i) {
+          push_interval(&merged, exons.items[j].start, exons.items[j + 1].end);
+          ++j;
+        } else
+          push_interval(&merged, exons.items[j].start, exons.items[j].end);
+      }
+      Interval orf = longest_orf(s, &merged, strand);
+      if (orf.end - orf.start > length) {
+        length = orf.end - orf.start;
+        remove = i;
+      }
+      free(merged.items);
+    }
+    if (remove < 0)
+      break;
+    exons.items[remove].end = exons.items[remove + 1].end;
+    memmove(&exons.items[remove + 1], &exons.items[remove + 2],
+            (size_t)(exons.count - remove - 2) * sizeof(*exons.items));
+    --exons.count;
   }
-  // Reciprocal 75%
-  return shared >= length[0] - length[0] / 4 &&
-         shared >= length[1] - length[1] / 4;
+  return exons;
+}
+
+static IntervalList best_chain(Interval span, const Introns *introns) {
+  int count = introns->count;
+  double *score = scalloc((size_t)count, sizeof(*score));
+  int *previous = scalloc((size_t)count, sizeof(*previous));
+  int best = -1;
+  for (int j = 0; j < count; ++j) {
+    double value = introns->items[j].score;
+    score[j] = value;
+    previous[j] = -1;
+    for (int i = 0; i < j; ++i)
+      if (introns->items[i].span.end < introns->items[j].span.start &&
+          score[i] + value > score[j]) {
+        score[j] = score[i] + value;
+        previous[j] = i;
+      }
+    if (best < 0 || score[j] > score[best])
+      best = j;
+  }
+  IntervalList exons = {0};
+  int *chain = scalloc((size_t)count, sizeof(*chain));
+  int length = 0;
+  for (int j = best; j >= 0; j = previous[j])
+    chain[length++] = j;
+  int64_t start = span.start;
+  for (int k = length - 1; k >= 0; --k) {
+    Interval intron = introns->items[chain[k]].span;
+    push_interval(&exons, start, intron.start);
+    start = intron.end;
+  }
+  push_interval(&exons, start, span.end);
+  free(chain);
+  free(previous);
+  free(score);
+  return exons;
 }
 
 static int emit_forms(FILE *output, const Sequence *s, char strand,
-                      Interval span, const IntervalList *introns,
+                      Interval span, const Introns *introns,
                       unsigned long gene) {
-  IntervalList form = {0}, best = {0};
-  int *next = scalloc((size_t)introns->count + 1, sizeof(*next));
-  int64_t longest = 0;
-  size_t number = 0;
-  for (int pass = 0; pass < 2; ++pass) {
-    if (pass) {
-      if (!longest)
-        break;
-      if (write_isoform(output, s, &best, strand, gene, ++number) < 0)
-        bye("cannot write transcript for %s", s->name);
-    }
-    push_interval(&form, span.start, span.end);
-    next[0] = 0;
-    while (form.count) {
-      if (!pass) {
-        Interval cds = longest_orf(s, &form, strand);
-        if (cds.end - cds.start > longest) {
-          longest = cds.end - cds.start;
-          best.items = srealloc(best.items, form.count, sizeof(*best.items));
-          memcpy(best.items, form.items, form.count * sizeof(*best.items));
-          best.count = form.count;
-        }
-      } else if ((form.count != best.count ||
-                  memcmp(form.items, best.items,
-                         form.count * sizeof(*form.items))) &&
-                 reciprocal(&form, &best)) {
-        int status = write_isoform(output, s, &form, strand, gene, number + 1);
-        if (status < 0)
-          bye("cannot write transcript for %s", s->name);
-        number += status;
-      }
-      // Iterative DFS
-      while (form.count) {
-        int depth = form.count - 1;
-        if (next[depth] == introns->count) {
-          --form.count;
-          if (form.count)
-            form.items[form.count - 1].end = span.end;
-          continue;
-        }
-        int j = next[depth]++;
-        Interval intron = introns->items[j];
-        if (intron.start <= form.items[depth].start)
-          continue;
-        form.items[depth].end = intron.start;
-        push_interval(&form, intron.end, span.end);
-        next[depth + 1] = j + 1;
-        break;
-      }
-    }
-  }
-  free(next);
-  free(form.items);
-  free(best.items);
-  return number != 0;
+  IntervalList exons = best_chain(span, introns);
+  exons = refine_chain(s, strand, exons);
+  int status = write_isoform(output, s, &exons, strand, gene, 1);
+  free(exons.items);
+  if (status < 0)
+    bye("cannot write transcript for %s", s->name);
+  return status > 0;
 }
 
 static void write_points(FILE *const *files, const Sequence *s,
@@ -247,7 +270,7 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
         Candidates sites = detect_sites(model, &oriented, span.start + 1,
                                         span.end - 1, (1U << IS) | (1U << IE));
         write_points(files + strand * SITES, s, &sites, strand);
-        IntervalList introns = find_introns(model, &oriented, &sites);
+        Introns introns = find_introns(model, &oriented, &sites);
         genes +=
             emit_forms(gff, s, strand ? '-' : '+', span, &introns, genes + 1);
         free(introns.items);
@@ -256,7 +279,7 @@ unsigned long predict(const Model *model, const Sequence *sequences, int count,
       free(spans.items);
     }
     free(reverse);
-    cry("%s: %lu GS/GE transcripts", s->name, genes - previous);
+    cry("%s: %lu transcripts", s->name, genes - previous);
   }
   for (int i = 0; i < 2 * SITES; ++i)
     if (files[i] && fclose(files[i]))

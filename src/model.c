@@ -158,9 +158,8 @@ void read_gff3(const char *path, Sequence *sequences, int count) {
         push_interval(&exons, span.start, span.end);
     }
     int reverse = f->strand == '-';
-    if ((flags & 6) == 6)
-      observe_pair(s, reverse, SPAN, exons.items[0].start,
-                   exons.items[exons.count - 1].end);
+    observe_pair(s, reverse, SPAN, exons.items[0].start,
+                 exons.items[exons.count - 1].end);
     for (int e = 1; e < exons.count; ++e)
       observe_pair(s, reverse, JUNCTION, exons.items[e - 1].end,
                    exons.items[e].start);
@@ -208,7 +207,7 @@ void sample_pair(const Sequence *s, int64_t start, int64_t end, int type,
     for (int k = 0; k < SITE_WIDTH; ++k)
       sample->ends[side][k] =
           nucleotide(s, (side ? end : start) + k - SITE_RADIUS);
-  sample->distance[0] = (float)(log1p(end - start) / 10);
+  sample->distance[0] = (float)(log1p(end - start));
   sample->distance[1] = sample->distance[0] * sample->distance[0];
 }
 
