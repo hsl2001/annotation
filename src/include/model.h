@@ -19,8 +19,8 @@ extern const char *const classifier_names[CLASSIFIERS];
 #error "STRIDE must be nonnegative"
 #endif
 #define SITE_WIDTH (2 * SITE_RADIUS + 1)
-#define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1 + 64) + 1)
-#define PAIR_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES + 1) + 3)
+#define SITE_FEATURES (SITE_WIDTH * (NUCLEOTIDES + 1) + 1)
+#define PAIR_FEATURES (SITE_WIDTH * (2 * NUCLEOTIDES) + 3)
 #define MODEL_FEATURES                                                         \
   (SITE_FEATURES > PAIR_FEATURES ? SITE_FEATURES : PAIR_FEATURES)
 

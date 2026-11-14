@@ -217,7 +217,7 @@ static double sample_logit(const double *weights, const Sample *sample,
   int pair = sample->type >= SITES;
   double values[4 * SITE_WIDTH + 3];
   for (int k = 0; k < SITE_WIDTH; ++k) {
-    int at = k * ((pair + 1) * NUCLEOTIDES + 1);
+    int at = k * (pair ? 2 * NUCLEOTIDES : NUCLEOTIDES + 1);
     for (int end = 0; end <= pair; ++end) {
       int a = pair ? sample->ends[end][k] : sample->bases[k];
       if (a < NUCLEOTIDES) {
@@ -225,22 +225,12 @@ static double sample_logit(const double *weights, const Sample *sample,
         values[count++] = 1;
       }
     }
-    indices[count] = at + (pair + 1) * NUCLEOTIDES;
-    values[count++] = pair ? sample->ends[0][k] < NUCLEOTIDES &&
-                                 sample->ends[0][k] == sample->ends[1][k]
-                           : sample->power[k];
+    if (!pair) {
+      indices[count] = at + NUCLEOTIDES;
+      values[count++] = sample->power[k];
+    }
   }
 
-  if (!pair)
-    for (int k = 0; k + 2 < SITE_WIDTH; ++k)
-      if (sample->bases[k] < NUCLEOTIDES &&
-          sample->bases[k + 1] < NUCLEOTIDES &&
-          sample->bases[k + 2] < NUCLEOTIDES) {
-        indices[count] = SITE_WIDTH * (NUCLEOTIDES + 1) + k * 64 +
-                         sample->bases[k] * 16 + sample->bases[k + 1] * 4 +
-                         sample->bases[k + 2];
-        values[count++] = 1;
-      }
   if (pair)
     for (int k = 0; k < 2; ++k) {
       indices[count] = PAIR_FEATURES - 3 + k;
