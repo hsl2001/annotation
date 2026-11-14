@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { TILE = 16384 };
+enum { TILE = 16384, PATHS = 8, SCORE_DROP = 8 };
 
 typedef struct {
   int64_t position;
@@ -173,52 +173,139 @@ static IntervalList refine_chain(const Sequence *s, char strand,
   return exons;
 }
 
-static IntervalList best_chain(Interval span, const Introns *introns) {
-  int count = introns->count;
-  double *score = scalloc((size_t)count, sizeof(*score));
-  int *previous = scalloc((size_t)count, sizeof(*previous));
-  int best = -1;
-  for (int j = 0; j < count; ++j) {
-    double value = introns->items[j].score;
-    score[j] = value;
-    previous[j] = -1;
-    for (int i = 0; i < j; ++i)
-      if (introns->items[i].span.end < introns->items[j].span.start &&
-          score[i] + value > score[j]) {
-        score[j] = score[i] + value;
-        previous[j] = i;
-      }
-    if (best < 0 || score[j] > score[best])
-      best = j;
-  }
-  IntervalList exons = {0};
-  int *chain = scalloc((size_t)count, sizeof(*chain));
+typedef struct {
+  double score;
+  int previous, rank;
+} Path;
+
+static void build_chain(Interval span, const Introns *introns,
+                        Path (*paths)[PATHS], int j, int k,
+                        IntervalList *exons) {
+  int *chain = scalloc((size_t)(j + 1), sizeof(*chain));
   int length = 0;
-  for (int j = best; j >= 0; j = previous[j])
+  while (j >= 0) {
     chain[length++] = j;
+    Path node = paths[j][k];
+    j = node.previous;
+    k = node.rank;
+  }
   int64_t start = span.start;
-  for (int k = length - 1; k >= 0; --k) {
-    Interval intron = introns->items[chain[k]].span;
-    push_interval(&exons, start, intron.start);
+  for (int i = length - 1; i >= 0; --i) {
+    Interval intron = introns->items[chain[i]].span;
+    push_interval(exons, start, intron.start);
     start = intron.end;
   }
-  push_interval(&exons, start, span.end);
+  push_interval(exons, start, span.end);
   free(chain);
-  free(previous);
-  free(score);
-  return exons;
+}
+
+static int reciprocal(const IntervalList *a, const IntervalList *b) {
+  int64_t length[2] = {0}, shared = 0;
+  const IntervalList *forms[] = {a, b};
+  for (int k = 0; k < 2; ++k)
+    for (int i = 0; i < forms[k]->count; ++i)
+      length[k] += forms[k]->items[i].end - forms[k]->items[i].start;
+  for (int i = 0, j = 0; i < a->count && j < b->count;) {
+    Interval x = a->items[i], y = b->items[j];
+    int64_t lo = x.start > y.start ? x.start : y.start;
+    int64_t hi = x.end < y.end ? x.end : y.end;
+    if (hi > lo)
+      shared += hi - lo;
+    if (x.end <= y.end)
+      ++i;
+    else
+      ++j;
+  }
+  return shared >= length[0] - length[0] / 4 &&
+         shared >= length[1] - length[1] / 4;
 }
 
 static int emit_forms(FILE *output, const Sequence *s, char strand,
                       Interval span, const Introns *introns,
                       unsigned long gene) {
-  IntervalList exons = best_chain(span, introns);
-  exons = refine_chain(s, strand, exons);
-  int status = write_isoform(output, s, &exons, strand, gene, 1);
-  free(exons.items);
+  int count = introns->count;
+  Path(*paths)[PATHS] = scalloc((size_t)count, sizeof(*paths));
+  for (int j = 0; j < count; ++j)
+    for (int k = 0; k < PATHS; ++k)
+      paths[j][k] = (Path){-INFINITY, -1, -1};
+  for (int j = 0; j < count; ++j) {
+    double value = introns->items[j].score;
+    paths[j][0] = (Path){value, -1, -1};
+    for (int i = 0; i < j; ++i)
+      if (introns->items[i].span.end < introns->items[j].span.start)
+        for (int k = 0; k < PATHS && isfinite(paths[i][k].score); ++k) {
+          double score = paths[i][k].score + value;
+          int rank = PATHS - 1;
+          if (score <= paths[j][rank].score)
+            continue;
+          while (rank && score > paths[j][rank - 1].score) {
+            paths[j][rank] = paths[j][rank - 1];
+            --rank;
+          }
+          paths[j][rank] = (Path){score, i, k};
+        }
+  }
+  int best_j = -1, best_k = -1;
+  double best_score = -INFINITY;
+  for (int j = 0; j < count; ++j)
+    for (int k = 0; k < PATHS && isfinite(paths[j][k].score); ++k)
+      if (paths[j][k].score > best_score) {
+        best_score = paths[j][k].score;
+        best_j = j;
+        best_k = k;
+      }
+  IntervalList best = {0};
+  if (best_j >= 0)
+    build_chain(span, introns, paths, best_j, best_k, &best);
+  else
+    push_interval(&best, span.start, span.end);
+  best = refine_chain(s, strand, best);
+  int status = write_isoform(output, s, &best, strand, gene, 1);
   if (status < 0)
     bye("cannot write transcript for %s", s->name);
-  return status > 0;
+  size_t number = status > 0 ? 1 : 0;
+  typedef struct {
+    double score;
+    int j, k;
+  } Ranked;
+  Ranked *ranked = scalloc((size_t)(count * PATHS), sizeof(*ranked));
+  int n = 0;
+  for (int j = 0; j < count; ++j)
+    for (int k = 0; k < PATHS && isfinite(paths[j][k].score); ++k)
+      ranked[n++] = (Ranked){paths[j][k].score, j, k};
+  for (int a = 0; a < n; ++a)
+    for (int b = a + 1; b < n; ++b)
+      if (ranked[b].score > ranked[a].score) {
+        Ranked swap = ranked[a];
+        ranked[a] = ranked[b];
+        ranked[b] = swap;
+      }
+  int emitted = 0;
+  for (int r = 0; r < n && emitted < PATHS; ++r) {
+    if (ranked[r].score < best_score - SCORE_DROP)
+      break;
+    int j = ranked[r].j, k = ranked[r].k;
+    if (j == best_j && k == best_k)
+      continue;
+    IntervalList exons = {0};
+    build_chain(span, introns, paths, j, k, &exons);
+    exons = refine_chain(s, strand, exons);
+    int same = exons.count == best.count &&
+               !memcmp(exons.items, best.items,
+                       (size_t)exons.count * sizeof(*exons.items));
+    if (!same && reciprocal(&exons, &best)) {
+      int alt = write_isoform(output, s, &exons, strand, gene, number + 1);
+      if (alt < 0)
+        bye("cannot write transcript for %s", s->name);
+      number += alt;
+      ++emitted;
+    }
+    free(exons.items);
+  }
+  free(ranked);
+  free(best.items);
+  free(paths);
+  return number != 0;
 }
 
 static void write_points(FILE *const *files, const Sequence *s,
